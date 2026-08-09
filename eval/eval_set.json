@@ -1,58 +1,58 @@
 [
   {
-    "question": "What argument is required to specify which AMI an aws_instance uses?",
-    "ground_truth": "The `ami` argument is required and specifies the AMI to use for the instance.",
+    "question": "What field is required to specify which container image a Pod's container uses?",
+    "ground_truth": "The `image` field is required on a container entry and specifies which container image to run for that container.",
     "retrieved_contexts": [
-      "resource \"aws_instance\" \"web\" {\n  ami           = \"ami-0c55b159cbfafe1f0\"\n  instance_type = \"t3.micro\"\n}\n\nArgument Reference: `ami` (Required) - AMI to use for the instance. `instance_type` (Required) - Instance type to use, such as `t3.micro`."
+      "apiVersion: v1\nkind: Pod\nmetadata:\n  name: web\nspec:\n  containers:\n    - name: web\n      image: nginx:1.27\n      ports:\n        - containerPort: 80\n\nContainer fields: `image` (Required) - the container image to run. `name` (Required) - a unique name for the container within the Pod. `ports` (Optional) - list of ports the container exposes."
     ]
   },
   {
-    "question": "How do I enable versioning on an S3 bucket in Terraform?",
-    "ground_truth": "Use a separate aws_s3_bucket_versioning resource referencing the bucket's id, with a versioning_configuration block setting status = \"Enabled\".",
+    "question": "How do I run setup logic before my main container starts in a Pod?",
+    "ground_truth": "Add an `initContainers` list to the Pod spec. Each init container runs to completion, in order, before any of the Pod's regular containers start.",
     "retrieved_contexts": [
-      "resource \"aws_s3_bucket_versioning\" \"data_versioning\" {\n  bucket = aws_s3_bucket.data.id\n  versioning_configuration {\n    status = \"Enabled\"\n  }\n}"
+      "apiVersion: v1\nkind: Pod\nmetadata:\n  name: app\nspec:\n  initContainers:\n    - name: wait-for-db\n      image: busybox:1.36\n      command: [\"sh\", \"-c\", \"until nc -z db 5432; do sleep 2; done\"]\n  containers:\n    - name: app\n      image: myapp:1.0\n\nInit Containers: specialized containers that run before app containers in a Pod. They always run to completion, and each must complete successfully before the next starts."
     ]
   },
   {
-    "question": "What's the difference between count and for_each for avoiding unnecessary resource recreation?",
-    "ground_truth": "count indexes resources by position, so removing an item from the middle of a list shifts every subsequent index and can cause Terraform to destroy and recreate resources that didn't actually change. for_each keyed by a stable identifier avoids this because each resource is addressed by its key, not its position.",
+    "question": "What's the difference between setting a Deployment's replicas field directly and using a HorizontalPodAutoscaler?",
+    "ground_truth": "`replicas` on the Deployment sets a fixed, static Pod count that only changes when the manifest is edited. A HorizontalPodAutoscaler continuously adjusts the Deployment's replica count automatically based on observed metrics like CPU or memory utilization, and overrides a manually set replicas value while it's active.",
     "retrieved_contexts": [
-      "Using count when for_each would be safer: count indexes resources by position (0, 1, 2...). If you remove an item from the middle of a list, everything after it shifts index and Terraform wants to destroy and recreate resources that didn't actually change. for_each keyed by a stable identifier avoids this entirely."
+      "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: web\nspec:\n  replicas: 3\n  selector:\n    matchLabels:\n      app: web\n\n---\napiVersion: autoscaling/v2\nkind: HorizontalPodAutoscaler\nmetadata:\n  name: web-hpa\nspec:\n  scaleTargetRef:\n    apiVersion: apps/v1\n    kind: Deployment\n    name: web\n  minReplicas: 2\n  maxReplicas: 10\n  metrics:\n    - type: Resource\n      resource:\n        name: cpu\n        target:\n          type: Utilization\n          averageUtilization: 60\n\nHorizontalPodAutoscaler automatically scales the number of Pods in a Deployment based on observed CPU/memory utilization or custom metrics."
     ]
   },
   {
-    "question": "How do I pin a provider version in Terraform?",
-    "ground_truth": "Declare the provider inside a required_providers block within the terraform block, setting a source and a version constraint such as \"~> 5.0\".",
+    "question": "How do I pin a container to a specific image version instead of floating on latest?",
+    "ground_truth": "Set the `image` field to `<repository>:<tag>` with an explicit version tag, or a digest with `@sha256:...` for full immutability, instead of leaving the tag off or using `:latest`, which resolves to whatever the newest pushed image happens to be at deploy time.",
     "retrieved_contexts": [
-      "terraform {\n  required_providers {\n    aws = {\n      source  = \"hashicorp/aws\"\n      version = \"~> 5.0\"\n    }\n  }\n}\n\nrequired_providers (Optional) - A block declaring which providers are required, and their source and version constraints."
+      "containers:\n  - name: web\n    image: nginx:1.27.1\n\nAvoid the `latest` tag or an untagged image reference in production manifests: both float to whatever was most recently pushed, so the same manifest can deploy different code on different days. Pin to an explicit tag, or an image digest for full reproducibility."
     ]
   },
   {
-    "question": "How do I safely destroy just one resource without affecting the rest of my Terraform-managed infrastructure?",
-    "ground_truth": "The recommended approach is to remove the resource block from the configuration file and let a normal terraform apply handle the deletion as part of a full plan, rather than using terraform destroy -target, which is meant as a break-glass tool since it can leave state and config out of sync.",
+    "question": "How do I safely delete a single Pod without affecting the rest of my Deployment-managed replicas?",
+    "ground_truth": "Run `kubectl delete pod <pod-name>`. The Deployment's controller notices the replica count has dropped below the desired `replicas` value and creates a fresh replacement Pod automatically; the other running replicas are untouched.",
     "retrieved_contexts": [
-      "terraform destroy -target=aws_s3_bucket.old_bucket is the quick answer, but be careful, -target is meant as a break-glass tool, not a regular workflow habit... The recommended way for most cases is to remove the resource block from your .tf file entirely and let a normal terraform apply handle the deletion as part of a full plan."
+      "kubectl delete pod web-7d9f8c6b8-abcde\n\nDeleting an individual Pod that is managed by a Deployment does not scale down the Deployment. The Deployment's controller reconciles the observed replica count against the desired `replicas` value and creates a new Pod to replace the deleted one, keeping the total replica count stable."
     ]
   },
   {
-    "question": "What does the depends_on argument do on an output block?",
-    "ground_truth": "depends_on on an output block sets explicit dependencies the output should wait on before it is evaluated.",
+    "question": "What's the purpose of an initContainers entry relative to a Pod's main containers?",
+    "ground_truth": "Init containers run sequentially before any of the Pod's main containers start, and each one must exit successfully before the next (or the main containers) begins. They're commonly used to wait for a dependency to become available or to perform one-time setup the main container shouldn't have to handle itself.",
     "retrieved_contexts": [
-      "output \"instance_public_ip\" {\n  value       = aws_instance.web.public_ip\n  description = \"The public IP address of the web server.\"\n}\n\nArgument Reference: `value` (Required)... `depends_on` (Optional) - Explicit dependencies the output should wait on."
+      "spec:\n  initContainers:\n    - name: init-permissions\n      image: busybox:1.36\n      command: [\"sh\", \"-c\", \"chown -R 1000:1000 /data\"]\n      volumeMounts:\n        - name: data\n          mountPath: /data\n  containers:\n    - name: app\n      image: myapp:2.0\n\nInit containers always run to completion. If an init container fails, the kubelet repeatedly restarts it until it succeeds, unless the Pod's restartPolicy is Never."
     ]
   },
   {
-    "question": "How do I set up a remote state backend with locking on AWS?",
-    "ground_truth": "Create an S3 bucket for state and a DynamoDB table for locking (as a one-time bootstrap step outside the main config), then point the terraform backend \"s3\" block at that bucket and table with encrypt = true, and run terraform init -migrate-state to move existing local state into it.",
+    "question": "How do I configure a StatefulSet so each replica gets its own persistent storage?",
+    "ground_truth": "Add a `volumeClaimTemplates` block to the StatefulSet spec. Kubernetes provisions a distinct PersistentVolumeClaim per replica, named after the template and the replica's stable ordinal (e.g. `data-web-0`, `data-web-1`), so each Pod keeps its own storage across restarts and rescheduling instead of sharing one volume.",
     "retrieved_contexts": [
-      "terraform {\n  backend \"s3\" {\n    bucket         = \"my-team-terraform-state\"\n    key            = \"app/terraform.tfstate\"\n    region         = \"us-east-1\"\n    dynamodb_table = \"terraform-lock\"\n    encrypt        = true\n  }\n}\n\nMigrate existing local state: terraform init -migrate-state"
+      "apiVersion: apps/v1\nkind: StatefulSet\nmetadata:\n  name: web\nspec:\n  serviceName: web\n  replicas: 3\n  volumeClaimTemplates:\n    - metadata:\n        name: data\n      spec:\n        accessModes: [\"ReadWriteOnce\"]\n        resources:\n          requests:\n            storage: 10Gi\n\nvolumeClaimTemplates provides stable storage using PersistentVolumeClaims. Each replica gets its own PVC, created and bound automatically, matching the replica's identity."
     ]
   },
   {
-    "question": "Why shouldn't I hardcode a database password directly in a Terraform resource block?",
-    "ground_truth": "A hardcoded password gets committed to version control in plaintext. Instead, declare it as a sensitive variable and supply the value at apply time (e.g. from a secrets manager), and ensure the state backend itself encrypts state at rest, since sensitive = true only hides the value from CLI output, not from the state file.",
+    "question": "Why shouldn't I hardcode a database password directly in a Pod's container env field?",
+    "ground_truth": "A hardcoded value in `env` is stored in plain text in the Pod manifest and in the cluster's object store, visible to anyone who can read the Pod spec (e.g. via `kubectl get pod -o yaml`) or has RBAC access to view Pods, and it ends up in version control if the manifest is checked in. Use a Secret and reference it via `env.valueFrom.secretKeyRef`, or mount it as a volume, instead, so the value is stored and accessed separately from the manifest itself.",
     "retrieved_contexts": [
-      "variable \"db_password\" {\n  type      = string\n  sensitive = true\n}\n\nsensitive = true isn't full protection: it hides the value from CLI output, but it's still sitting in your state file in plaintext unless your backend encrypts state at rest."
+      "env:\n  - name: DB_PASSWORD\n    valueFrom:\n      secretKeyRef:\n        name: db-credentials\n        key: password\n\nSecrets let you store and manage sensitive information such as passwords, tokens, or keys separately from Pod specs. Referencing a Secret via `secretKeyRef` avoids embedding sensitive values directly in a Pod manifest."
     ]
   }
 ]

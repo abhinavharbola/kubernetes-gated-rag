@@ -27,7 +27,12 @@ class Settings(BaseSettings):
 
     rerank_score_threshold: float = 0.5
 
-    qdrant_docs_collection: str = "terraform_docs"
+    # how long a cached "no grounded documentation" answer is trusted before
+    # it's re-checked against retrieval; keeps re-ingested corpora from being
+    # shadowed by a stale no-context verdict for the same question
+    no_context_cache_ttl_seconds: int = 3600
+
+    qdrant_docs_collection: str = "kubernetes_docs"
     qdrant_cache_collection: str = "semantic_cache"
 
     nim_base_url: str = "https://integrate.api.nvidia.com/v1"

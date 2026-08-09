@@ -4,6 +4,14 @@ from google.genai import types
 from src.clients import gemini_client
 from src.config import settings
 
+# Gemini's embed_content endpoint accepts a batch of texts in a single
+# request, not just one. The previous implementation called it once per
+# text, so ingesting N chunks cost N network round-trips and N slices of
+# a free-tier RPM budget instead of ceil(N / EMBED_BATCH_SIZE). 100 is
+# comfortably under Gemini's per-request batch limit; lower it if that
+# limit changes.
+EMBED_BATCH_SIZE = 100
+
 
 def _normalize(vector: list[float]) -> list[float]:
     array = np.array(vector, dtype=np.float32)
@@ -16,17 +24,21 @@ def _normalize(vector: list[float]) -> list[float]:
 def embed_texts(texts: list[str], task_type: str) -> list[list[float]]:
     """task_type: RETRIEVAL_DOCUMENT for ingestion, RETRIEVAL_QUERY for queries,
     SEMANTIC_SIMILARITY for cache lookups."""
-    vectors = []
-    for text in texts:
+    if not texts:
+        return []
+
+    vectors: list[list[float]] = []
+    for start in range(0, len(texts), EMBED_BATCH_SIZE):
+        batch = texts[start : start + EMBED_BATCH_SIZE]
         response = gemini_client.models.embed_content(
             model=settings.gemini_embedding_model,
-            contents=text,
+            contents=batch,
             config=types.EmbedContentConfig(
                 task_type=task_type,
                 output_dimensionality=settings.embedding_dim,
             ),
         )
-        vectors.append(_normalize(response.embeddings[0].values))
+        vectors.extend(_normalize(embedding.values) for embedding in response.embeddings)
     return vectors
 
 

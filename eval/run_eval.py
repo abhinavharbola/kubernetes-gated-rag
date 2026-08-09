@@ -41,7 +41,7 @@ def _generate_answer(question: str, contexts: list[str]) -> str:
         [
             {
                 "role": "system",
-                "content": "Answer the Terraform question using ONLY the provided context. "
+                "content": "Answer the Kubernetes question using ONLY the provided context. "
                 "If the context doesn't fully cover the question, say what's missing "
                 "rather than guessing.",
             },

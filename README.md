@@ -1,8 +1,8 @@
-# Terraform Agentic RAG
+# Kubernetes Agentic RAG
 
-A retrieval-augmented Q&A system for Terraform (HashiCorp IaC) questions, built to run entirely on a no-GPU, 16GB laptop by offloading every model-weight operation to free-tier hosted APIs. Local compute is limited to parsing, chunking, and CPU/ONNX reranking.
+A retrieval-augmented Q&A system for Kubernetes questions, built to run entirely on a no-GPU, 16GB laptop by offloading every model-weight operation to free-tier hosted APIs. Local compute is limited to parsing, chunking, and CPU/ONNX reranking.
 
-Not a scale project, a demonstration of the pieces that separate a "wrap an LLM around a vector search" demo from something closer to production shape: two-layer caching with intent preservation, structure-aware chunking that respects HCL block boundaries, a hard-gated reranker instead of similarity-only retrieval, provider failover, and full request tracing.
+Not a scale project, a demonstration of the pieces that separate a "wrap an LLM around a vector search" demo from something closer to production shape: two-layer caching with intent preservation, structure-aware chunking that respects Kubernetes manifest boundaries, a hard-gated reranker instead of similarity-only retrieval, provider failover, and full request tracing.
 
 ## Architecture
 
@@ -20,7 +20,7 @@ flowchart TD
     SemanticCache -->|hit| ReturnSemantic([Return cached answer])
     SemanticCache -->|miss| Retrieve[Retrieve top 20 - Qdrant]
     Retrieve --> Rerank[Rerank + hard threshold gate - FlashRank]
-    Rerank -->|zero survivors| NoContext([No grounded documentation])
+    Rerank -->|zero survivors| NoContext([No grounded documentation, cached])
     Rerank -->|survivors| Generate[Generate - main model]
     Generate --> WriteCache[Write exact + semantic cache]
     WriteCache --> ReturnAnswer([Return answer])
@@ -28,9 +28,11 @@ flowchart TD
 
 - **Safety Gate** runs on the raw message, before any other LLM call, so a jailbreak attempt is rejected before it costs a planner call.
 - **Topic Gate** runs on the rewritten standalone question, so context-dependent follow-ups aren't misjudged as off-topic in isolation.
-- Both gates **fail closed**, a classifier error blocks the request rather than letting it through.
+- Both gates **fail closed**, a classifier error, or an unparseable classifier response, blocks the request rather than letting it through.
 - **Exact cache** and **semantic cache** are two independent layers: exact match is cheap with zero false-positive risk but only catches identical questions; semantic cache catches paraphrases but relies on the canonicalization step to preserve intent (e.g. "create" vs "destroy") before the embedding similarity check runs.
 - **Rerank + gate** is two distinct operations: FlashRank reorders candidates by relevance, then a hard score threshold drops anything below it entirely, reordering alone doesn't filter noise out of what reaches the generator.
+- **No-context outcomes are cached too** (exact-match layer, short TTL), so a repeated question with no matching documentation doesn't re-pay retrieval and reranking every time, while still expiring if the corpus is later updated.
+- **Ingestion has its own relevance gate**, separate from the query-time guardrails: `ingest.py` classifies each document's excerpt before chunking and embedding it, and skips anything off-topic to the corpus rather than embedding it and hoping retrieval never surfaces it. Unlike `safety_gate`/`topic_gate`, this fails **open** on a classifier error, a missed rejection just leaves one extra document the rerank gate will likely filter per-query anyway; a false rejection silently shrinks a batch ingestion job with nobody watching to notice.
 
 Implemented as a LangGraph state machine (`src/graph.py`), not a linear script, every node is independently callable and independently testable.
 
@@ -39,11 +41,11 @@ Implemented as a LangGraph state machine (`src/graph.py`), not a linear script, 
 - **Orchestration:** LangGraph  
 - **LLMs:** NVIDIA NIM (primary), Groq (fallback)  
 - **Guardrails:** NVIDIA NemoGuard (content safety & topic control)  
-- **Embeddings:** Google Gemini (`gemini-embedding-001`)  
+- **Embeddings:** Google Gemini (`gemini-embedding-001`), batched per ingested file  
 - **Vector database:** Qdrant  
 - **Reranking:** FlashRank (cross-encoder)  
 - **Caching:** SQLite (exact cache), Qdrant (semantic cache)  
-- **Document processing:** BeautifulSoup4, PyMuPDF, python-docx, python-pptx, Markdown parsing, HCL-aware chunking  
+- **Document processing:** BeautifulSoup4, PyMuPDF, python-docx, python-pptx, Markdown parsing, Kubernetes-manifest-aware chunking  
 - **Evaluation:** RAGAS  
 - **Tracing & observability:** Logfire  
 - **Frontend:** Streamlit  
@@ -53,13 +55,13 @@ Implemented as a LangGraph state machine (`src/graph.py`), not a linear script, 
 
 | Role | Primary | Fallback | Why |
 |---|---|---|---|
-| Main generation | NVIDIA NIM | Groq | retry-then-failover; NIM's RPM-only free tier suits a chatty pipeline better than Groq's tight TPM cap, Groq catches NIM outages |
+| Main generation | NVIDIA NIM | Groq | retry-then-failover on transient errors only; NIM's RPM-only free tier suits a chatty pipeline better than Groq's tight TPM cap, Groq catches NIM outages |
 | Planner (rewrite, canonicalize) | NIM, small model | Groq, small model | kept off the main generation model's rate budget entirely |
 | Guardrails | NIM NemoGuard (topic-control + content-safety) | none, fails closed | purpose-built classifiers, not a general LLM self-policing via system prompt |
 | Embeddings | Google Gemini, `gemini-embedding-001`, truncated to 768 dims | none | GA, free tier, 768 dims keeps Qdrant storage well under free-tier limits |
 | Eval judge | Groq |, | deliberately separate from whatever's serving live traffic |
 
-Exact model IDs live in `.env.example` / `src/config.py`, not hardcoded in the pipeline logic.
+Exact model IDs live in `.env.example` / `src/config.py`, not hardcoded in the pipeline logic. Only transient errors (timeouts, rate limits, connection errors, 5xx) trigger retry-then-failover; non-transient client errors (bad request, auth) propagate immediately rather than wasting a retry and a failover on something that will never succeed.
 
 ## Setup
 
@@ -70,12 +72,12 @@ cp .env.example .env   # fill in NVIDIA_NIM_API_KEY, GROQ_API_KEY, GEMINI_API_KE
 
 pytest tests/ -v
 
-python ingest.py --official-dir data/official --community-dir data/community
+python ingest.py DATA --wipe
 
-streamlit run streamlit_app.py
+streamlit run ui/app.py
 ```
 
-`data/official/` and `data/community/` ship with a small synthetic Terraform doc corpus (original content, not scraped) so the pipeline is testable out of the box, swap in real docs for anything beyond a demo.
+`DATA/` follows a `true_data/` (the real corpus) and `noisy_data/` (off-topic content, expected to be rejected by the ingestion relevance gate, not a lower-trust second tier) convention rather than a curated official/community split, both directories are run through the same `ingest_directory()` path in `ingest.py`. Bring your own `DATA/true_data/` and `DATA/noisy_data/`, there's no bundled starter corpus or fetch script in this project, that's a deliberate choice: any doc-fetching tool needs to be run by you, against sources you've checked, not shipped as something that silently pulls third-party content on your behalf.
 
 ## Configuration: the two threshold knobs
 
@@ -89,33 +91,41 @@ Both live in `.env`, both need empirical tuning against your own corpus and quer
 - Too loose: noisy, weakly-related chunks reach the generator and it hallucinates around them.
 - Too tight: everything gets dropped and the system claims it has no documentation when it does. Cross-encoder scores are **not calibrated probabilities**, don't assume 0.5 means "50% confident." Before trusting any value, print the actual score distribution for a few real queries against your corpus (a quick REPL call to `src.rerank._ranker.rerank(...)` on a handful of retrieved candidates) and set the threshold relative to what you actually see, not the default.
 
+There's also **`NO_CONTEXT_CACHE_TTL_SECONDS`** (default `3600`), how long a cached "no grounded documentation" answer is trusted before the next identical question re-checks retrieval, lower it if you're actively adding to the corpus and don't want a stale no-context verdict to outlive a re-ingest.
+
 ## Project structure
 
 ```
-rag-assistant/
+kubernetes-agentic-rag/
 │
-├── streamlit_app.py                      # Streamlit chat UI (rerun-safe via st.chat_input)
-├── ingest.py                             # CLI pipeline: parse → chunk → embed → upsert
+├── ui/
+│   └── app.py                            # Streamlit chat UI (rerun-safe via st.chat_input)
+├── ingest.py                             # CLI pipeline: parse → relevance-gate → chunk → embed → upsert
 │
 ├── src/                                  # Core RAG pipeline
 │   ├── config.py                         # application settings, retrieval/rerank thresholds
 │   ├── clients.py                        # NIM, Groq, Gemini & Qdrant client singletons with timeouts
-│   ├── llm.py                            # retry-then-failover LLM wrapper
-│   ├── embeddings.py                     # Gemini embedding generation + manual vector normalization
-│   ├── guardrails.py                     # safety_gate() & topic_gate() (fail-closed)
+│   ├── llm.py                            # retry-then-failover LLM wrapper (transient errors only)
+│   ├── embeddings.py                     # Gemini embedding generation, batched, manual vector normalization
+│   ├── guardrails.py                     # safety_gate() & topic_gate() (fail-closed, NeMo Colang-based)
+│   ├── colang_rules.py                   # Colang intent/flow definitions for the guardrails gate
+│   ├── ingest_filter.py                  # ingestion-time document relevance classifier (fails open)
 │   ├── cache.py                          # exact-match and semantic caching layers
-│   ├── parsers.py                        # PDF, HTML, TXT, DOCX & PPTX text extraction
-│   ├── chunking.py                       # markdown-header & HCL-aware document chunking
+│   ├── parsers.py                        # PDF, HTML, TXT, DOCX, PPTX & YAML text extraction
+│   ├── chunking.py                       # markdown-header & Kubernetes-manifest-aware chunking
 │   ├── retrieval.py                      # Qdrant dense vector retrieval
 │   ├── rerank.py                         # FlashRank reranking + hard relevance threshold
 │   ├── graph.py                          # LangGraph orchestration/state machine
 │   └── tracing.py                        # Logfire tracing and observability
 │
-├── data/
+├── DATA/
+│   ├── true_data/                         # the real corpus, bring your own
+│   └── noisy_data/                        # off-topic content the ingestion gate should reject
 │
 ├── eval/
 │   ├── eval_set.json                     # starter evaluation dataset
-│   └── ragas_eval.py                     # RAGAS evaluation (6 retrieval & generation metrics)
+│   ├── dataset.py                        # eval set loader/validator
+│   └── run_eval.py                       # RAGAS evaluation (6 retrieval & generation metrics)
 │
 ├── tests/
 │
@@ -131,7 +141,7 @@ rag-assistant/
 pytest tests/ -v
 ```
 
-Every provider call is mocked, the suite runs with no real API keys and no network beyond `pip install`. `tests/test_chunking.py` runs against zero external dependencies and is worth reading first if you want to see the HCL-block-boundary logic actually exercised, including a regression test for a real bug (leading-whitespace drift in the block-start regex) caught by writing the tests, not assumed away.
+Every provider call is mocked, the suite runs with no real API keys and no network beyond `pip install`. `tests/test_chunking.py` runs against zero external dependencies and is worth reading first if you want to see the manifest-block-boundary logic actually exercised: the chunker uses `apiVersion:` at column zero as an object's start marker and `---` as the document separator, so tests should cover multi-document files, a document with no trailing separator, and prose sections that don't parse as manifests at all (falls back to a sliding window).
 
 ## Evaluation
 
@@ -143,13 +153,13 @@ Runs RAGAS's six metrics (faithfulness, answer relevancy, context precision/reca
 
 ## Intentionally simplified
 
-- **Guardrails call NemoGuard directly** rather than through full NeMo Colang dialog rails, simpler to debug for a solo project, same two models, same fail-closed behavior. Extend by  swapping `src/guardrails.py`'s `_classify()` calls for a Colang-based `LLMRails` if you need multi-turn dialog policy rather than a single input/output classifier gate.
+- **Guardrails call NemoGuard directly** rather than through full NeMo Colang dialog rails, simpler to debug for a solo project, same two models, same fail-closed behavior. Extend by swapping `src/guardrails.py`'s `_classify()` calls for a Colang-based `LLMRails` if you need multi-turn dialog policy rather than a single input/output classifier gate.
 - **NemoGuard prompts are simplified**, not NVIDIA's exact published templates (which are more elaborate and the models were tuned against that specific phrasing). Functionally equivalent, but pull NVIDIA's real templates from the NeMo Guardrails docs before relying on this in production, this is the most likely place classification quality is being left on the table.
-- **The eval set and doc corpus are both synthetic**, written for this project rather than scraped from real sources, for copyright reasons. Swap in real Terraform docs and a real hand-built eval set before treating either as representative.
+- **No bundled corpus.** Bring your own `DATA/true_data/` and `DATA/noisy_data/`. The eval set (`eval/eval_set.json`) is synthetic, written for this project rather than scraped, for copyright reasons, extend it with a real hand-built set before treating its scores as representative.
 
 ## Known limitations
 
 - FlashRank's cross-encoder score is not a calibrated probability, see the threshold section above.
-- The `+0.02` official-source authority boost in `rerank.py` is a tie-breaker only, by design, it will not make a weakly-relevant official chunk outrank a strongly-relevant community one. If official sources aren't showing up for a topic, check whether the corpus actually has relevant official content before assuming the boost is broken.
+- The manifest chunker is a structural heuristic, not a real YAML parser: a block scalar (`|` or `>`) whose literal content happens to contain a line that is exactly `---` will be mis-split as if it were a document boundary. Rare in practice for real Kubernetes manifests, but worth knowing rather than assuming full YAML awareness.
 - No conversation persistence, history lives in `st.session_state` and is lost on page reload. The exact/semantic caches persist independently of chat history, so repeated questions across sessions still benefit from caching even though the visible transcript doesn't.
 - Single-user local demo, not multi-tenant. The exact cache is a local SQLite file (`.cache/exact`); the semantic cache lives in Qdrant and is shared across every session hitting the same Qdrant collection.

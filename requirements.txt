@@ -19,3 +19,6 @@ pytest
 openai
 python-docx
 python-pptx
+nemoguardrails
+langchain-groq
+langchain-google-vertexai

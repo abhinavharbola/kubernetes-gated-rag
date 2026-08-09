@@ -43,6 +43,8 @@ PARSERS = {
     ".htm": parse_html,
     ".txt": parse_txt,
     ".md": parse_txt,
+    ".yaml": parse_txt,  # raw K8s manifests, plain text is enough for the chunker
+    ".yml": parse_txt,
 }
 
 

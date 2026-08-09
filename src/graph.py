@@ -1,13 +1,15 @@
+import time
 from typing import TypedDict
 
 from langgraph.graph import StateGraph, START, END
 
 from src.cache import exact_cache_get, exact_cache_set, semantic_cache_get, semantic_cache_set
+from src.config import settings
 from src.guardrails import safety_gate, topic_gate
 from src.llm import generate_main, generate_planner
 from src.rerank import rerank_and_gate
 from src.retrieval import retrieve
-from src.tracing import node_span, log_cache_decision
+from src.tracing import node_span, log_cache_decision, turn_span
 
 NO_CONTEXT_MESSAGE = (
     "I don't have grounded documentation for that. Try rephrasing, or ask about "
@@ -22,11 +24,14 @@ class GraphState(TypedDict, total=False):
     canonical_question: str
     allowed: bool
     refusal_reason: str | None
+    blocked_stage: str | None
     answer: str
     provider: str | None
+    model: str | None
     cache_layer: str | None
     candidates: list[dict]
     reranked: list[dict]
+    latency_seconds: float | None
 
 
 def safety_gate_node(state: GraphState) -> GraphState:
@@ -34,7 +39,7 @@ def safety_gate_node(state: GraphState) -> GraphState:
     # is rejected before it costs a planner call.
     with node_span("safety_gate"):
         allowed, reason = safety_gate(state["raw_message"])
-        return {"allowed": allowed, "refusal_reason": reason}
+        return {"allowed": allowed, "refusal_reason": reason, "blocked_stage": None if allowed else "safety"}
 
 
 def rewrite_with_history_node(state: GraphState) -> GraphState:
@@ -64,7 +69,7 @@ def topic_gate_node(state: GraphState) -> GraphState:
     # aren't misjudged as off-topic.
     with node_span("topic_gate"):
         allowed, reason = topic_gate(state["standalone_question"])
-        return {"allowed": allowed, "refusal_reason": reason}
+        return {"allowed": allowed, "refusal_reason": reason, "blocked_stage": None if allowed else "topic"}
 
 
 def exact_cache_node(state: GraphState) -> GraphState:
@@ -82,7 +87,7 @@ def canonicalize_node(state: GraphState) -> GraphState:
             [
                 {
                     "role": "system",
-                    "content": "Normalize the phrasing of this Terraform question into a consistent "
+                    "content": "Normalize the phrasing of this Kubernetes question into a consistent "
                     "canonical form, so that different phrasings asking the same thing (e.g. 'what is X', "
                     "'tell me about X', 'explain X') produce the same canonical question. Preserve the "
                     "specific topic and scope exactly as asked, do not add or remove details, and do not "
@@ -123,14 +128,14 @@ def generate_node(state: GraphState) -> GraphState:
             [
                 {
                     "role": "system",
-                    "content": "Answer the Terraform question using ONLY the provided context. "
+                    "content": "Answer the Kubernetes question using ONLY the provided context. "
                     "If the context doesn't fully cover the question, say what's missing "
                     "rather than guessing.",
                 },
                 {"role": "user", "content": f"Context:\n{context}\n\nQuestion: {state['standalone_question']}"},
             ]
         )
-        return {"answer": result.content, "provider": result.provider}
+        return {"answer": result.content, "provider": result.provider, "model": result.model}
 
 
 def write_caches_node(state: GraphState) -> GraphState:
@@ -138,6 +143,21 @@ def write_caches_node(state: GraphState) -> GraphState:
         exact_cache_set(state["standalone_question"], state["answer"])
         semantic_cache_set(state["canonical_question"], state["answer"])
         return {}
+
+
+def cache_no_context_node(state: GraphState) -> GraphState:
+    # zero reranked survivors means there's no grounded documentation for
+    # this question right now. That's cached too (exact-match only, with a
+    # TTL rather than forever) so a repeated identical question doesn't
+    # re-pay embedding + retrieval + rerank for an answer that won't change
+    # until the corpus does, while still expiring if the corpus is updated.
+    with node_span("cache_no_context"):
+        exact_cache_set(
+            state["standalone_question"],
+            NO_CONTEXT_MESSAGE,
+            expire=settings.no_context_cache_ttl_seconds,
+        )
+        return {"answer": NO_CONTEXT_MESSAGE}
 
 
 def route_after_safety_gate(state: GraphState) -> str:
@@ -157,7 +177,7 @@ def route_after_semantic_cache(state: GraphState) -> str:
 
 
 def route_after_rerank(state: GraphState) -> str:
-    return "generate" if state["reranked"] else END
+    return "generate" if state["reranked"] else "cache_no_context"
 
 
 def build_graph():
@@ -173,6 +193,7 @@ def build_graph():
     graph.add_node("rerank_and_gate", rerank_node)
     graph.add_node("generate", generate_node)
     graph.add_node("write_caches", write_caches_node)
+    graph.add_node("cache_no_context", cache_no_context_node)
 
     graph.add_edge(START, "safety_gate")
     graph.add_conditional_edges("safety_gate", route_after_safety_gate)
@@ -185,6 +206,7 @@ def build_graph():
     graph.add_edge("retrieve", "rerank_and_gate")
     graph.add_edge("generate", "write_caches")
     graph.add_edge("write_caches", END)
+    graph.add_edge("cache_no_context", END)
 
     return graph.compile()
 
@@ -194,10 +216,11 @@ compiled_graph = build_graph()
 
 
 def run_turn(raw_message: str, chat_history: list[dict]) -> GraphState:
-    initial_state: GraphState = {"raw_message": raw_message, "chat_history": chat_history}
-    final_state = compiled_graph.invoke(initial_state)
-    if not final_state.get("allowed", True):
-        final_state["answer"] = final_state["refusal_reason"]
-    elif final_state.get("cache_layer") is None and not final_state.get("reranked"):
-        final_state["answer"] = NO_CONTEXT_MESSAGE
+    start = time.perf_counter()
+    with turn_span(raw_message):
+        initial_state: GraphState = {"raw_message": raw_message, "chat_history": chat_history}
+        final_state = compiled_graph.invoke(initial_state)
+        if not final_state.get("allowed", True):
+            final_state["answer"] = final_state["refusal_reason"]
+    final_state["latency_seconds"] = time.perf_counter() - start
     return final_state

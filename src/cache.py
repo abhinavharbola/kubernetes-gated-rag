@@ -25,8 +25,11 @@ def exact_cache_get(question: str) -> str | None:
     return _exact_cache.get(normalize_exact(question))
 
 
-def exact_cache_set(question: str, answer: str) -> None:
-    _exact_cache.set(normalize_exact(question), answer)
+def exact_cache_set(question: str, answer: str, expire: float | None = None) -> None:
+    # expire=None (default) never expires, used for real generated answers.
+    # A finite expire is used for cached no-context outcomes, so a stale
+    # "no docs for this" verdict doesn't outlive a later re-ingest.
+    _exact_cache.set(normalize_exact(question), answer, expire=expire)
 
 
 def semantic_cache_get(canonical_question: str) -> str | None:

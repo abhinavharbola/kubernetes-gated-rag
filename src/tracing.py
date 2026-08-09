@@ -2,7 +2,7 @@ import logfire
 
 from src.config import settings
 
-logfire.configure(token=settings.logfire_token, service_name="terraform-agentic-rag")
+logfire.configure(token=settings.logfire_token, service_name="kubernetes-agentic-rag")
 
 
 def turn_span(user_message: str):

@@ -5,12 +5,12 @@ from src.config import settings
 from src.embeddings import embed_query
 
 
-def retrieve(question: str, resource_type: str | None = None, top_k: int | None = None) -> list[dict]:
+def retrieve(question: str, manifest_kind: str | None = None, top_k: int | None = None) -> list[dict]:
     vector = embed_query(question)
     query_filter = None
-    if resource_type:
+    if manifest_kind:
         query_filter = Filter(
-            must=[FieldCondition(key="resource_type", match=MatchValue(value=resource_type))]
+            must=[FieldCondition(key="manifest_kind", match=MatchValue(value=manifest_kind))]
         )
 
     results = qdrant_client.query_points(

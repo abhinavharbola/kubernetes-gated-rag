@@ -3,8 +3,9 @@ import logging
 from langchain_groq import ChatGroq
 from nemoguardrails import LLMRails, RailsConfig
 
-from src.colang_rules import COLANG_CONTENT, JAILBREAK_INDICATORS, OFF_TOPIC_INDICATORS, YAML_CONTENT
+from src.colang_rules import COLANG_CONTENT, JAILBREAK_INDICATORS, YAML_CONTENT
 from src.config import settings
+from src.llm import generate_planner
 
 logger = logging.getLogger(__name__)
 
@@ -17,14 +18,24 @@ UNSAFE_REFUSAL = (
     "orchestration questions, happy to help if you'd like to ask one."
 )
 
+TOPIC_SYSTEM_PROMPT = (
+    "You are a topic-control classifier for a Kubernetes documentation assistant. Do "
+    "not classify a message as on-topic unless it concerns Kubernetes objects, manifests, "
+    "controllers (Deployments, StatefulSets, Services, etc.), cluster operations, or "
+    "container orchestration workflows. General programming requests (write code, solve "
+    "an algorithm, explain a language feature) that are not specifically about Kubernetes "
+    "are off-topic, even though they're technical. Only classify small talk (greetings, "
+    "thanks) as on-topic in addition to that. Respond with exactly one word: 'on-topic' "
+    "or 'off-topic'."
+)
+
 _rails: LLMRails | None = None
 
 
 def _get_rails() -> LLMRails:
     # lazily built once per process rather than at import time: Colang
     # parsing has real startup cost, worth paying once, not per request, but
-    # also not worth paying at all for code paths (e.g. a plain unit test
-    # importing this module) that never actually call the gate.
+    # also not worth paying at all for code paths that never call the gate.
     global _rails
     if _rails is None:
         guard_llm = ChatGroq(api_key=settings.groq_api_key, model=settings.groq_planner_model, temperature=0)
@@ -34,24 +45,40 @@ def _get_rails() -> LLMRails:
     return _rails
 
 
-def _flow_fired(message: str, indicators: list[str]) -> bool:
-    rails = _get_rails()
-    result = rails.generate(messages=[{"role": "user", "content": message}])
-    # LLMRails.generate returns {'role': 'assistant', 'content': '...'}
-    content = result.get("content", "") if isinstance(result, dict) else str(result)
-    return any(indicator in content for indicator in indicators)
-
-
 def check_safety(raw_message: str) -> bool:
-    # checks only for the jailbreak flow specifically. If a different flow
-    # fires instead (off-topic, greeting, ...), that's not this gate's job:
-    # topic_gate handles off-topic later, on the rewritten question, and
-    # small talk is allowed through by design.
-    return not _flow_fired(raw_message, JAILBREAK_INDICATORS)
+    # Colang's few-shot flow matching is a good fit for jailbreak detection
+    # specifically: jailbreak attempts share distinctive, recognizable
+    # phrasing regardless of surrounding topic, which is exactly what
+    # few-shot similarity matching is good at.
+    rails = _get_rails()
+    result = rails.generate(messages=[{"role": "user", "content": raw_message}])
+    content = result.get("content", "") if isinstance(result, dict) else str(result)
+    return not any(indicator in content for indicator in JAILBREAK_INDICATORS)
 
 
 def check_topic(standalone_question: str) -> bool:
-    return not _flow_fired(standalone_question, OFF_TOPIC_INDICATORS)
+    # deliberately NOT the Colang few-shot flow: "is this on-topic for
+    # Kubernetes" is an open-ended classification over an unbounded space of
+    # possible off-topic requests, not a small set of recognizable patterns.
+    # Few-shot matching against a fixed example list generalizes poorly to
+    # categories the examples don't resemble — e.g. "give me python code for
+    # two sum" didn't match any "off topic" example closely enough, fell
+    # through Colang's general-response flow, and got answered directly
+    # instead of refused. A direct classifier judges the actual question
+    # asked, not its distance from a handful of memorized examples.
+    result = generate_planner(
+        [
+            {"role": "system", "content": TOPIC_SYSTEM_PROMPT},
+            {"role": "user", "content": standalone_question},
+        ]
+    )
+    verdict = result.content.strip().lower()
+    if "on-topic" in verdict:
+        return True
+    if "off-topic" in verdict:
+        return False
+    logger.warning("topic gate got unparseable verdict %r, failing closed", verdict)
+    return False
 
 
 def safety_gate(raw_message: str) -> tuple[bool, str | None]:

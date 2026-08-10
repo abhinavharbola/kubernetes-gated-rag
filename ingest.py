@@ -1,9 +1,12 @@
 import argparse
 import logging
+import time
 import uuid
 from pathlib import Path
 
+from qdrant_client.http.exceptions import ResponseHandlingException
 from qdrant_client.models import Distance, PointStruct, VectorParams
+from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
 from src.chunking import chunk_document
 from src.clients import qdrant_client
@@ -22,6 +25,34 @@ logger = logging.getLogger(__name__)
 # second tier of valid content).
 TRUE_DIR_NAME = "true_data"
 NOISY_DIR_NAME = "noisy_data"
+
+# Gemini's free-tier embed_content quota is 100 requests/minute. embed_texts()
+# already retries on a 429 respecting the server's suggested backoff, but
+# that's a reactive fix — spacing ingestion's own calls out proactively means
+# fewer 429s to react to in the first place. 1s between files keeps a
+# many-small-files corpus comfortably under the ceiling; raise this if you're
+# still hitting 429s with a lot of files.
+INGEST_EMBED_DELAY_SECONDS = 1.0
+
+# a single large-file upsert (many points, each with a full vector + text
+# payload) can be a big enough request body to hit a write timeout on a
+# free-tier Qdrant Cloud connection. Splitting into smaller batches keeps
+# each request quick and means a mid-file failure doesn't lose the points
+# that already made it in.
+UPSERT_BATCH_SIZE = 64
+
+
+@retry(
+    stop=stop_after_attempt(4),
+    wait=wait_exponential(multiplier=2, min=2, max=30),
+    retry=retry_if_exception_type(ResponseHandlingException),
+    reraise=True,
+)
+def _upsert_batch(points: list[PointStruct]) -> None:
+    # ResponseHandlingException wraps transport-level failures (timeouts,
+    # connection resets), not a real server-side rejection of the request
+    # (that's UnexpectedResponse, a 4xx/5xx with a body) — safe to retry.
+    qdrant_client.upsert(collection_name=settings.qdrant_docs_collection, points=points)
 
 
 def ensure_collection(wipe: bool = False) -> None:
@@ -69,6 +100,7 @@ def ingest_directory(directory: Path) -> dict:
             # one batched call for every chunk in this file instead of
             # one Gemini round-trip per chunk.
             vectors = embed_texts([chunk["text"] for chunk in chunks], task_type="RETRIEVAL_DOCUMENT")
+            time.sleep(INGEST_EMBED_DELAY_SECONDS)
 
             points = [
                 PointStruct(
@@ -79,7 +111,8 @@ def ingest_directory(directory: Path) -> dict:
                 for chunk, vector in zip(chunks, vectors)
             ]
 
-            qdrant_client.upsert(collection_name=settings.qdrant_docs_collection, points=points)
+            for batch_start in range(0, len(points), UPSERT_BATCH_SIZE):
+                _upsert_batch(points[batch_start : batch_start + UPSERT_BATCH_SIZE])
             ingested += len(points)
 
     return {"ingested": ingested, "skipped_irrelevant": skipped_irrelevant}

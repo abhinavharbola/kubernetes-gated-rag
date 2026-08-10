@@ -21,4 +21,4 @@ python-docx
 python-pptx
 nemoguardrails
 langchain-groq
-langchain-google-vertexai
+langchain-google-vertexai  # required for NeMo Guardrails' internal import to succeed, unused otherwise, no GCP credentials needed

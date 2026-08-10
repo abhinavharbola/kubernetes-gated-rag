@@ -2,8 +2,23 @@ import logging
 import sys
 from pathlib import Path
 
-import streamlit as st
+# app.py lives in ui/, one level below the repo root, so the repo root
+# (where the src/ package lives) has to be added explicitly. Without this,
+# `from src...` only works by accident of whatever directory the process
+# happened to be launched from.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+# NeMo Guardrails and httpx both log at INFO by default, including the full
+# Colang phase-by-phase prompt/response trace for every gate check. That's
+# not a separate or leaked conversation — it's this app's own safety_gate()
+# doing its job — but it's not meant for a normal terminal, only useful when
+# actually debugging the gate itself. Quiet by default; flip back to INFO
+# locally if you need to see what a gate call is actually doing.
+logging.getLogger("nemoguardrails").setLevel(logging.WARNING)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+
+import streamlit as st
 
 from src.clients import qdrant_client
 from src.config import settings
@@ -23,25 +38,26 @@ CUSTOM_CSS = """
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap');
 
 :root {
-    --bg: #0e1117;
-    --border: rgba(148, 163, 184, 0.14);
-    --border-accent: rgba(61, 174, 160, 0.2);
-    --text-primary: #e5e7eb;
-    --text-muted: #9199a8;
-    --text-faint: #5b6472;
-    --accent: #3DAEA0;
-    --accent-strong: #2E8B7F;
-    --accent-soft: rgba(61, 174, 160, 0.09);
-    --warn-strong: #B5573D;
-    --warn-soft: rgba(217, 119, 87, 0.09);
-    --danger: #C0392B;
-    --danger-soft: rgba(192, 57, 43, 0.09);
-    --neutral: #4b5563;
+    --bg: #FBF7F2;
+    --surface: #FFFFFF;
+    --border: rgba(58, 46, 39, 0.10);
+    --border-accent: rgba(199, 106, 63, 0.28);
+    --text-primary: #3A2E27;
+    --text-muted: #8A7A6D;
+    --text-faint: #C2B3A5;
+    --accent: #C76A3F;
+    --accent-strong: #A8532F;
+    --accent-soft: rgba(199, 106, 63, 0.10);
+    --warn-strong: #A8532F;
+    --warn-soft: rgba(199, 106, 63, 0.10);
+    --danger: #B33A2E;
+    --danger-soft: rgba(179, 58, 46, 0.08);
+    --neutral: #C2B3A5;
     --font-sans: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
     --font-mono: "JetBrains Mono", "Fira Code", ui-monospace, monospace;
 }
 
-.stApp { font-family: var(--font-sans); }
+.stApp { font-family: var(--font-sans); background: var(--bg); }
 .stApp [data-testid="stChatMessage"] { gap: 0.6rem; }
 code, .mono { font-family: var(--font-mono); }
 
@@ -62,22 +78,27 @@ code, .mono { font-family: var(--font-mono); }
     display: inline-flex; align-items: center; gap: 0.4rem; white-space: nowrap;
 }
 .status-pill.operational { color: var(--accent-strong); border: 1px solid var(--border-accent); background: var(--accent-soft); }
-.status-pill.degraded { color: var(--warn-strong); border: 1px solid rgba(217, 119, 87, 0.35); background: var(--warn-soft); }
+.status-pill.degraded { color: var(--danger); border: 1px solid rgba(179, 58, 46, 0.3); background: var(--danger-soft); }
 .status-dot { width: 6px; height: 6px; border-radius: 50%; background: currentColor; display: inline-block; }
+
+/* --- history fade while a new turn is generating --- */
+.st-key-history_normal { opacity: 1; transition: opacity 0.3s ease; }
+.st-key-history_dim { opacity: 0.38; filter: saturate(0.7); transition: opacity 0.3s ease; pointer-events: none; }
 
 /* --- pipeline trace --- */
 .trace-row { display: flex; flex-wrap: wrap; align-items: stretch; gap: 0.4rem; margin: 0.6rem 0 0.15rem 0; }
 .trace-step {
     display: flex; flex-direction: column; justify-content: center; gap: 0.08rem;
     padding: 0.32rem 0.65rem; border-radius: 6px;
-    background: rgba(255, 255, 255, 0.025);
+    background: var(--surface);
+    border: 1px solid var(--border);
     border-left: 3px solid var(--accent);
     min-width: 82px;
 }
 .trace-step.fail { border-left-color: var(--danger); }
 .trace-step.hit { border-left-color: var(--accent-strong); background: var(--accent-soft); }
-.trace-step.skip { border-left-color: var(--neutral); opacity: 0.55; }
-.trace-step.pending { border-left-color: var(--text-faint); border-left-style: dashed; opacity: 0.5; background: transparent; }
+.trace-step.skip { border-left-color: var(--neutral); opacity: 0.65; }
+.trace-step.pending { border-left-color: var(--text-faint); border-left-style: dashed; opacity: 0.6; background: transparent; }
 .trace-step .trace-label {
     font-family: var(--font-mono); font-size: 0.6rem; letter-spacing: 0.07em;
     text-transform: uppercase; color: var(--text-muted);
@@ -104,7 +125,7 @@ code, .mono { font-family: var(--font-mono); }
 }
 .source-row:last-child { border-bottom: none; }
 .source-meta { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-primary); }
-.source-score-wrap { height: 5px; border-radius: 3px; background: rgba(255, 255, 255, 0.06); overflow: hidden; }
+.source-score-wrap { height: 5px; border-radius: 3px; background: rgba(58, 46, 39, 0.08); overflow: hidden; }
 .source-score-bar { height: 100%; background: var(--accent); }
 .source-row .score { color: var(--accent-strong); text-align: right; }
 
@@ -118,7 +139,7 @@ code, .mono { font-family: var(--font-mono); }
 .welcome-caption { color: var(--text-faint); font-size: 0.74rem; margin: 0.3rem 0 1.1rem 0; }
 
 /* --- sidebar --- */
-[data-testid="stSidebar"] { border-right: 1px solid var(--border-accent); }
+[data-testid="stSidebar"] { border-right: 1px solid var(--border-accent); background: var(--surface); }
 .eyebrow {
     font-family: var(--font-mono); font-size: 0.68rem; letter-spacing: 0.08em;
     text-transform: uppercase; color: var(--text-faint); margin: 0.2rem 0 0.5rem 0;
@@ -134,12 +155,12 @@ code, .mono { font-family: var(--font-mono); }
     display: flex; align-items: center; gap: 0.55rem;
 }
 .status-dot-inline { width: 7px; height: 7px; border-radius: 50%; display: inline-block; flex-shrink: 0; }
-.status-dot-inline.up { background: var(--accent-strong); box-shadow: 0 0 4px rgba(61, 174, 160, 0.6); }
+.status-dot-inline.up { background: var(--accent-strong); box-shadow: 0 0 4px rgba(199, 106, 63, 0.5); }
 .status-dot-inline.down { background: var(--danger); }
 
 .error-note {
     font-family: var(--font-mono); font-size: 0.76rem; color: var(--danger);
-    background: var(--danger-soft); border: 1px solid rgba(192, 57, 43, 0.3);
+    background: var(--danger-soft); border: 1px solid rgba(179, 58, 46, 0.25);
     border-radius: 6px; padding: 0.5rem 0.7rem; margin-top: 0.5rem;
 }
 </style>
@@ -195,6 +216,17 @@ def get_session_stats():
     return total, f"{round(cache_hits / total * 100)}%", avg_latency
 
 
+# chat_input is called early, even though it visually renders pinned to the
+# bottom of the page regardless of call order (Streamlit's own behavior) —
+# doing this before rendering history lets the history block below know
+# whether a new turn is about to be generated, so it can fade itself.
+prompt = st.chat_input("Ask a Kubernetes question")
+if not prompt and st.session_state.pending_prompt:
+    prompt = st.session_state.pending_prompt
+    st.session_state.pending_prompt = None
+
+is_generating = bool(prompt)
+
 # ---------- header ----------
 
 provider_status = {label: check() for label, check in PROVIDER_KEYS.items()}
@@ -238,6 +270,9 @@ with st.sidebar:
         for label, ok in provider_status.items()
     )
     st.markdown(f'<div class="provider-list">{provider_rows}</div>', unsafe_allow_html=True)
+
+    st.markdown('<div class="eyebrow" style="margin-top: 1rem;">Display</div>', unsafe_allow_html=True)
+    show_trace = st.toggle("Show pipeline trace", value=False)
 
     st.divider()
     if st.button("Clear conversation", use_container_width=True):
@@ -340,21 +375,22 @@ if not st.session_state.history:
     st.markdown(
         '<p class="welcome-note">Every answer passes through safety and topic '
         "gating, a two-layer cache, and a hard-gated reranker before it reaches the "
-        "model, or gets stopped along the way. The bar below any answer shows exactly "
-        "which of these stages ran and what each one decided:</p>",
+        "model, or gets stopped along the way. Turn on \"Show pipeline trace\" in the "
+        "sidebar to see exactly which stages ran and what each one decided.</p>",
         unsafe_allow_html=True,
     )
-    preview_html = ""
-    for i, stage in enumerate(PIPELINE_STAGES):
-        preview_html += (
-            f'<div class="trace-step pending">'
-            f'<span class="trace-label">{stage}</span>'
-            f'<span class="trace-value">pending</span>'
-            f"</div>"
-        )
-        if i < len(PIPELINE_STAGES) - 1:
-            preview_html += '<div class="trace-arrow">&#8594;</div>'
-    st.markdown(f'<div class="trace-row">{preview_html}</div>', unsafe_allow_html=True)
+    if show_trace:
+        preview_html = ""
+        for i, stage in enumerate(PIPELINE_STAGES):
+            preview_html += (
+                f'<div class="trace-step pending">'
+                f'<span class="trace-label">{stage}</span>'
+                f'<span class="trace-value">pending</span>'
+                f"</div>"
+            )
+            if i < len(PIPELINE_STAGES) - 1:
+                preview_html += '<div class="trace-arrow">&#8594;</div>'
+        st.markdown(f'<div class="trace-row">{preview_html}</div>', unsafe_allow_html=True)
     st.markdown('<p class="welcome-caption">Try one of these, or ask your own below.</p>', unsafe_allow_html=True)
 
     cols = st.columns(2)
@@ -365,16 +401,15 @@ if not st.session_state.history:
                 st.session_state.pending_prompt = question
             st.markdown("</div>", unsafe_allow_html=True)
 
-for turn in st.session_state.history:
-    with st.chat_message(turn["role"]):
-        st.markdown(turn["content"])
-        if turn["role"] == "assistant" and turn.get("details"):
-            render_trace(turn["details"])
-
-prompt = st.chat_input("Ask a Kubernetes question")
-if not prompt and st.session_state.pending_prompt:
-    prompt = st.session_state.pending_prompt
-    st.session_state.pending_prompt = None
+# past turns fade out while a new one is being generated, so attention goes
+# to the active exchange below rather than the settled conversation above it
+history_container = st.container(key="history_dim" if is_generating else "history_normal")
+with history_container:
+    for turn in st.session_state.history:
+        with st.chat_message(turn["role"]):
+            st.markdown(turn["content"])
+            if turn["role"] == "assistant" and show_trace and turn.get("details"):
+                render_trace(turn["details"])
 
 if prompt:
     st.session_state.history.append({"role": "user", "content": prompt})
@@ -414,7 +449,8 @@ if prompt:
                 "sources": result.get("reranked") if not result.get("cache_layer") else None,
                 "latency_seconds": result.get("latency_seconds"),
             }
-        render_trace(details)
+        if show_trace:
+            render_trace(details)
 
     st.session_state.history.append({"role": "assistant", "content": answer, "details": details})
     get_corpus_stats.clear()

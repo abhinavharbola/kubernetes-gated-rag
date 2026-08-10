@@ -23,4 +23,5 @@ gemini_client = genai.Client(api_key=settings.gemini_api_key)
 qdrant_client = QdrantClient(
     url=settings.qdrant_url,
     api_key=settings.qdrant_api_key,
+    timeout=60.0,
 )

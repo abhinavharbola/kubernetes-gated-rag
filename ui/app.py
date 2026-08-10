@@ -35,7 +35,7 @@ PIPELINE_ERROR_MESSAGE = (
 
 CUSTOM_CSS = """
 <style>
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap');
 
 :root {
     --bg: #FBF7F2;
@@ -63,27 +63,28 @@ code, .mono { font-family: var(--font-mono); }
 
 /* --- header --- */
 .app-header {
-    display: flex; justify-content: space-between; align-items: flex-end;
-    padding-bottom: 0.7rem; margin-bottom: 1rem;
+    position: relative;
+    display: flex; flex-direction: column; align-items: center; text-align: center;
+    padding: 0.5rem 0 1.1rem 0; margin-bottom: 1.2rem;
     border-bottom: 1px solid var(--border-accent);
 }
 .app-header .title-block h1 {
-    margin: 0; font-family: var(--font-sans); font-size: 1.4rem;
-    font-weight: 700; letter-spacing: -0.015em; color: var(--text-primary);
+    margin: 0; font-family: var(--font-sans); font-size: 2.5rem;
+    font-weight: 800; letter-spacing: -0.03em; color: var(--text-primary); line-height: 1.15;
 }
-.app-header .title-block .tagline { color: var(--text-muted); font-size: 0.83rem; margin-top: 0.22rem; }
+.app-header .title-block .tagline { color: var(--text-muted); font-size: 0.95rem; margin-top: 0.4rem; }
 .status-pill {
     font-family: var(--font-mono); font-size: 0.68rem; letter-spacing: 0.02em;
     padding: 0.28rem 0.7rem; border-radius: 999px;
     display: inline-flex; align-items: center; gap: 0.4rem; white-space: nowrap;
+    position: absolute; top: 0.5rem; right: 0;
 }
 .status-pill.operational { color: var(--accent-strong); border: 1px solid var(--border-accent); background: var(--accent-soft); }
 .status-pill.degraded { color: var(--danger); border: 1px solid rgba(179, 58, 46, 0.3); background: var(--danger-soft); }
 .status-dot { width: 6px; height: 6px; border-radius: 50%; background: currentColor; display: inline-block; }
 
-/* --- history fade while a new turn is generating --- */
-.st-key-history_normal { opacity: 1; transition: opacity 0.3s ease; }
-.st-key-history_dim { opacity: 0.38; filter: saturate(0.7); transition: opacity 0.3s ease; pointer-events: none; }
+/* history fade opacity is now injected dynamically alongside the container,
+   see the history_block section below, not fixed here */
 
 /* --- pipeline trace --- */
 .trace-row { display: flex; flex-wrap: wrap; align-items: stretch; gap: 0.4rem; margin: 0.6rem 0 0.15rem 0; }
@@ -149,7 +150,7 @@ code, .mono { font-family: var(--font-mono); }
 }
 [data-testid="stSidebar"] [data-testid="stMetricLabel"] { font-size: 0.66rem; color: var(--text-muted); }
 
-.provider-list { display: flex; flex-direction: column; gap: 0.42rem; }
+.provider-list { display: grid; grid-template-columns: 1fr 1fr; gap: 0.5rem 0.75rem; }
 .provider-row {
     font-family: var(--font-mono); font-size: 0.78rem; color: var(--text-primary);
     display: flex; align-items: center; gap: 0.55rem;
@@ -402,8 +403,23 @@ if not st.session_state.history:
             st.markdown("</div>", unsafe_allow_html=True)
 
 # past turns fade out while a new one is being generated, so attention goes
-# to the active exchange below rather than the settled conversation above it
-history_container = st.container(key="history_dim" if is_generating else "history_normal")
+# to the active exchange below rather than the settled conversation above it.
+# The container's own key MUST stay constant across runs — switching keys
+# based on state makes Streamlit treat it as a different element each time,
+# which breaks reconciliation mid-run and was leaving stale content behind
+# during generation. Only the injected CSS values change, not the container.
+st.markdown(
+    f"""<style>
+    .st-key-history_block {{
+        opacity: {"0.38" if is_generating else "1"};
+        filter: saturate({"0.7" if is_generating else "1"});
+        transition: opacity 0.3s ease;
+        pointer-events: {"none" if is_generating else "auto"};
+    }}
+    </style>""",
+    unsafe_allow_html=True,
+)
+history_container = st.container(key="history_block")
 with history_container:
     for turn in st.session_state.history:
         with st.chat_message(turn["role"]):

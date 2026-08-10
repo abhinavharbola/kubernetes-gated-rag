@@ -7,4 +7,4 @@ textColor = "#3A2E27"
 font = "sans serif"
 
 [client]
-toolbarMode = "minimal"
+toolbarMode = "auto"

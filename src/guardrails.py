@@ -29,6 +29,13 @@ TOPIC_SYSTEM_PROMPT = (
     "or 'off-topic'."
 )
 
+SAFETY_SYSTEM_PROMPT = (
+    "Check if the user message contains unsafe content: violence, illegal activity, "
+    "harassment, hate speech, sexual content, self-harm, or other harmful material. "
+    "This is independent of topic, a message can be unsafe regardless of whether it "
+    "mentions Kubernetes at all. Respond with exactly one word: 'safe' or 'unsafe'."
+)
+
 _rails: LLMRails | None = None
 
 
@@ -46,14 +53,35 @@ def _get_rails() -> LLMRails:
 
 
 def check_safety(raw_message: str) -> bool:
-    # Colang's few-shot flow matching is a good fit for jailbreak detection
-    # specifically: jailbreak attempts share distinctive, recognizable
-    # phrasing regardless of surrounding topic, which is exactly what
-    # few-shot similarity matching is good at.
+    # two independent checks, either firing is enough to block. Colang's
+    # few-shot flow catches jailbreak-pattern attempts specifically (its
+    # strength: jailbreaks share recognizable phrasing regardless of topic).
+    # It does NOT catch general unsafe content that isn't phrased like a
+    # jailbreak — violence, harassment, and similar categories were passing
+    # this gate entirely and only getting caught downstream by topic_gate
+    # rejecting them as off-topic, for the wrong reason, and not at all if
+    # the content happened to be phrased in an on-topic-sounding way. The
+    # direct classifier below closes that gap the same way it closed
+    # check_topic's few-shot generalization gap.
     rails = _get_rails()
     result = rails.generate(messages=[{"role": "user", "content": raw_message}])
     content = result.get("content", "") if isinstance(result, dict) else str(result)
-    return not any(indicator in content for indicator in JAILBREAK_INDICATORS)
+    if any(indicator in content for indicator in JAILBREAK_INDICATORS):
+        return False
+
+    classifier_result = generate_planner(
+        [
+            {"role": "system", "content": SAFETY_SYSTEM_PROMPT},
+            {"role": "user", "content": raw_message},
+        ]
+    )
+    verdict = classifier_result.content.strip().lower()
+    if "unsafe" in verdict:
+        return False
+    if "safe" in verdict:
+        return True
+    logger.warning("safety classifier gave unparseable verdict %r, failing closed", verdict)
+    return False
 
 
 def check_topic(standalone_question: str) -> bool:

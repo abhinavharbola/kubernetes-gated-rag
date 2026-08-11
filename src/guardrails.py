@@ -25,18 +25,40 @@ TOPIC_SYSTEM_PROMPT = (
     "container orchestration workflows. General programming requests (write code, solve "
     "an algorithm, explain a language feature) that are not specifically about Kubernetes "
     "are off-topic, even though they're technical. Only classify small talk (greetings, "
-    "thanks) as on-topic in addition to that. Respond with exactly one word: 'on-topic' "
-    "or 'off-topic'."
+    "thanks) as on-topic in addition to that. Respond with exactly one word and nothing "
+    "else, no explanation, no punctuation: on-topic or off-topic."
 )
 
 SAFETY_SYSTEM_PROMPT = (
-    "Check if the user message contains unsafe content: violence, illegal activity, "
-    "harassment, hate speech, sexual content, self-harm, or other harmful material. "
+    "Classify whether the user message contains clearly unsafe content: explicit "
+    "violence, illegal activity, harassment, hate speech, sexual content, or self-harm. "
     "This is independent of topic, a message can be unsafe regardless of whether it "
-    "mentions Kubernetes at all. Respond with exactly one word: 'safe' or 'unsafe'."
+    "mentions Kubernetes at all. Ordinary questions are safe even if they are off-topic, "
+    "mundane, or unrelated to Kubernetes, being off-topic is not itself a safety issue. "
+    "When in doubt, classify as safe, only flag content that is unambiguously harmful. "
+    "Respond with exactly one word and nothing else, no explanation, no punctuation: "
+    "safe or unsafe."
 )
 
 _rails: LLMRails | None = None
+
+
+def _parse_binary_verdict(raw: str, true_word: str, false_word: str) -> bool | None:
+    # checks only the FIRST token of the response, not "does this word
+    # appear anywhere" — a substring-anywhere check misfires if the model
+    # adds any preamble at all, e.g. "this is safe, not unsafe" contains
+    # "unsafe" as a literal substring despite the actual verdict being
+    # safe. We asked for exactly one word; treat only that first word as
+    # the verdict, ignore whatever the model says around it.
+    stripped = raw.strip()
+    if not stripped:
+        return None
+    first_token = stripped.split()[0].strip(".,!?\"'").lower()
+    if first_token == false_word:
+        return False
+    if first_token == true_word:
+        return True
+    return None
 
 
 def _get_rails() -> LLMRails:
@@ -75,13 +97,11 @@ def check_safety(raw_message: str) -> bool:
             {"role": "user", "content": raw_message},
         ]
     )
-    verdict = classifier_result.content.strip().lower()
-    if "unsafe" in verdict:
+    verdict = _parse_binary_verdict(classifier_result.content, true_word="safe", false_word="unsafe")
+    if verdict is None:
+        logger.warning("safety classifier gave unparseable verdict %r, failing closed", classifier_result.content)
         return False
-    if "safe" in verdict:
-        return True
-    logger.warning("safety classifier gave unparseable verdict %r, failing closed", verdict)
-    return False
+    return verdict
 
 
 def check_topic(standalone_question: str) -> bool:
@@ -100,13 +120,11 @@ def check_topic(standalone_question: str) -> bool:
             {"role": "user", "content": standalone_question},
         ]
     )
-    verdict = result.content.strip().lower()
-    if "on-topic" in verdict:
-        return True
-    if "off-topic" in verdict:
+    verdict = _parse_binary_verdict(result.content, true_word="on-topic", false_word="off-topic")
+    if verdict is None:
+        logger.warning("topic gate got unparseable verdict %r, failing closed", result.content)
         return False
-    logger.warning("topic gate got unparseable verdict %r, failing closed", verdict)
-    return False
+    return verdict
 
 
 def safety_gate(raw_message: str) -> tuple[bool, str | None]:

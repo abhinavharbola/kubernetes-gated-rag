@@ -4,6 +4,25 @@ A retrieval-augmented Q&A system for Kubernetes questions, built to run entirely
 
 Not a scale project, a demonstration of the pieces that separate a "wrap an LLM around a vector search" demo from something closer to production shape: two-layer caching with intent preservation, structure-aware chunking that respects Kubernetes manifest boundaries, a hard-gated reranker instead of similarity-only retrieval, provider failover, and full request tracing.
 
+<p align="center">
+  <img src="docs/screenshot.png" alt="Kubernetes Q&A UI: a chat exchange with the pipeline trace expanded, showing safety, topic, cache, retrieve, rerank, and generate stages" width="820">
+</p>
+
+> **Note:** `docs/screenshot.png` is a placeholder path, not a bundled image. Drop in a real screenshot of your own running app (light theme, an example Q&A, "Show pipeline trace" toggled on in the sidebar so the trace bar is visible) at that path before this renders on GitHub.
+
+## Contents
+
+- [Architecture](#architecture)
+- [Tech stack](#tech-stack)
+- [Provider roles](#provider-roles)
+- [Setup](#setup)
+- [Configuration: the two threshold knobs](#configuration-the-two-threshold-knobs)
+- [Project structure](#project-structure)
+- [Testing](#testing)
+- [Evaluation](#evaluation)
+- [Intentionally simplified](#intentionally-simplified)
+- [Known limitations](#known-limitations)
+
 ## Architecture
 
 ```mermaid
@@ -26,9 +45,9 @@ flowchart TD
     WriteCache --> ReturnAnswer([Return answer])
 ```
 
-- **Safety Gate** runs on the raw message, before any other LLM call, so a jailbreak attempt is rejected before it costs a planner call.
-- **Topic Gate** runs on the rewritten standalone question, so context-dependent follow-ups aren't misjudged as off-topic in isolation.
-- Both gates **fail closed**, a classifier error, or an unparseable classifier response, blocks the request rather than letting it through.
+- **Safety Gate** runs on the raw message, before any other LLM call, so a jailbreak attempt is rejected before it costs a planner call. Two independent checks, either firing blocks the message: a NeMo Guardrails (Colang) few-shot flow for jailbreak-*pattern* detection, and a direct LLM classifier for broader unsafe-*content* categories (violence, harassment, etc.) that don't necessarily look like a jailbreak attempt.
+- **Topic Gate** runs on the rewritten standalone question, so context-dependent follow-ups aren't misjudged as off-topic in isolation. A direct LLM classifier, not few-shot flow matching, on purpose, "is this on-topic for Kubernetes" is an open-ended classification over an unbounded space of possible off-topic requests, not a small set of recognizable patterns a few-shot example list can cover.
+- Both gates **fail closed**: a classifier error, or an unparseable classifier response, blocks the request rather than letting it through. Verdict parsing checks only the model's first token against the expected word, not "does this word appear anywhere in the response", which would misfire on a model adding any explanation around its answer.
 - **Exact cache** and **semantic cache** are two independent layers: exact match is cheap with zero false-positive risk but only catches identical questions; semantic cache catches paraphrases but relies on the canonicalization step to preserve intent (e.g. "create" vs "destroy") before the embedding similarity check runs.
 - **Rerank + gate** is two distinct operations: FlashRank reorders candidates by relevance, then a hard score threshold drops anything below it entirely, reordering alone doesn't filter noise out of what reaches the generator.
 - **No-context outcomes are cached too** (exact-match layer, short TTL), so a repeated question with no matching documentation doesn't re-pay retrieval and reranking every time, while still expiring if the corpus is later updated.
@@ -38,17 +57,17 @@ Implemented as a LangGraph state machine (`src/graph.py`), not a linear script, 
 
 ## Tech stack
 
-- **Orchestration:** LangGraph  
-- **LLMs:** NVIDIA NIM (primary), Groq (fallback)  
-- **Guardrails:** NVIDIA NemoGuard (content safety & topic control)  
-- **Embeddings:** Google Gemini (`gemini-embedding-001`), batched per ingested file  
-- **Vector database:** Qdrant  
-- **Reranking:** FlashRank (cross-encoder)  
-- **Caching:** SQLite (exact cache), Qdrant (semantic cache)  
-- **Document processing:** BeautifulSoup4, PyMuPDF, python-docx, python-pptx, Markdown parsing, Kubernetes-manifest-aware chunking  
-- **Evaluation:** RAGAS  
-- **Tracing & observability:** Logfire  
-- **Frontend:** Streamlit  
+- **Orchestration:** LangGraph
+- **LLMs:** NVIDIA NIM (primary), Groq (fallback)
+- **Guardrails:** NeMo Guardrails / Colang (jailbreak-pattern detection) + a direct LLM classifier (topic control & unsafe-content detection)
+- **Embeddings:** Google Gemini (`gemini-embedding-001`), batched per ingested file
+- **Vector database:** Qdrant
+- **Reranking:** FlashRank (cross-encoder)
+- **Caching:** SQLite (exact cache), Qdrant (semantic cache)
+- **Document processing:** BeautifulSoup4, PyMuPDF, python-docx, python-pptx, Markdown parsing, Kubernetes-manifest-aware chunking
+- **Evaluation:** RAGAS
+- **Tracing & observability:** Logfire
+- **Frontend:** Streamlit
 - **Testing:** pytest
 
 ## Provider roles
@@ -56,10 +75,10 @@ Implemented as a LangGraph state machine (`src/graph.py`), not a linear script, 
 | Role | Primary | Fallback | Why |
 |---|---|---|---|
 | Main generation | NVIDIA NIM | Groq | retry-then-failover on transient errors only; NIM's RPM-only free tier suits a chatty pipeline better than Groq's tight TPM cap, Groq catches NIM outages |
-| Planner (rewrite, canonicalize) | NIM, small model | Groq, small model | kept off the main generation model's rate budget entirely |
-| Guardrails | NIM NemoGuard (topic-control + content-safety) | none, fails closed | purpose-built classifiers, not a general LLM self-policing via system prompt |
+| Planner (rewrite, canonicalize, topic/safety classification) | NIM, small model | Groq, small model | kept off the main generation model's rate budget entirely |
+| Jailbreak detection | NeMo Guardrails / Colang, backed by Groq | none, fails closed | few-shot pattern matching suits jailbreak-shaped attempts specifically; not used for general topic/safety classification, which generalizes poorly under a fixed few-shot example set |
 | Embeddings | Google Gemini, `gemini-embedding-001`, truncated to 768 dims | none | GA, free tier, 768 dims keeps Qdrant storage well under free-tier limits |
-| Eval judge | Groq |, | deliberately separate from whatever's serving live traffic |
+| Eval judge | Groq | — | deliberately separate from whatever's serving live traffic |
 
 Exact model IDs live in `.env.example` / `src/config.py`, not hardcoded in the pipeline logic. Only transient errors (timeouts, rate limits, connection errors, 5xx) trigger retry-then-failover; non-transient client errors (bad request, auth) propagate immediately rather than wasting a retry and a failover on something that will never succeed.
 
@@ -89,7 +108,7 @@ Both live in `.env`, both need empirical tuning against your own corpus and quer
 
 **`RERANK_SCORE_THRESHOLD`** (default `0.5`), FlashRank cross-encoder score floor; anything below is dropped, not just deprioritized.
 - Too loose: noisy, weakly-related chunks reach the generator and it hallucinates around them.
-- Too tight: everything gets dropped and the system claims it has no documentation when it does. Cross-encoder scores are **not calibrated probabilities**, don't assume 0.5 means "50% confident." Before trusting any value, print the actual score distribution for a few real queries against your corpus (a quick REPL call to `src.rerank._ranker.rerank(...)` on a handful of retrieved candidates) and set the threshold relative to what you actually see, not the default.
+- Too tight: everything gets dropped and the system claims it has no documentation when it does. Cross-encoder scores are **not calibrated probabilities**, don't assume 0.5 means "50% confident." Before trusting any value, print the actual score distribution for a few real queries against your corpus (a quick REPL call to `src.rerank._get_ranker().rerank(...)` on a handful of retrieved candidates) and set the threshold relative to what you actually see, not the default.
 
 There's also **`NO_CONTEXT_CACHE_TTL_SECONDS`** (default `3600`), how long a cached "no grounded documentation" answer is trusted before the next identical question re-checks retrieval, lower it if you're actively adding to the corpus and don't want a stale no-context verdict to outlive a re-ingest.
 
@@ -98,6 +117,8 @@ There's also **`NO_CONTEXT_CACHE_TTL_SECONDS`** (default `3600`), how long a cac
 ```
 kubernetes-agentic-rag/
 │
+├── .streamlit/
+│   └── config.toml                       # theme, toolbar mode
 ├── ui/
 │   └── app.py                            # Streamlit chat UI (rerun-safe via st.chat_input)
 ├── ingest.py                             # CLI pipeline: parse → relevance-gate → chunk → embed → upsert
@@ -106,21 +127,21 @@ kubernetes-agentic-rag/
 │   ├── config.py                         # application settings, retrieval/rerank thresholds
 │   ├── clients.py                        # NIM, Groq, Gemini & Qdrant client singletons with timeouts
 │   ├── llm.py                            # retry-then-failover LLM wrapper (transient errors only)
-│   ├── embeddings.py                     # Gemini embedding generation, batched, manual vector normalization
-│   ├── guardrails.py                     # safety_gate() & topic_gate() (fail-closed, NeMo Colang-based)
-│   ├── colang_rules.py                   # Colang intent/flow definitions for the guardrails gate
+│   ├── embeddings.py                     # Gemini embedding generation, batched, rate-limit-aware retry
+│   ├── guardrails.py                     # safety_gate() & topic_gate() (fail-closed, hybrid Colang + classifier)
+│   ├── colang_rules.py                   # Colang jailbreak-flow definitions for the safety gate
 │   ├── ingest_filter.py                  # ingestion-time document relevance classifier (fails open)
 │   ├── cache.py                          # exact-match and semantic caching layers
 │   ├── parsers.py                        # PDF, HTML, TXT, DOCX, PPTX & YAML text extraction
 │   ├── chunking.py                       # markdown-header & Kubernetes-manifest-aware chunking
 │   ├── retrieval.py                      # Qdrant dense vector retrieval
-│   ├── rerank.py                         # FlashRank reranking + hard relevance threshold
+│   ├── rerank.py                         # FlashRank reranking + hard relevance threshold, lazy-loaded
 │   ├── graph.py                          # LangGraph orchestration/state machine
 │   └── tracing.py                        # Logfire tracing and observability
 │
 ├── DATA/
-│   ├── true_data/                         # the real corpus, bring your own
-│   └── noisy_data/                        # off-topic content the ingestion gate should reject
+│   ├── true_data/                        # the real corpus, bring your own
+│   └── noisy_data/                       # off-topic content the ingestion gate should reject
 │
 ├── eval/
 │   ├── eval_set.json                     # starter evaluation dataset
@@ -153,8 +174,8 @@ Runs RAGAS's six metrics (faithfulness, answer relevancy, context precision/reca
 
 ## Intentionally simplified
 
-- **Guardrails call NemoGuard directly** rather than through full NeMo Colang dialog rails, simpler to debug for a solo project, same two models, same fail-closed behavior. Extend by swapping `src/guardrails.py`'s `_classify()` calls for a Colang-based `LLMRails` if you need multi-turn dialog policy rather than a single input/output classifier gate.
-- **NemoGuard prompts are simplified**, not NVIDIA's exact published templates (which are more elaborate and the models were tuned against that specific phrasing). Functionally equivalent, but pull NVIDIA's real templates from the NeMo Guardrails docs before relying on this in production, this is the most likely place classification quality is being left on the table.
+- **The safety/topic classifiers use plain single-word-verdict prompts**, not NVIDIA NeMoGuard's purpose-built, separately-tuned classification models. Functionally reasonable and fail-closed, but a purpose-built safety model will generally out-calibrate a general-purpose LLM told to output one word, this is the most likely place classification quality is being left on the table.
+- **Jailbreak detection is few-shot pattern matching** (Colang), not a dedicated jailbreak-classification model either. It catches attempts that resemble the examples in `colang_rules.py`; genuinely novel jailbreak phrasing may not match closely enough to trigger the flow. Extend by adding more diverse examples if you find a gap.
 - **No bundled corpus.** Bring your own `DATA/true_data/` and `DATA/noisy_data/`. The eval set (`eval/eval_set.json`) is synthetic, written for this project rather than scraped, for copyright reasons, extend it with a real hand-built set before treating its scores as representative.
 
 ## Known limitations

@@ -63,9 +63,8 @@ code, .mono { font-family: var(--font-mono); }
 
 /* --- header --- */
 .app-header {
-    position: relative;
     display: flex; flex-direction: column; align-items: center; text-align: center;
-    padding: 0.5rem 0 1.1rem 0; margin-bottom: 1.2rem;
+    padding: 0.75rem 0 1.25rem 0; margin-bottom: 0.5rem;
     border-bottom: 1px solid var(--border-accent);
 }
 .app-header .title-block h1 {
@@ -73,15 +72,10 @@ code, .mono { font-family: var(--font-mono); }
     font-weight: 800; letter-spacing: -0.03em; color: var(--text-primary); line-height: 1.15;
 }
 .app-header .title-block .tagline { color: var(--text-muted); font-size: 0.95rem; margin-top: 0.4rem; }
-.status-pill {
-    font-family: var(--font-mono); font-size: 0.68rem; letter-spacing: 0.02em;
-    padding: 0.28rem 0.7rem; border-radius: 999px;
-    display: inline-flex; align-items: center; gap: 0.4rem; white-space: nowrap;
-    position: absolute; top: 0.5rem; right: 0;
-}
-.status-pill.operational { color: var(--accent-strong); border: 1px solid var(--border-accent); background: var(--accent-soft); }
-.status-pill.degraded { color: var(--danger); border: 1px solid rgba(179, 58, 46, 0.3); background: var(--danger-soft); }
-.status-dot { width: 6px; height: 6px; border-radius: 50%; background: currentColor; display: inline-block; }
+
+/* --- welcome / onboarding --- */
+.welcome-block { max-width: 640px; margin: 1.75rem auto 1.5rem auto; text-align: center; }
+.welcome-block .trace-row { justify-content: center; }
 
 /* history fade opacity is now injected dynamically alongside the container,
    see the history_block section below, not fixed here */
@@ -131,7 +125,16 @@ code, .mono { font-family: var(--font-mono); }
 .source-row .score { color: var(--accent-strong); text-align: right; }
 
 /* --- welcome / onboarding --- */
-.example-btn button { text-align: left !important; }
+.example-btn button {
+    text-align: left !important;
+    min-height: 92px;
+    display: flex !important;
+    align-items: center !important;
+    justify-content: flex-start !important;
+    white-space: normal !important;
+    line-height: 1.35;
+    padding: 0.9rem 1.1rem !important;
+}
 .welcome-eyebrow {
     font-family: var(--font-mono); font-size: 0.68rem; letter-spacing: 0.08em;
     text-transform: uppercase; color: var(--text-faint); margin: 0.2rem 0 0.4rem 0;
@@ -231,19 +234,14 @@ is_generating = bool(prompt)
 # ---------- header ----------
 
 provider_status = {label: check() for label, check in PROVIDER_KEYS.items()}
-down_providers = [label for label, ok in provider_status.items() if not ok]
-system_ok = not down_providers
-status_class = "operational" if system_ok else "degraded"
-status_label = "Operational" if system_ok else f"Degraded &middot; {', '.join(down_providers)}"
 
 st.markdown(
-    f"""
+    """
     <div class="app-header">
         <div class="title-block">
             <h1>Kubernetes Q&amp;A</h1>
             <div class="tagline">Retrieval-augmented, grounded in your ingested docs.</div>
         </div>
-        <span class="status-pill {status_class}"><span class="status-dot"></span>{status_label}</span>
     </div>
     """,
     unsafe_allow_html=True,
@@ -372,6 +370,7 @@ def render_trace(details: dict) -> None:
 # ---------- conversation ----------
 
 if not st.session_state.history:
+    st.markdown('<div class="welcome-block">', unsafe_allow_html=True)
     st.markdown('<div class="welcome-eyebrow">How this works</div>', unsafe_allow_html=True)
     st.markdown(
         '<p class="welcome-note">Every answer passes through safety and topic '
@@ -393,6 +392,7 @@ if not st.session_state.history:
                 preview_html += '<div class="trace-arrow">&#8594;</div>'
         st.markdown(f'<div class="trace-row">{preview_html}</div>', unsafe_allow_html=True)
     st.markdown('<p class="welcome-caption">Try one of these, or ask your own below.</p>', unsafe_allow_html=True)
+    st.markdown("</div>", unsafe_allow_html=True)
 
     cols = st.columns(2)
     for i, question in enumerate(EXAMPLE_QUESTIONS):

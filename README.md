@@ -108,7 +108,7 @@ Both live in `.env`, both need empirical tuning against your own corpus and quer
 
 **`RERANK_SCORE_THRESHOLD`** (default `0.5`), FlashRank cross-encoder score floor; anything below is dropped, not just deprioritized.
 - Too loose: noisy, weakly-related chunks reach the generator and it hallucinates around them.
-- Too tight: everything gets dropped and the system claims it has no documentation when it does. Cross-encoder scores are **not calibrated probabilities**, don't assume 0.5 means "50% confident." Before trusting any value, print the actual score distribution for a few real queries against your corpus (a quick REPL call to `src.rerank._get_ranker().rerank(...)` on a handful of retrieved candidates) and set the threshold relative to what you actually see, not the default.
+- Too tight: everything gets dropped and the system claims it has no documentation when it does. Cross-encoder scores are **not calibrated probabilities**, don't assume 0.5 means "50% confident." Before trusting any value, print the actual score distribution for a few real queries against your corpus (a quick REPL call to `src.retrieval.rerank._get_ranker().rerank(...)` on a handful of retrieved candidates) and set the threshold relative to what you actually see, not the default.
 
 There's also **`NO_CONTEXT_CACHE_TTL_SECONDS`** (default `3600`), how long a cached "no grounded documentation" answer is trusted before the next identical question re-checks retrieval, lower it if you're actively adding to the corpus and don't want a stale no-context verdict to outlive a re-ingest.
 
@@ -125,19 +125,27 @@ kubernetes-agentic-rag/
 │
 ├── src/                                  # Core RAG pipeline
 │   ├── config.py                         # application settings, retrieval/rerank thresholds
-│   ├── clients.py                        # NIM, Groq, Gemini & Qdrant client singletons with timeouts
-│   ├── llm.py                            # retry-then-failover LLM wrapper (transient errors only)
-│   ├── embeddings.py                     # Gemini embedding generation, batched, rate-limit-aware retry
-│   ├── guardrails.py                     # safety_gate() & topic_gate() (fail-closed, hybrid Colang + classifier)
-│   ├── colang_rules.py                   # Colang jailbreak-flow definitions for the safety gate
-│   ├── ingest_filter.py                  # ingestion-time document relevance classifier (fails open)
-│   ├── cache.py                          # exact-match and semantic caching layers
-│   ├── parsers.py                        # PDF, HTML, TXT, DOCX, PPTX & YAML text extraction
-│   ├── chunking.py                       # markdown-header & Kubernetes-manifest-aware chunking
-│   ├── retrieval.py                      # Qdrant dense vector retrieval
-│   ├── rerank.py                         # FlashRank reranking + hard relevance threshold, lazy-loaded
-│   ├── graph.py                          # LangGraph orchestration/state machine
-│   └── tracing.py                        # Logfire tracing and observability
+│   ├── tracing.py                        # Logfire tracing and observability
+│   ├── graph.py                          # LangGraph orchestration/state machine, ties every package below together
+│   │
+│   ├── providers/                        # model-provider plumbing, no RAG-specific logic
+│   │   ├── clients.py                    # NIM, Groq, Gemini & Qdrant client singletons with timeouts
+│   │   └── llm.py                        # retry-then-failover LLM wrapper (transient errors only)
+│   │
+│   ├── guardrails/                       # query-time safety, independent of retrieval
+│   │   ├── gates.py                      # safety_gate() & topic_gate() (fail-closed, hybrid Colang + classifier)
+│   │   └── colang_rules.py               # Colang jailbreak-flow definitions for the safety gate
+│   │
+│   ├── ingestion/                        # offline: turns raw documents into stored chunks
+│   │   ├── parsers.py                    # PDF, HTML, TXT, DOCX, PPTX & YAML text extraction
+│   │   ├── chunking.py                   # markdown-header & Kubernetes-manifest-aware chunking
+│   │   └── filters.py                    # ingestion-time document relevance classifier (fails open)
+│   │
+│   └── retrieval/                        # online: turns a question into grounded context
+│       ├── embeddings.py                 # Gemini embedding generation, batched, rate-limit-aware retry
+│       ├── search.py                     # Qdrant dense vector retrieval
+│       ├── rerank.py                     # FlashRank reranking + hard relevance threshold, lazy-loaded
+│       └── cache.py                      # exact-match and semantic caching layers
 │
 ├── DATA/
 │   ├── true_data/                        # the real corpus, bring your own

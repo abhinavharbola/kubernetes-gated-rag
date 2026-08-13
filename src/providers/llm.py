@@ -10,7 +10,7 @@ from openai import (
 )
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
-from src.clients import nim_client, groq_client
+from src.providers.clients import nim_client, groq_client
 from src.config import settings
 from src.tracing import provider_call_span
 

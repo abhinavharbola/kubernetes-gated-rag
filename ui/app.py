@@ -20,7 +20,7 @@ logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 import streamlit as st
 
-from src.clients import qdrant_client
+from src.providers.clients import qdrant_client
 from src.config import settings
 from src.graph import run_turn
 

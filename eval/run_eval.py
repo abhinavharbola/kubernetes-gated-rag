@@ -16,8 +16,8 @@ from ragas.metrics.collections import (
 
 from eval.dataset import load_eval_set
 from src.config import settings
-from src.embeddings import embed_texts
-from src.llm import generate_main
+from src.retrieval.embeddings import embed_texts
+from src.providers.llm import generate_main
 
 
 class GeminiRagasEmbedding(BaseRagasEmbedding):

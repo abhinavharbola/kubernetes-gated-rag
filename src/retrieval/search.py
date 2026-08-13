@@ -1,8 +1,8 @@
 from qdrant_client.models import FieldCondition, Filter, MatchValue
 
-from src.clients import qdrant_client
+from src.providers.clients import qdrant_client
 from src.config import settings
-from src.embeddings import embed_query
+from src.retrieval.embeddings import embed_query
 
 
 def retrieve(question: str, manifest_kind: str | None = None, top_k: int | None = None) -> list[dict]:

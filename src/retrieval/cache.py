@@ -5,9 +5,9 @@ import uuid
 import diskcache
 from qdrant_client.models import PointStruct
 
-from src.clients import qdrant_client
+from src.providers.clients import qdrant_client
 from src.config import settings
-from src.embeddings import embed_for_cache
+from src.retrieval.embeddings import embed_for_cache
 
 _exact_cache = diskcache.Cache(".cache/exact")
 
@@ -32,11 +32,20 @@ def exact_cache_set(question: str, answer: str, expire: float | None = None) -> 
     _exact_cache.set(normalize_exact(question), answer, expire=expire)
 
 
-def semantic_cache_get(canonical_question: str) -> str | None:
-    vector = embed_for_cache(canonical_question)
+def embed_canonical_question(canonical_question: str) -> list[float]:
+    # split out as its own function, callable once per turn: the canonical
+    # question's embedding is needed by both the semantic-cache lookup and,
+    # on a miss, the later semantic-cache write. Computing it once and
+    # threading the vector through graph state (see src/graph.py) instead of
+    # calling this twice avoids paying for a second identical Gemini
+    # embedding round-trip on every non-cache-hit turn.
+    return embed_for_cache(canonical_question)
+
+
+def semantic_cache_get(canonical_question_vector: list[float]) -> str | None:
     results = qdrant_client.query_points(
         collection_name=settings.qdrant_cache_collection,
-        query=vector,
+        query=canonical_question_vector,
         limit=1,
         score_threshold=settings.semantic_cache_similarity_threshold,
     ).points
@@ -45,14 +54,13 @@ def semantic_cache_get(canonical_question: str) -> str | None:
     return results[0].payload.get("answer")
 
 
-def semantic_cache_set(canonical_question: str, answer: str) -> None:
-    vector = embed_for_cache(canonical_question)
+def semantic_cache_set(canonical_question: str, canonical_question_vector: list[float], answer: str) -> None:
     qdrant_client.upsert(
         collection_name=settings.qdrant_cache_collection,
         points=[
             PointStruct(
                 id=str(uuid.uuid4()),
-                vector=vector,
+                vector=canonical_question_vector,
                 payload={"question": canonical_question, "answer": answer},
             )
         ],

@@ -1,20 +1,20 @@
 from unittest.mock import patch
 
-from src.rerank import rerank_and_gate
+from src.retrieval.rerank import rerank_and_gate
 
 
-def _candidate(text, resource_type=None, authority=None):
-    return {"text": text, "metadata": {"resource_type": resource_type, "source_authority": authority}}
+def _candidate(text, manifest_kind=None, manifest_name=None):
+    return {"text": text, "metadata": {"manifest_kind": manifest_kind, "manifest_name": manifest_name}}
 
 
-@patch("src.rerank.settings")
-@patch("src.rerank._ranker")
+@patch("src.retrieval.rerank.settings")
+@patch("src.retrieval.rerank._ranker")
 def test_empty_candidates_returns_empty(mock_ranker, mock_settings):
     assert rerank_and_gate("how do I create a resource?", []) == []
 
 
-@patch("src.rerank.settings")
-@patch("src.rerank._ranker")
+@patch("src.retrieval.rerank.settings")
+@patch("src.retrieval.rerank._ranker")
 def test_below_threshold_candidates_are_dropped_not_reordered_to_bottom(mock_ranker, mock_settings):
     mock_settings.rerank_score_threshold = 0.5
     mock_ranker.rerank.return_value = [
@@ -29,8 +29,8 @@ def test_below_threshold_candidates_are_dropped_not_reordered_to_bottom(mock_ran
     assert survivors[0]["text"] == "relevant chunk"
 
 
-@patch("src.rerank.settings")
-@patch("src.rerank._ranker")
+@patch("src.retrieval.rerank.settings")
+@patch("src.retrieval.rerank._ranker")
 def test_zero_survivors_when_all_below_threshold(mock_ranker, mock_settings):
     mock_settings.rerank_score_threshold = 0.5
     mock_ranker.rerank.return_value = [{"id": 0, "score": 0.1}]
@@ -38,40 +38,33 @@ def test_zero_survivors_when_all_below_threshold(mock_ranker, mock_settings):
     assert survivors == []
 
 
-@patch("src.rerank.settings")
-@patch("src.rerank._ranker")
-def test_official_authority_boost_flips_a_close_tie(mock_ranker, mock_settings):
+@patch("src.retrieval.rerank.settings")
+@patch("src.retrieval.rerank._ranker")
+def test_survivors_sorted_by_rerank_score_descending(mock_ranker, mock_settings):
     mock_settings.rerank_score_threshold = 0.5
     mock_ranker.rerank.return_value = [
-        {"id": 0, "score": 0.60},
-        {"id": 1, "score": 0.59},
+        {"id": 0, "score": 0.55},
+        {"id": 1, "score": 0.90},
     ]
+    candidates = [_candidate("lower scored chunk"), _candidate("higher scored chunk")]
+
+    survivors = rerank_and_gate("question", candidates)
+
+    assert [c["text"] for c in survivors] == ["higher scored chunk", "lower scored chunk"]
+
+
+@patch("src.retrieval.rerank.settings")
+@patch("src.retrieval.rerank._ranker")
+def test_ranker_failure_falls_back_to_retrieval_order_without_gating(mock_ranker, mock_settings):
+    mock_settings.rerank_score_threshold = 0.5
+    mock_ranker.rerank.side_effect = RuntimeError("ONNX load failed")
     candidates = [
-        _candidate("community chunk", authority="community"),
-        _candidate("official chunk", authority="official"),
+        {**_candidate("lower retrieval score"), "retrieval_score": 0.3},
+        {**_candidate("higher retrieval score"), "retrieval_score": 0.7},
     ]
 
     survivors = rerank_and_gate("question", candidates)
 
-    # official's +0.02 boost (0.59 -> 0.61) edges out community's 0.60
-    assert survivors[0]["text"] == "official chunk"
-    assert len(survivors) == 2
-
-
-@patch("src.rerank.settings")
-@patch("src.rerank._ranker")
-def test_official_authority_boost_does_not_override_a_clear_gap(mock_ranker, mock_settings):
-    mock_settings.rerank_score_threshold = 0.5
-    mock_ranker.rerank.return_value = [
-        {"id": 0, "score": 0.80},
-        {"id": 1, "score": 0.55},
-    ]
-    candidates = [
-        _candidate("community chunk", authority="community"),
-        _candidate("official chunk", authority="official"),
-    ]
-
-    survivors = rerank_and_gate("question", candidates)
-
-    # official's +0.02 boost (0.55 -> 0.57) is nowhere near community's 0.80
-    assert survivors[0]["text"] == "community chunk"
+    # degrades to retrieval order, does not drop anything even though no
+    # rerank score exists to gate on
+    assert [c["text"] for c in survivors] == ["higher retrieval score", "lower retrieval score"]

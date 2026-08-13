@@ -3,12 +3,18 @@ from typing import TypedDict
 
 from langgraph.graph import StateGraph, START, END
 
-from src.cache import exact_cache_get, exact_cache_set, semantic_cache_get, semantic_cache_set
+from src.retrieval.cache import (
+    embed_canonical_question,
+    exact_cache_get,
+    exact_cache_set,
+    semantic_cache_get,
+    semantic_cache_set,
+)
 from src.config import settings
 from src.guardrails import safety_gate, topic_gate
-from src.llm import generate_main, generate_planner
-from src.rerank import rerank_and_gate
-from src.retrieval import retrieve
+from src.providers.llm import generate_main, generate_planner
+from src.retrieval.rerank import rerank_and_gate
+from src.retrieval.search import retrieve
 from src.tracing import node_span, log_cache_decision, turn_span
 
 NO_CONTEXT_MESSAGE = (
@@ -22,6 +28,7 @@ class GraphState(TypedDict, total=False):
     chat_history: list[dict]
     standalone_question: str
     canonical_question: str
+    canonical_question_vector: list[float] | None
     allowed: bool
     refusal_reason: str | None
     blocked_stage: str | None
@@ -56,7 +63,11 @@ def rewrite_with_history_node(state: GraphState) -> GraphState:
                     "the latest message depends on. If the latest message is already self-contained, "
                     "return it unchanged or with only minor grammatical cleanup: do not broaden it with "
                     "topics, details, or scope from earlier turns that this message didn't ask about. "
-                    "Preserve intent exactly. Return only the rewritten question.",
+                    "If the latest message introduces a subject unrelated to the conversation so far, "
+                    "treat it as self-contained and do not merge it with earlier context to make it read "
+                    "as more related than it is, the downstream topic check needs to see the question as "
+                    "actually asked, not a version reframed to look more on-topic. Preserve intent "
+                    "exactly. Return only the rewritten question.",
                 },
                 {"role": "user", "content": f"History:\n{history_text}\n\nLatest: {state['raw_message']}"},
             ]
@@ -102,11 +113,15 @@ def canonicalize_node(state: GraphState) -> GraphState:
 
 def semantic_cache_node(state: GraphState) -> GraphState:
     with node_span("semantic_cache_check"):
-        cached = semantic_cache_get(state["canonical_question"])
+        # computed once here and carried in state; write_caches_node reuses
+        # this same vector on a miss instead of re-embedding the identical
+        # canonical_question text a second time.
+        vector = embed_canonical_question(state["canonical_question"])
+        cached = semantic_cache_get(vector)
         log_cache_decision("semantic", hit=cached is not None)
         if cached:
-            return {"answer": cached, "cache_layer": "semantic"}
-        return {}
+            return {"answer": cached, "cache_layer": "semantic", "canonical_question_vector": vector}
+        return {"canonical_question_vector": vector}
 
 
 def retrieve_node(state: GraphState) -> GraphState:
@@ -141,7 +156,9 @@ def generate_node(state: GraphState) -> GraphState:
 def write_caches_node(state: GraphState) -> GraphState:
     with node_span("write_caches"):
         exact_cache_set(state["standalone_question"], state["answer"])
-        semantic_cache_set(state["canonical_question"], state["answer"])
+        # reuses the vector computed in semantic_cache_node rather than
+        # calling embed_canonical_question again for the same text.
+        semantic_cache_set(state["canonical_question"], state["canonical_question_vector"], state["answer"])
         return {}
 
 

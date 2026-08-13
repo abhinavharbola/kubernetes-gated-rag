@@ -11,6 +11,10 @@ python-dotenv
 qdrant-client
 logfire
 ragas
+langchain-community<0.4.2  # ragas==0.4.3 imports langchain_community.chat_models.vertexai directly with
+                           # no version constraint of its own; that module was removed in 0.4.2, so an
+                           # unpinned install breaks eval/run_eval.py's `import ragas` at the top of the
+                           # chain. Pin below the break until ragas stops depending on the removed path.
 tenacity
 pydantic
 datasets

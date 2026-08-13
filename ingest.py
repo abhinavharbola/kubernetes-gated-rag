@@ -8,12 +8,12 @@ from qdrant_client.http.exceptions import ResponseHandlingException
 from qdrant_client.models import Distance, PointStruct, VectorParams
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
-from src.chunking import chunk_document
-from src.clients import qdrant_client
+from src.ingestion.chunking import chunk_document
+from src.providers.clients import qdrant_client
 from src.config import settings
-from src.embeddings import embed_texts
-from src.ingest_filter import is_relevant
-from src.parsers import PARSERS, parse_file
+from src.retrieval.embeddings import embed_texts
+from src.ingestion.filters import is_relevant
+from src.ingestion.parsers import PARSERS, parse_file
 from src.tracing import node_span
 
 logger = logging.getLogger(__name__)

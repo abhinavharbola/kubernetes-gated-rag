@@ -1,10 +1,10 @@
-from src.chunking import (
-    chunk_document,
-    split_by_hcl_blocks,
-    split_by_markdown_headers,
-    _find_matching_brace,
+from src.ingestion.chunking import (
+    FALLBACK_WINDOW_WORDS,
     _fallback_window,
-    _parse_resource_type,
+    _parse_manifest_kind_and_name,
+    chunk_document,
+    split_by_manifest_blocks,
+    split_by_markdown_headers,
 )
 
 
@@ -32,86 +32,93 @@ def test_split_by_markdown_headers_preserves_text_before_first_header():
     assert sections[1]["header"] == "First Header"
 
 
-def test_find_matching_brace_handles_nesting():
-    text = 'resource "aws_security_group" "web" {\n  ingress {\n    port = 80\n  }\n}\nafter'
-    open_index = text.index("{")
-    close_index = _find_matching_brace(text, open_index)
-    assert text[close_index] == "}"
-    # the matched close brace must be the outer one, not the inner ingress block's
-    assert text[close_index:].startswith("}\nafter")
+def test_parse_manifest_kind_and_name_extracts_both():
+    block = "apiVersion: v1\nkind: Pod\nmetadata:\n  name: web\nspec:\n  containers: []\n"
+    kind, name = _parse_manifest_kind_and_name(block)
+    assert kind == "Pod"
+    assert name == "web"
 
 
-def test_parse_resource_type_extracts_type_from_resource_block():
-    block = 'resource "aws_instance" "web" {\n  ami = "x"\n}'
-    assert _parse_resource_type(block) == "aws_instance"
+def test_parse_manifest_kind_and_name_handles_quoted_scalars():
+    block = 'apiVersion: v1\nkind: "Service"\nmetadata:\n  name: \'my-svc\'\n'
+    kind, name = _parse_manifest_kind_and_name(block)
+    assert kind == "Service"
+    assert name == "my-svc"
 
 
-def test_parse_resource_type_returns_none_for_non_resource_blocks():
-    block = 'variable "instance_type" {\n  type = string\n}'
-    assert _parse_resource_type(block) is None
+def test_parse_manifest_kind_and_name_returns_none_when_absent():
+    block = "just prose, no manifest fields here"
+    kind, name = _parse_manifest_kind_and_name(block)
+    assert kind is None
+    assert name is None
 
 
-def test_split_by_hcl_blocks_extracts_full_nested_block_intact():
-    section = (
-        'Some intro text.\n\n'
-        'resource "aws_security_group" "web" {\n'
-        '  ingress {\n'
-        '    from_port = 80\n'
-        '    to_port   = 80\n'
-        '  }\n'
-        '  egress {\n'
-        '    from_port = 0\n'
-        '  }\n'
-        '}\n\n'
-        'Trailing text after the block.'
+def test_parse_manifest_kind_and_name_does_not_read_past_metadata_block():
+    # name lives inside metadata:, a name: key appearing under a different
+    # top-level section (e.g. spec:) must not be picked up
+    block = (
+        "apiVersion: v1\nkind: Pod\nmetadata:\n  name: real-name\n"
+        "  labels:\n    app: demo\nspec:\n  containers:\n    - name: decoy-name\n"
     )
-    blocks = split_by_hcl_blocks(section)
-    hcl_blocks = [b for b in blocks if b["resource_type"] or "resource \"aws_security_group\"" in b["text"]]
-    assert len(hcl_blocks) == 1
-    block_text = hcl_blocks[0]["text"]
-    assert block_text.startswith('resource "aws_security_group" "web" {')
-    assert block_text.rstrip().endswith("}")
-    assert "egress" in block_text
-    assert block_text.count("{") == block_text.count("}")
+    kind, name = _parse_manifest_kind_and_name(block)
+    assert kind == "Pod"
+    assert name == "real-name"
 
 
-def test_split_by_hcl_blocks_never_splits_a_block_midway():
-    # a block containing text that could confuse a naive line-based splitter
-    section = (
-        'resource "aws_iam_role" "x" {\n'
-        '  assume_role_policy = jsonencode({\n'
-        '    Statement = [{ Effect = "Allow" }]\n'
-        '  })\n'
-        '}\n'
-    )
-    blocks = split_by_hcl_blocks(section)
-    resource_blocks = [b for b in blocks if b["resource_type"] == "aws_iam_role"]
-    assert len(resource_blocks) == 1
-    assert resource_blocks[0]["text"].count("{") == resource_blocks[0]["text"].count("}")
-
-
-def test_split_by_hcl_blocks_parses_multiple_distinct_types():
-    section = (
-        'resource "aws_instance" "web" {\n  ami = "x"\n}\n\n'
-        'variable "region" {\n  type = string\n}\n\n'
-        'output "ip" {\n  value = aws_instance.web.public_ip\n}\n'
-    )
-    blocks = split_by_hcl_blocks(section)
-    resource_types = [b["resource_type"] for b in blocks if b["resource_type"]]
-    assert resource_types == ["aws_instance"]
-    # variable/output blocks are still captured as their own blocks, just with resource_type=None
-    non_fallback_block_count = sum(
-        1 for b in blocks if b["text"].startswith(("resource", "variable", "output"))
-    )
-    assert non_fallback_block_count == 3
-
-
-def test_split_by_hcl_blocks_falls_back_to_windowing_when_no_hcl_present():
-    section = "This is plain prose with no HCL blocks in it whatsoever."
-    blocks = split_by_hcl_blocks(section)
+def test_split_by_manifest_blocks_single_document():
+    section = "apiVersion: v1\nkind: Pod\nmetadata:\n  name: web\nspec:\n  containers: []\n"
+    blocks = split_by_manifest_blocks(section)
     assert len(blocks) == 1
-    assert blocks[0]["resource_type"] is None
+    assert blocks[0]["kind"] == "Pod"
+    assert blocks[0]["name"] == "web"
+    assert blocks[0]["text"].startswith("apiVersion: v1")
+
+
+def test_split_by_manifest_blocks_multi_document_file():
+    section = (
+        "apiVersion: v1\nkind: Pod\nmetadata:\n  name: web\nspec:\n  containers: []\n"
+        "---\n"
+        "apiVersion: v1\nkind: Service\nmetadata:\n  name: web-svc\nspec:\n  ports: []\n"
+    )
+    blocks = split_by_manifest_blocks(section)
+    assert [b["kind"] for b in blocks] == ["Pod", "Service"]
+    assert [b["name"] for b in blocks] == ["web", "web-svc"]
+    # the separator line itself must not leak into either block's text
+    assert "---" not in blocks[0]["text"]
+    assert "---" not in blocks[1]["text"]
+
+
+def test_split_by_manifest_blocks_no_trailing_separator():
+    # a file with no final "---" after the last document is the common
+    # case, not an edge case: the last block must still be captured whole.
+    section = "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: cfg\ndata:\n  key: value\n"
+    blocks = split_by_manifest_blocks(section)
+    assert len(blocks) == 1
+    assert blocks[0]["kind"] == "ConfigMap"
+    assert blocks[0]["text"].rstrip().endswith("value")
+
+
+def test_split_by_manifest_blocks_prose_with_no_manifest_falls_back_to_window():
+    section = "This is a prose explanation of Kubernetes concepts with no manifest in it at all."
+    blocks = split_by_manifest_blocks(section)
+    assert len(blocks) == 1
+    assert blocks[0]["kind"] is None
+    assert blocks[0]["name"] is None
     assert blocks[0]["text"] == section
+
+
+def test_split_by_manifest_blocks_prose_preamble_before_first_manifest():
+    section = (
+        "Here is an example Pod manifest:\n\n"
+        "apiVersion: v1\nkind: Pod\nmetadata:\n  name: web\nspec:\n  containers: []\n"
+    )
+    blocks = split_by_manifest_blocks(section)
+    # the leading prose becomes its own fallback-window block, the manifest
+    # becomes its own structured block, in that order
+    assert len(blocks) == 2
+    assert blocks[0]["kind"] is None
+    assert "example Pod manifest" in blocks[0]["text"]
+    assert blocks[1]["kind"] == "Pod"
 
 
 def test_fallback_window_short_text_stays_one_chunk():
@@ -131,37 +138,35 @@ def test_fallback_window_long_text_splits_with_overlap():
     text = " ".join(words)
     chunks = _fallback_window(text)
     assert len(chunks) > 1
-    # every chunk should respect the configured window size
     for chunk in chunks:
-        assert len(chunk["text"].split()) <= 300
-    # consecutive chunks should overlap (share some words) rather than losing context at the boundary
+        assert len(chunk["text"].split()) <= FALLBACK_WINDOW_WORDS
     first_words = chunks[0]["text"].split()
     second_words = chunks[1]["text"].split()
     assert set(first_words) & set(second_words)
 
 
-def test_chunk_document_combines_headers_and_hcl_blocks_with_metadata():
+def test_chunk_document_combines_headers_and_manifest_blocks_with_metadata():
     text = (
-        "# aws_instance\n\n"
-        "Some description text.\n\n"
-        '```hcl\nresource "aws_instance" "web" {\n  ami = "x"\n}\n```\n\n'
+        "# Pod basics\n\n"
+        "A Pod is the smallest deployable unit.\n\n"
+        "apiVersion: v1\nkind: Pod\nmetadata:\n  name: web\nspec:\n  containers: []\n\n"
         "## Notes\n\nAdditional prose here about usage."
     )
-    chunks = chunk_document(text, base_metadata={"source_path": "aws_instance.md", "source_authority": "official"})
+    chunks = chunk_document(text, base_metadata={"source_path": "pod.md"})
 
-    assert all(c["metadata"]["source_authority"] == "official" for c in chunks)
-    assert all(c["metadata"]["source_path"] == "aws_instance.md" for c in chunks)
+    assert all(c["metadata"]["source_path"] == "pod.md" for c in chunks)
 
-    resource_chunks = [c for c in chunks if c["metadata"]["resource_type"] == "aws_instance"]
-    assert len(resource_chunks) == 1
-    assert resource_chunks[0]["metadata"]["section_header"] == "aws_instance"
+    manifest_chunks = [c for c in chunks if c["metadata"]["manifest_kind"] == "Pod"]
+    assert len(manifest_chunks) == 1
+    assert manifest_chunks[0]["metadata"]["manifest_name"] == "web"
+    assert manifest_chunks[0]["metadata"]["section_header"] == "Pod basics"
 
     notes_chunks = [c for c in chunks if c["metadata"]["section_header"] == "Notes"]
     assert len(notes_chunks) == 1
-    assert notes_chunks[0]["metadata"]["resource_type"] is None
+    assert notes_chunks[0]["metadata"]["manifest_kind"] is None
 
 
 def test_chunk_document_skips_blank_chunks():
     text = "# Header\n\n\n\n## Next\n\nreal content"
-    chunks = chunk_document(text, base_metadata={"source_path": "x", "source_authority": "community"})
+    chunks = chunk_document(text, base_metadata={"source_path": "x"})
     assert all(c["text"].strip() for c in chunks)

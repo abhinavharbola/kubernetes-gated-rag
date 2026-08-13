@@ -6,7 +6,7 @@ from google.genai import types
 from google.genai.errors import ClientError
 from tenacity import retry, retry_if_exception, stop_after_attempt
 
-from src.clients import gemini_client
+from src.providers.clients import gemini_client
 from src.config import settings
 
 logger = logging.getLogger(__name__)

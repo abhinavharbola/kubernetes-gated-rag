@@ -1,6 +1,6 @@
 import logging
 
-from src.llm import generate_planner
+from src.providers.llm import generate_planner
 
 logger = logging.getLogger(__name__)
 

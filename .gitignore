@@ -1,0 +1,37 @@
+# --- env / secrets ---
+.env
+*.env
+!.env.example
+
+# --- python ---
+__pycache__/
+*.pyc
+*.pyo
+.Python
+.venv/
+venv/
+env/
+*.egg-info/
+dist/
+build/
+
+# --- caches ---
+.cache/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# --- eval outputs (eval_set.json itself is a tracked deliverable, not ignored) ---
+eval/results.csv
+
+# --- logs ---
+*.log
+
+# --- OS / editor ---
+.DS_Store
+.idea/
+.vscode/
+
+# --- streamlit ---
+.streamlit/secrets.toml
+data/

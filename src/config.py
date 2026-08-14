@@ -13,8 +13,10 @@ class Settings(BaseSettings):
 
     groq_main_model: str = "openai/gpt-oss-120b"
     nim_main_model: str = "openai/gpt-oss-120b"
+    gemini_main_model: str = "gemini-2.5-flash"
     nim_planner_model: str = "meta/llama-3.1-8b-instruct"
     groq_planner_model: str = "openai/gpt-oss-20b"
+    gemini_planner_model: str = "gemini-2.5-flash-lite"
     groq_eval_judge_model: str = "openai/gpt-oss-120b"
 
     nemoguard_topic_model: str = "nvidia/llama-3.1-nemoguard-8b-topic-control"

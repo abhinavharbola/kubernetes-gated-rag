@@ -23,10 +23,31 @@ import streamlit as st
 from src.providers.clients import qdrant_client
 from src.config import settings
 from src.graph import run_turn
+from src.guardrails import preload as preload_guardrails
+from src.retrieval.rerank import preload as preload_rerank
 
 logger = logging.getLogger(__name__)
 
 st.set_page_config(page_title="Kubernetes RAG", page_icon="◧", layout="centered")
+
+
+@st.cache_resource(show_spinner="Warming up safety and rerank models (one-time, first load only)…")
+def _warm_up_models() -> bool:
+    # NeMo Guardrails' Colang flow matcher and FlashRank's cross-encoder are
+    # both lazily built on first use by default (see their preload()
+    # docstrings in src/guardrails/gates.py and src/retrieval/rerank.py) —
+    # deliberately so, since a process that never runs a real turn (tests,
+    # ingest.py) shouldn't pay for either. This app always needs both, so
+    # force them to build now, during page load with its own spinner,
+    # rather than silently inside the first user question's latency.
+    # st.cache_resource makes this run exactly once per server process,
+    # shared across every session, not once per rerun.
+    preload_guardrails()
+    preload_rerank()
+    return True
+
+
+_warm_up_models()
 
 PIPELINE_ERROR_MESSAGE = (
     "Something went wrong completing that request. This is usually a transient "
@@ -35,26 +56,25 @@ PIPELINE_ERROR_MESSAGE = (
 
 CUSTOM_CSS = """
 <style>
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,600;9..144,700&family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap');
 
 :root {
-    --bg: #FBF7F2;
+    --bg: #F2EFE6;
     --surface: #FFFFFF;
-    --border: rgba(58, 46, 39, 0.10);
-    --border-accent: rgba(199, 106, 63, 0.28);
-    --text-primary: #3A2E27;
-    --text-muted: #8A7A6D;
-    --text-faint: #C2B3A5;
-    --accent: #C76A3F;
-    --accent-strong: #A8532F;
-    --accent-soft: rgba(199, 106, 63, 0.10);
-    --warn-strong: #A8532F;
-    --warn-soft: rgba(199, 106, 63, 0.10);
-    --danger: #B33A2E;
-    --danger-soft: rgba(179, 58, 46, 0.08);
-    --neutral: #C2B3A5;
-    --font-sans: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-    --font-mono: "JetBrains Mono", "Fira Code", ui-monospace, monospace;
+    --border: rgba(24, 30, 27, 0.10);
+    --border-accent: rgba(37, 99, 87, 0.28);
+    --text-primary: #1B211D;
+    --text-muted: #6D756F;
+    --text-faint: #B7BFB8;
+    --accent: #256357;
+    --accent-strong: #16453B;
+    --accent-soft: rgba(37, 99, 87, 0.10);
+    --danger: #A8402E;
+    --danger-soft: rgba(168, 64, 46, 0.08);
+    --neutral: #B7BFB8;
+    --font-display: "Fraunces", Georgia, serif;
+    --font-sans: "IBM Plex Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    --font-mono: "IBM Plex Mono", "Fira Code", ui-monospace, monospace;
 }
 
 .stApp { font-family: var(--font-sans); background: var(--bg); }
@@ -64,14 +84,17 @@ code, .mono { font-family: var(--font-mono); }
 /* --- header --- */
 .app-header {
     display: flex; flex-direction: column; align-items: center; text-align: center;
-    padding: 0.75rem 0 1.25rem 0; margin-bottom: 0.5rem;
+    padding: 0.9rem 0 1.4rem 0; margin-bottom: 0.5rem;
     border-bottom: 1px solid var(--border-accent);
 }
 .app-header .title-block h1 {
-    margin: 0; font-family: var(--font-sans); font-size: 2.5rem;
-    font-weight: 800; letter-spacing: -0.03em; color: var(--text-primary); line-height: 1.15;
+    margin: 0; font-family: var(--font-display); font-size: 2.7rem;
+    font-weight: 600; letter-spacing: -0.01em; color: var(--text-primary); line-height: 1.15;
 }
-.app-header .title-block .tagline { color: var(--text-muted); font-size: 0.95rem; margin-top: 0.4rem; }
+.app-header .title-block .tagline {
+    color: var(--text-muted); font-size: 1rem; margin-top: 0.55rem;
+    max-width: 560px; line-height: 1.55;
+}
 
 /* --- welcome / onboarding --- */
 .welcome-block { max-width: 640px; margin: 1.75rem auto 1.5rem auto; text-align: center; }
@@ -80,7 +103,7 @@ code, .mono { font-family: var(--font-mono); }
 /* history fade opacity is now injected dynamically alongside the container,
    see the history_block section below, not fixed here */
 
-/* --- pipeline trace --- */
+/* --- pipeline trace (live, per-turn) --- */
 .trace-row { display: flex; flex-wrap: wrap; align-items: stretch; gap: 0.4rem; margin: 0.6rem 0 0.15rem 0; }
 .trace-step {
     display: flex; flex-direction: column; justify-content: center; gap: 0.08rem;
@@ -112,6 +135,28 @@ code, .mono { font-family: var(--font-mono); }
     font-size: 0.7rem; color: var(--text-faint); white-space: nowrap; padding-left: 0.5rem;
 }
 
+/* --- pipeline diagram (static, explanatory, inside "How this works") --- */
+.pipeline-diagram {
+    display: flex; flex-wrap: wrap; align-items: stretch; justify-content: center;
+    gap: 0.5rem; margin: 0.75rem 0 0.4rem 0;
+}
+.pipeline-node {
+    display: flex; flex-direction: column; gap: 0.2rem;
+    padding: 0.6rem 0.8rem; border-radius: 8px; width: 128px;
+    background: var(--surface); border: 1px solid var(--border);
+    border-top: 3px solid var(--accent);
+}
+.pipeline-node .pipeline-node-title {
+    font-family: var(--font-mono); font-size: 0.72rem; font-weight: 600;
+    letter-spacing: 0.03em; color: var(--text-primary);
+}
+.pipeline-node .pipeline-node-desc {
+    font-size: 0.72rem; line-height: 1.4; color: var(--text-muted);
+}
+.pipeline-arrow {
+    display: flex; align-items: center; color: var(--neutral); font-size: 1rem;
+}
+
 /* --- sources --- */
 .source-row {
     display: grid; grid-template-columns: 1fr 90px 54px; align-items: center; gap: 0.6rem;
@@ -120,26 +165,23 @@ code, .mono { font-family: var(--font-mono); }
 }
 .source-row:last-child { border-bottom: none; }
 .source-meta { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-primary); }
-.source-score-wrap { height: 5px; border-radius: 3px; background: rgba(58, 46, 39, 0.08); overflow: hidden; }
+.source-score-wrap { height: 5px; border-radius: 3px; background: rgba(24, 30, 27, 0.08); overflow: hidden; }
 .source-score-bar { height: 100%; background: var(--accent); }
 .source-row .score { color: var(--accent-strong); text-align: right; }
 
 /* --- welcome / onboarding --- */
 .example-btn button {
     text-align: left !important;
-    min-height: 92px;
+    height: 108px !important;
+    box-sizing: border-box !important;
     display: flex !important;
     align-items: center !important;
     justify-content: flex-start !important;
     white-space: normal !important;
+    overflow: hidden !important;
     line-height: 1.35;
     padding: 0.9rem 1.1rem !important;
 }
-.welcome-eyebrow {
-    font-family: var(--font-mono); font-size: 0.68rem; letter-spacing: 0.08em;
-    text-transform: uppercase; color: var(--text-faint); margin: 0.2rem 0 0.4rem 0;
-}
-.welcome-note { color: var(--text-muted); font-size: 0.86rem; line-height: 1.55; margin: 0 0 0.7rem 0; }
 .welcome-caption { color: var(--text-faint); font-size: 0.74rem; margin: 0.3rem 0 1.1rem 0; }
 
 /* --- sidebar --- */
@@ -153,18 +195,24 @@ code, .mono { font-family: var(--font-mono); }
 }
 [data-testid="stSidebar"] [data-testid="stMetricLabel"] { font-size: 0.66rem; color: var(--text-muted); }
 
-.provider-list { display: grid; grid-template-columns: 1fr 1fr; gap: 0.5rem 0.75rem; }
+.provider-list { display: flex; flex-direction: column; gap: 0.4rem; }
 .provider-row {
     font-family: var(--font-mono); font-size: 0.78rem; color: var(--text-primary);
     display: flex; align-items: center; gap: 0.55rem;
+    padding: 0.15rem 0;
+}
+.provider-row .provider-name { flex-shrink: 0; }
+.provider-row .provider-role {
+    margin-left: auto; font-size: 0.66rem; color: var(--text-faint);
+    text-transform: uppercase; letter-spacing: 0.04em;
 }
 .status-dot-inline { width: 7px; height: 7px; border-radius: 50%; display: inline-block; flex-shrink: 0; }
-.status-dot-inline.up { background: var(--accent-strong); box-shadow: 0 0 4px rgba(199, 106, 63, 0.5); }
+.status-dot-inline.up { background: var(--accent-strong); box-shadow: 0 0 4px rgba(37, 99, 87, 0.5); }
 .status-dot-inline.down { background: var(--danger); }
 
 .error-note {
     font-family: var(--font-mono); font-size: 0.76rem; color: var(--danger);
-    background: var(--danger-soft); border: 1px solid rgba(179, 58, 46, 0.25);
+    background: var(--danger-soft); border: 1px solid rgba(168, 64, 46, 0.25);
     border-radius: 6px; padding: 0.5rem 0.7rem; margin-top: 0.5rem;
 }
 </style>
@@ -183,14 +231,25 @@ EXAMPLE_QUESTIONS = [
     "How do I give each StatefulSet replica its own persistent storage?",
 ]
 
-PROVIDER_KEYS = {
-    "NIM": lambda: bool(settings.nvidia_nim_api_key),
-    "Groq": lambda: bool(settings.groq_api_key),
-    "Gemini": lambda: bool(settings.gemini_api_key),
-    "Qdrant": lambda: bool(settings.qdrant_url and settings.qdrant_api_key),
-}
+PROVIDERS = [
+    {"label": "Groq", "role": "primary", "check": lambda: bool(settings.groq_api_key)},
+    {"label": "NIM", "role": "fallback", "check": lambda: bool(settings.nvidia_nim_api_key)},
+    {"label": "Gemini", "role": "fallback \u00b7 embeddings", "check": lambda: bool(settings.gemini_api_key)},
+    {
+        "label": "Qdrant",
+        "role": "vector store",
+        "check": lambda: bool(settings.qdrant_url and settings.qdrant_api_key),
+    },
+]
 
-PIPELINE_STAGES = ["Safety", "Topic", "Cache", "Retrieve", "Rerank", "Generate"]
+PIPELINE_STAGES = [
+    {"label": "Safety", "desc": "blocks unsafe content"},
+    {"label": "Topic", "desc": "blocks off-topic questions"},
+    {"label": "Cache", "desc": "exact + semantic lookup"},
+    {"label": "Retrieve", "desc": "dense vector search"},
+    {"label": "Rerank", "desc": "cross-encoder relevance gate"},
+    {"label": "Generate", "desc": "grounded answer"},
+]
 
 STATUS_GLYPH = {"ok": "&#10003;", "hit": "&#10003;", "fail": "&#10007;", "skip": "&#8722;"}
 
@@ -233,14 +292,15 @@ is_generating = bool(prompt)
 
 # ---------- header ----------
 
-provider_status = {label: check() for label, check in PROVIDER_KEYS.items()}
-
 st.markdown(
     """
     <div class="app-header">
         <div class="title-block">
             <h1>Kubernetes Q&amp;A</h1>
-            <div class="tagline">Retrieval-augmented, grounded in your ingested docs.</div>
+            <div class="tagline">Ask anything about Pods, Deployments, Services, or manifest syntax and get
+            an answer grounded in your own ingested documentation, not a guess. Every question is checked for
+            safety and relevance, checked against a two-layer cache, and only reaches the model with retrieved
+            context that actually clears a relevance bar.</div>
         </div>
     </div>
     """,
@@ -265,8 +325,12 @@ with st.sidebar:
 
     st.markdown('<div class="eyebrow" style="margin-top: 1rem;">Providers</div>', unsafe_allow_html=True)
     provider_rows = "".join(
-        f'<div class="provider-row"><span class="status-dot-inline {"up" if ok else "down"}"></span>{label}</div>'
-        for label, ok in provider_status.items()
+        f'<div class="provider-row">'
+        f'<span class="status-dot-inline {"up" if provider["check"]() else "down"}"></span>'
+        f'<span class="provider-name">{provider["label"]}</span>'
+        f'<span class="provider-role">{provider["role"]}</span>'
+        f"</div>"
+        for provider in PROVIDERS
     )
     st.markdown(f'<div class="provider-list">{provider_rows}</div>', unsafe_allow_html=True)
 
@@ -371,26 +435,18 @@ def render_trace(details: dict) -> None:
 
 if not st.session_state.history:
     st.markdown('<div class="welcome-block">', unsafe_allow_html=True)
-    st.markdown('<div class="welcome-eyebrow">How this works</div>', unsafe_allow_html=True)
-    st.markdown(
-        '<p class="welcome-note">Every answer passes through safety and topic '
-        "gating, a two-layer cache, and a hard-gated reranker before it reaches the "
-        "model, or gets stopped along the way. Turn on \"Show pipeline trace\" in the "
-        "sidebar to see exactly which stages ran and what each one decided.</p>",
-        unsafe_allow_html=True,
-    )
-    if show_trace:
-        preview_html = ""
+    with st.expander("How this works", expanded=False):
+        diagram_html = ""
         for i, stage in enumerate(PIPELINE_STAGES):
-            preview_html += (
-                f'<div class="trace-step pending">'
-                f'<span class="trace-label">{stage}</span>'
-                f'<span class="trace-value">pending</span>'
+            diagram_html += (
+                f'<div class="pipeline-node">'
+                f'<span class="pipeline-node-title">{stage["label"]}</span>'
+                f'<span class="pipeline-node-desc">{stage["desc"]}</span>'
                 f"</div>"
             )
             if i < len(PIPELINE_STAGES) - 1:
-                preview_html += '<div class="trace-arrow">&#8594;</div>'
-        st.markdown(f'<div class="trace-row">{preview_html}</div>', unsafe_allow_html=True)
+                diagram_html += '<div class="pipeline-arrow">&#8594;</div>'
+        st.markdown(f'<div class="pipeline-diagram">{diagram_html}</div>', unsafe_allow_html=True)
     st.markdown('<p class="welcome-caption">Try one of these, or ask your own below.</p>', unsafe_allow_html=True)
     st.markdown("</div>", unsafe_allow_html=True)
 

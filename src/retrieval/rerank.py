@@ -11,7 +11,7 @@ _ranker: Ranker | None = None
 
 def _get_ranker() -> Ranker:
     # lazily built on first use, not at import time: the ONNX model is a
-    # real ~30-50MB load, paying that cost during `import src.rerank` (e.g.
+    # real ~30-50MB load, paying that cost during `import src.retrieval.rerank` (e.g.
     # via `import src.graph` at app startup) delays every cold start by
     # however long that load takes, for a model that a given process might
     # not even need yet (cache hits never reach this code path at all).
@@ -19,6 +19,14 @@ def _get_ranker() -> Ranker:
     if _ranker is None:
         _ranker = Ranker(model_name=settings.rerank_model)
     return _ranker
+
+
+def preload() -> None:
+    """Force the FlashRank ONNX model to load now, rather than lazily on
+    the first real rerank_and_gate() call. See guardrails/gates.py's
+    preload() for why this matters: paid once at UI startup instead of
+    silently inflating the first user question's latency."""
+    _get_ranker()
 
 
 def rerank_and_gate(question: str, candidates: list[dict]) -> list[dict]:

@@ -58,7 +58,7 @@ Implemented as a LangGraph state machine (`src/graph.py`), not a linear script, 
 ## Tech stack
 
 - **Orchestration:** LangGraph
-- **LLMs:** NVIDIA NIM (primary), Groq (fallback)
+- **LLMs:** Groq (primary), NVIDIA NIM (fallback), Google Gemini (second fallback)
 - **Guardrails:** NeMo Guardrails / Colang (jailbreak-pattern detection) + a direct LLM classifier (topic control & unsafe-content detection)
 - **Embeddings:** Google Gemini (`gemini-embedding-001`), batched per ingested file
 - **Vector database:** Qdrant
@@ -72,15 +72,15 @@ Implemented as a LangGraph state machine (`src/graph.py`), not a linear script, 
 
 ## Provider roles
 
-| Role | Primary | Fallback | Why |
-|---|---|---|---|
-| Main generation | NVIDIA NIM | Groq | retry-then-failover on transient errors only; NIM's RPM-only free tier suits a chatty pipeline better than Groq's tight TPM cap, Groq catches NIM outages |
-| Planner (rewrite, canonicalize, topic/safety classification) | NIM, small model | Groq, small model | kept off the main generation model's rate budget entirely |
-| Jailbreak detection | NeMo Guardrails / Colang, backed by Groq | none, fails closed | few-shot pattern matching suits jailbreak-shaped attempts specifically; not used for general topic/safety classification, which generalizes poorly under a fixed few-shot example set |
-| Embeddings | Google Gemini, `gemini-embedding-001`, truncated to 768 dims | none | GA, free tier, 768 dims keeps Qdrant storage well under free-tier limits |
-| Eval judge | Groq | — | deliberately separate from whatever's serving live traffic |
+| Role | Chain | Why |
+|---|---|---|
+| Main generation | Groq &rarr; NVIDIA NIM &rarr; Google Gemini | retry-then-failover per link, on transient errors only; Groq's low latency suits a chat UI best, NIM catches Groq's tighter TPM cap, Gemini is a last-resort third provider so a single-vendor outage doesn't take the whole app down |
+| Planner (rewrite, canonicalize, topic/safety classification) | Groq, small model &rarr; NIM, small model &rarr; Gemini, small model | kept off the main generation model's rate budget entirely, same chain order and reasoning as main generation |
+| Jailbreak detection | NeMo Guardrails / Colang, backed by Groq, no fallback (fails closed) | few-shot pattern matching suits jailbreak-shaped attempts specifically; not used for general topic/safety classification, which generalizes poorly under a fixed few-shot example set |
+| Embeddings | Google Gemini, `gemini-embedding-001`, truncated to 768 dims, no fallback | GA, free tier, 768 dims keeps Qdrant storage well under free-tier limits |
+| Eval judge | Groq only | deliberately separate from whatever's serving live traffic |
 
-Exact model IDs live in `.env.example` / `src/config.py`, not hardcoded in the pipeline logic. Only transient errors (timeouts, rate limits, connection errors, 5xx) trigger retry-then-failover; non-transient client errors (bad request, auth) propagate immediately rather than wasting a retry and a failover on something that will never succeed.
+Exact model IDs live in `.env.example` / `src/config.py`, not hardcoded in the pipeline logic. Only transient errors (timeouts, rate limits, connection errors, 5xx) trigger retry-then-failover to the next link in the chain; non-transient client errors (bad request, auth) propagate immediately rather than wasting a retry and a failover on something that will never succeed. Each OpenAI-compatible client (Groq, NIM) has a 15s request timeout, so a single unresponsive provider costs at most ~30s (one retry) before the chain moves on, rather than ~60s.
 
 ## Setup
 

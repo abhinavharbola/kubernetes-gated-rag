@@ -1,6 +1,6 @@
-# Kubernetes Agentic RAG
+# Kubernetes Gated RAG
 
-A retrieval-augmented Q&A system for Kubernetes questions, built to run entirely on a no-GPU, 16GB laptop by offloading every model-weight operation to free-tier hosted APIs. Local compute is limited to parsing, chunking, and CPU/ONNX reranking.
+A retrieval-augmented Q&A system for Kubernetes questions, gated at every stage rather than trusting any single check: a safety gate and topic gate before a message is even processed, a hard relevance threshold that drops weak retrieval matches instead of just reordering them, and fail-closed behavior throughout, a classifier error blocks a request rather than letting it through. Built to run entirely on a no-GPU, 16GB laptop by offloading every model-weight operation to free-tier hosted APIs; local compute is limited to parsing, chunking, and CPU/ONNX reranking.
 
 Not a scale project, a demonstration of the pieces that separate a "wrap an LLM around a vector search" demo from something closer to production shape: two-layer caching with intent preservation, structure-aware chunking that respects Kubernetes manifest boundaries, a hard-gated reranker instead of similarity-only retrieval, three-way provider failover, and full request tracing.
 
@@ -90,18 +90,14 @@ A confirmed "no grounded documentation" outcome is cached too, under a short TTL
 
 ## Safety
 
-Retrieved context here comes only from your own ingested, gate-filtered corpus, not the open web, so the classic prompt-injection-via-search-results surface doesn't apply the same way it would to an agent that fetches live pages. The actual trust boundary is narrower and more direct: whatever safety or topic risk exists depends entirely on what you choose to ingest into `DATA/`, the query-time guardrails exist to filter what users can *ask*, not to sanitize what the corpus itself contains.
+Retrieved context here comes only from your own ingested, gate-filtered corpus, not the open web, so the classic prompt-injection-via-search-results surface doesn't apply the same way it would to an agent that fetches live pages. The actual trust boundary is narrower and more direct: whatever safety or topic risk exists depends entirely on what you choose to ingest into `data/`, the query-time guardrails exist to filter what users can *ask*, not to sanitize what the corpus itself contains.
 
 ## Project structure
 
 ```
-kubernetes-agentic-rag/
-│
-├── .streamlit/
-│   └── config.toml                       # theme, toolbar mode
-├── ui/
-│   └── app.py                            # Streamlit chat UI (rerun-safe via st.chat_input)
-├── ingest.py                             # CLI pipeline: parse → relevance-gate → chunk → embed → upsert
+kubernetes-gated-rag/
+├── .streamlit/config.toml                # theme, toolbar mode
+├── ui/app.py                             # Streamlit chat UI (rerun-safe via st.chat_input)
 │
 ├── src/                                  # Core RAG pipeline
 │   ├── config.py                         # application settings, retrieval/rerank thresholds
@@ -127,7 +123,7 @@ kubernetes-agentic-rag/
 │       ├── rerank.py                     # FlashRank reranking + hard relevance threshold, lazy-loaded
 │       └── cache.py                      # exact-match and semantic caching layers
 │
-├── DATA/
+├── data/
 │   ├── true_data/                        # the real corpus, bring your own
 │   └── noisy_data/                       # off-topic content the ingestion gate should reject
 │
@@ -136,10 +132,8 @@ kubernetes-agentic-rag/
 │   ├── dataset.py                        # eval set loader/validator
 │   └── run_eval.py                       # RAGAS evaluation (6 retrieval & generation metrics)
 │
-├── docs/
-│   └── screenshots/
-│
 ├── tests/
+├── ingest.py                             # CLI pipeline: parse → relevance-gate → chunk → embed → upsert
 │
 ├── .env.example                          # API keys for NIM, Groq, Gemini & Qdrant
 ├── .gitignore
@@ -163,13 +157,13 @@ kubernetes-agentic-rag/
    cp .env.example .env   # fill in NVIDIA_NIM_API_KEY, GROQ_API_KEY, GEMINI_API_KEY, QDRANT_URL, QDRANT_API_KEY
    ```
 
-3. **Corpus.** `DATA/` follows a `true_data/` (the real corpus) and `noisy_data/` (off-topic content, expected to be rejected by the ingestion relevance gate, not a lower-trust second tier) convention, both directories run through the same `ingest_directory()` path in `ingest.py`. Bring your own, there's no bundled starter corpus or fetch script in this project, that's deliberate: any doc-fetching tool needs to be run by you, against sources you've checked, not shipped as something that silently pulls third-party content on your behalf.
+3. **Corpus.** `data/` follows a `true_data/` (the real corpus) and `noisy_data/` (off-topic content, expected to be rejected by the ingestion relevance gate, not a lower-trust second tier) convention, both directories run through the same `ingest_directory()` path in `ingest.py`. Bring your own, there's no bundled starter corpus or fetch script in this project, that's deliberate: any doc-fetching tool needs to be run by you, against sources you've checked, not shipped as something that silently pulls third-party content on your behalf.
 
 ## Running it
 
 ```bash
 pytest tests/ -v            # full suite, mocked, no real API keys or network needed
-python ingest.py DATA --wipe   # parse -> relevance-gate -> chunk -> embed -> upsert into Qdrant
+python ingest.py data --wipe   # parse -> relevance-gate -> chunk -> embed -> upsert into Qdrant
 streamlit run ui/app.py        # chat UI on :8501
 ```
 
@@ -203,8 +197,6 @@ python eval/run_eval.py
 
 - **The safety/topic classifiers use plain single-word-verdict prompts**, not NVIDIA NeMoGuard's purpose-built, separately-tuned classification models (`nemoguard_topic_model` / `nemoguard_safety_model` are defined in `src/config.py` for exactly this but aren't wired into `src/guardrails/gates.py` yet). Functionally reasonable and fail-closed with few-shot calibration examples, but a purpose-built safety model will generally out-calibrate a general-purpose LLM told to output one word, this is the most likely place classification quality is being left on the table.
 - **Jailbreak detection is few-shot pattern matching** (Colang), not a dedicated jailbreak-classification model either. It catches attempts that resemble the examples in `colang_rules.py`, backed by a direct-classifier safety net for jailbreak phrasing that doesn't match those examples; genuinely novel phrasing can still slip past both. Extend `colang_rules.py` with more diverse examples if you find a gap.
-- **No bundled corpus.** Bring your own `DATA/true_data/` and `DATA/noisy_data/`. The eval set (`eval/eval_set.json`) is synthetic, written for this project rather than scraped, for copyright reasons, extend it with a real hand-built set before treating its scores as representative.
 - FlashRank's cross-encoder score is not a calibrated probability, see the Configuration section above.
-- The manifest chunker is a structural heuristic, not a real YAML parser: a block scalar (`|` or `>`) whose literal content happens to contain a line that is exactly `---` will be mis-split as if it were a document boundary. Rare in practice for real Kubernetes manifests, but worth knowing rather than assuming full YAML awareness.
 - No conversation persistence, history lives in `st.session_state` and is lost on page reload. The exact/semantic caches persist independently of chat history, so repeated questions across sessions still benefit from caching even though the visible transcript doesn't.
 - Single-user local demo, not multi-tenant. The exact cache is a local SQLite file (`.cache/exact`); the semantic cache lives in Qdrant and is shared across every session hitting the same Qdrant collection.

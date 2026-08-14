@@ -59,19 +59,19 @@ CUSTOM_CSS = """
 @import url('https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,600;9..144,700&family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap');
 
 :root {
-    --bg: #F2EFE6;
-    --surface: #FFFFFF;
-    --border: rgba(24, 30, 27, 0.10);
-    --border-accent: rgba(37, 99, 87, 0.28);
-    --text-primary: #1B211D;
-    --text-muted: #6D756F;
-    --text-faint: #B7BFB8;
-    --accent: #256357;
-    --accent-strong: #16453B;
-    --accent-soft: rgba(37, 99, 87, 0.10);
-    --danger: #A8402E;
-    --danger-soft: rgba(168, 64, 46, 0.08);
-    --neutral: #B7BFB8;
+    --bg: #14171C;
+    --surface: #1B1F26;
+    --border: rgba(237, 234, 228, 0.09);
+    --border-accent: rgba(217, 164, 65, 0.30);
+    --text-primary: #EDEAE4;
+    --text-muted: #9B968D;
+    --text-faint: #625D54;
+    --accent: #D9A441;
+    --accent-strong: #C08A2E;
+    --accent-soft: rgba(217, 164, 65, 0.12);
+    --danger: #E2685A;
+    --danger-soft: rgba(226, 104, 90, 0.12);
+    --neutral: #625D54;
     --font-display: "Fraunces", Georgia, serif;
     --font-sans: "IBM Plex Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
     --font-mono: "IBM Plex Mono", "Fira Code", ui-monospace, monospace;
@@ -81,23 +81,52 @@ CUSTOM_CSS = """
 .stApp [data-testid="stChatMessage"] { gap: 0.6rem; }
 code, .mono { font-family: var(--font-mono); }
 
+/* Streamlit paints its header bar and the bottom chat-input bar from
+   separate containers that don't inherit .stApp's background — theme.toml
+   now matches this palette too (belt and suspenders: the toml drives
+   Streamlit's own native widget colors, this covers anything it doesn't). */
+[data-testid="stHeader"],
+[data-testid="stBottom"],
+[data-testid="stBottomBlockContainer"] {
+    background: var(--bg) !important;
+}
+[data-testid="stChatInput"] {
+    background: var(--surface) !important;
+    border: 1px solid var(--border-accent) !important;
+    border-radius: 10px !important;
+}
+[data-testid="stChatInput"] textarea { color: var(--text-primary) !important; }
+.stButton button {
+    border-radius: 8px !important;
+    border: 1px solid var(--border-accent) !important;
+}
+
+/* the "usable width" of centered layout is capped by Streamlit's own
+   block-container max-width (~730px); widen it so the header, diagram, and
+   example grid all have room to breathe instead of wrapping constantly. */
+.block-container, [data-testid="stMainBlockContainer"] {
+    max-width: 980px !important;
+    padding-top: 2.2rem !important;
+}
+
 /* --- header --- */
 .app-header {
     display: flex; flex-direction: column; align-items: center; text-align: center;
     padding: 0.9rem 0 1.4rem 0; margin-bottom: 0.5rem;
-    border-bottom: 1px solid var(--border-accent);
+    border-bottom: 2px solid transparent;
+    border-image: linear-gradient(90deg, transparent, var(--accent) 20%, var(--accent) 80%, transparent) 1;
 }
 .app-header .title-block h1 {
-    margin: 0; font-family: var(--font-display); font-size: 2.7rem;
+    margin: 0; font-family: var(--font-display); font-size: 2.9rem;
     font-weight: 600; letter-spacing: -0.01em; color: var(--text-primary); line-height: 1.15;
 }
 .app-header .title-block .tagline {
-    color: var(--text-muted); font-size: 1rem; margin-top: 0.55rem;
-    max-width: 560px; line-height: 1.55;
+    color: var(--text-muted); font-size: 1.02rem; margin: 0.6rem auto 0 auto;
+    max-width: 700px; line-height: 1.5;
 }
 
 /* --- welcome / onboarding --- */
-.welcome-block { max-width: 640px; margin: 1.75rem auto 1.5rem auto; text-align: center; }
+.welcome-block { max-width: 900px; margin: 1.75rem auto 1.5rem auto; text-align: center; }
 .welcome-block .trace-row { justify-content: center; }
 
 /* history fade opacity is now injected dynamically alongside the container,
@@ -135,26 +164,38 @@ code, .mono { font-family: var(--font-mono); }
     font-size: 0.7rem; color: var(--text-faint); white-space: nowrap; padding-left: 0.5rem;
 }
 
-/* --- pipeline diagram (static, explanatory, inside "How this works") --- */
+/* --- pipeline diagram (static, explanatory, inside "How this works") ---
+   flex-wrap previously broke the arrow chain: nodes that wrapped to a
+   second row left a dangling arrow at the row break with no connector
+   picking back up on the next row. nowrap + horizontal scroll keeps the
+   chain visually intact at any width instead. */
+.pipeline-diagram-wrap { overflow-x: auto; padding: 0.2rem 0.1rem 0.5rem 0.1rem; }
 .pipeline-diagram {
-    display: flex; flex-wrap: wrap; align-items: stretch; justify-content: center;
-    gap: 0.5rem; margin: 0.75rem 0 0.4rem 0;
+    display: flex; flex-wrap: nowrap; align-items: stretch;
+    gap: 0.45rem; margin: 0.6rem 0 0.2rem 0; width: max-content; min-width: 100%;
+    justify-content: center;
 }
 .pipeline-node {
-    display: flex; flex-direction: column; gap: 0.2rem;
-    padding: 0.6rem 0.8rem; border-radius: 8px; width: 128px;
+    position: relative; display: flex; flex-direction: column; gap: 0.22rem;
+    padding: 0.65rem 0.75rem 0.6rem 0.75rem; border-radius: 10px; width: 118px; flex-shrink: 0;
     background: var(--surface); border: 1px solid var(--border);
     border-top: 3px solid var(--accent);
 }
+.pipeline-node .pipeline-node-badge {
+    position: absolute; top: -9px; right: -9px; width: 18px; height: 18px; border-radius: 50%;
+    background: var(--accent); color: #fff; font-family: var(--font-mono); font-size: 0.62rem;
+    font-weight: 600; display: flex; align-items: center; justify-content: center;
+}
 .pipeline-node .pipeline-node-title {
-    font-family: var(--font-mono); font-size: 0.72rem; font-weight: 600;
+    font-family: var(--font-mono); font-size: 0.74rem; font-weight: 600;
     letter-spacing: 0.03em; color: var(--text-primary);
 }
 .pipeline-node .pipeline-node-desc {
-    font-size: 0.72rem; line-height: 1.4; color: var(--text-muted);
+    font-size: 0.71rem; line-height: 1.4; color: var(--text-muted);
 }
 .pipeline-arrow {
-    display: flex; align-items: center; color: var(--neutral); font-size: 1rem;
+    display: flex; align-items: center; color: var(--accent); font-size: 1.15rem; flex-shrink: 0;
+    opacity: 0.55;
 }
 
 /* --- sources --- */
@@ -165,14 +206,21 @@ code, .mono { font-family: var(--font-mono); }
 }
 .source-row:last-child { border-bottom: none; }
 .source-meta { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-primary); }
-.source-score-wrap { height: 5px; border-radius: 3px; background: rgba(24, 30, 27, 0.08); overflow: hidden; }
+.source-score-wrap { height: 5px; border-radius: 3px; background: var(--border); overflow: hidden; }
 .source-score-bar { height: 100%; background: var(--accent); }
 .source-row .score { color: var(--accent-strong); text-align: right; }
 
-/* --- welcome / onboarding --- */
-.example-btn button {
+/* --- welcome / onboarding: example question buttons ---
+   targeting the key-based wrapper class Streamlit applies to the widget's
+   own container (the same mechanism already used for .st-key-history_block
+   below), not a hand-rolled markdown div — st.markdown('<div>') / st.button
+   / st.markdown('</div>') render as sibling DOM nodes, not nested ones, so
+   a ".example-btn button" selector never actually matched anything, which
+   is why the previous fixed-height attempt had no visible effect. */
+[class*="st-key-example_"] button {
     text-align: left !important;
-    height: 108px !important;
+    height: 104px !important;
+    width: 100% !important;
     box-sizing: border-box !important;
     display: flex !important;
     align-items: center !important;
@@ -207,7 +255,7 @@ code, .mono { font-family: var(--font-mono); }
     text-transform: uppercase; letter-spacing: 0.04em;
 }
 .status-dot-inline { width: 7px; height: 7px; border-radius: 50%; display: inline-block; flex-shrink: 0; }
-.status-dot-inline.up { background: var(--accent-strong); box-shadow: 0 0 4px rgba(37, 99, 87, 0.5); }
+.status-dot-inline.up { background: var(--accent-strong); box-shadow: 0 0 4px var(--accent-soft); }
 .status-dot-inline.down { background: var(--danger); }
 
 .error-note {
@@ -297,10 +345,8 @@ st.markdown(
     <div class="app-header">
         <div class="title-block">
             <h1>Kubernetes Q&amp;A</h1>
-            <div class="tagline">Ask anything about Pods, Deployments, Services, or manifest syntax and get
-            an answer grounded in your own ingested documentation, not a guess. Every question is checked for
-            safety and relevance, checked against a two-layer cache, and only reaches the model with retrieved
-            context that actually clears a relevance bar.</div>
+            <div class="tagline">Grounded Kubernetes answers from your own docs, safety-checked,
+            relevance-gated, and cached for speed.</div>
         </div>
     </div>
     """,
@@ -440,23 +486,25 @@ if not st.session_state.history:
         for i, stage in enumerate(PIPELINE_STAGES):
             diagram_html += (
                 f'<div class="pipeline-node">'
+                f'<span class="pipeline-node-badge">{i + 1}</span>'
                 f'<span class="pipeline-node-title">{stage["label"]}</span>'
                 f'<span class="pipeline-node-desc">{stage["desc"]}</span>'
                 f"</div>"
             )
             if i < len(PIPELINE_STAGES) - 1:
                 diagram_html += '<div class="pipeline-arrow">&#8594;</div>'
-        st.markdown(f'<div class="pipeline-diagram">{diagram_html}</div>', unsafe_allow_html=True)
+        st.markdown(
+            f'<div class="pipeline-diagram-wrap"><div class="pipeline-diagram">{diagram_html}</div></div>',
+            unsafe_allow_html=True,
+        )
     st.markdown('<p class="welcome-caption">Try one of these, or ask your own below.</p>', unsafe_allow_html=True)
     st.markdown("</div>", unsafe_allow_html=True)
 
     cols = st.columns(2)
     for i, question in enumerate(EXAMPLE_QUESTIONS):
         with cols[i % 2]:
-            st.markdown('<div class="example-btn">', unsafe_allow_html=True)
             if st.button(question, key=f"example_{i}", use_container_width=True):
                 st.session_state.pending_prompt = question
-            st.markdown("</div>", unsafe_allow_html=True)
 
 # past turns fade out while a new one is being generated, so attention goes
 # to the active exchange below rather than the settled conversation above it.

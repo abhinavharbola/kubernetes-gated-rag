@@ -1,3 +1,4 @@
+import logging
 import time
 from typing import TypedDict
 
@@ -16,6 +17,8 @@ from src.providers.llm import generate_main, generate_planner
 from src.retrieval.rerank import rerank_and_gate
 from src.retrieval.search import retrieve
 from src.tracing import node_span, log_cache_decision, turn_span
+
+logger = logging.getLogger(__name__)
 
 NO_CONTEXT_MESSAGE = (
     "I don't have grounded documentation for that. Try rephrasing, or ask about "
@@ -72,7 +75,15 @@ def rewrite_with_history_node(state: GraphState) -> GraphState:
                 {"role": "user", "content": f"History:\n{history_text}\n\nLatest: {state['raw_message']}"},
             ]
         )
-        return {"standalone_question": result.content.strip()}
+        standalone = result.content.strip()
+        if not standalone:
+            logger.warning(
+                "rewrite_with_history got an empty response from %s (%s), falling back to raw_message",
+                result.provider,
+                result.model,
+            )
+            standalone = state["raw_message"]
+        return {"standalone_question": standalone}
 
 
 def topic_gate_node(state: GraphState) -> GraphState:
@@ -108,7 +119,22 @@ def canonicalize_node(state: GraphState) -> GraphState:
                 {"role": "user", "content": state["standalone_question"]},
             ]
         )
-        return {"canonical_question": result.content.strip()}
+        canonical = result.content.strip()
+        if not canonical:
+            # small/fast planner models occasionally return an empty
+            # completion for an otherwise well-formed request. There's
+            # nothing to normalize in that case — fall back to the
+            # standalone question rather than letting an empty string
+            # reach embed_canonical_question, which Gemini's embed_content
+            # rejects outright with an opaque 400 (empty Part) error deep
+            # in a retry stack, not this call site.
+            logger.warning(
+                "canonicalize_question got an empty response from %s (%s), falling back to standalone_question",
+                result.provider,
+                result.model,
+            )
+            canonical = state["standalone_question"]
+        return {"canonical_question": canonical}
 
 
 def semantic_cache_node(state: GraphState) -> GraphState:

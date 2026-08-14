@@ -80,6 +80,15 @@ def embed_texts(texts: list[str], task_type: str) -> list[list[float]]:
     SEMANTIC_SIMILARITY for cache lookups."""
     if not texts:
         return []
+    for i, text in enumerate(texts):
+        if not text or not text.strip():
+            # Gemini's embed_content rejects an empty string with an opaque
+            # "EmbedContentRequest.content contains an empty Part" 400,
+            # several frames deep inside a tenacity retry stack. Failing
+            # here instead, right next to whatever produced the empty
+            # text, makes the actual bug traceable instead of just the
+            # symptom.
+            raise ValueError(f"embed_texts received an empty string at index {i} (task_type={task_type})")
 
     vectors: list[list[float]] = []
     for start in range(0, len(texts), EMBED_BATCH_SIZE):

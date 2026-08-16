@@ -22,6 +22,18 @@ groq_client = OpenAI(
     max_retries=0,
 )
 
+# second Groq account: distinct API key, same base URL and model. Used as
+# generate_main's 2nd chain link so a per-key/per-model rate cap on the
+# primary account doesn't immediately drop to the slower cross-vendor NIM
+# hop. See src/config.py's groq_api_key_secondary docstring for the
+# resilience tradeoff this does and doesn't cover.
+groq_client_secondary = OpenAI(
+    api_key=settings.groq_api_key_secondary,
+    base_url=settings.groq_base_url,
+    timeout=15.0,
+    max_retries=0,
+)
+
 gemini_client = genai.Client(api_key=settings.gemini_api_key)
 
 qdrant_client = QdrantClient(

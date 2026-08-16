@@ -56,12 +56,22 @@ def _upsert_batch(points: list[PointStruct]) -> None:
 
 
 def ensure_collection(wipe: bool = False) -> None:
+    # wipe clears BOTH the docs collection and the semantic cache, not just
+    # docs. A cached answer (semantic or the permanent, expire=None exact
+    # cache) points at content that may no longer exist or may have changed
+    # once the corpus is re-ingested; leaving the cache alone means repeat
+    # or paraphrased questions keep silently serving pre-wipe answers
+    # indefinitely, since only the "no grounded documentation" outcome has
+    # a TTL, not a real generated answer.
     existing = {c.name for c in qdrant_client.get_collections().collections}
 
-    if wipe and settings.qdrant_docs_collection in existing:
-        qdrant_client.delete_collection(settings.qdrant_docs_collection)
-        existing.discard(settings.qdrant_docs_collection)
-        logger.info("wiped existing collection: %s", settings.qdrant_docs_collection)
+    if wipe:
+        for collection_name in (settings.qdrant_docs_collection, settings.qdrant_cache_collection):
+            if collection_name in existing:
+                qdrant_client.delete_collection(collection_name)
+                existing.discard(collection_name)
+                logger.info("wiped existing collection: %s", collection_name)
+        _wipe_exact_cache()
 
     if settings.qdrant_docs_collection not in existing:
         qdrant_client.create_collection(
@@ -73,6 +83,18 @@ def ensure_collection(wipe: bool = False) -> None:
             collection_name=settings.qdrant_cache_collection,
             vectors_config=VectorParams(size=settings.embedding_dim, distance=Distance.COSINE),
         )
+
+
+def _wipe_exact_cache() -> None:
+    # local import: ingest.py otherwise has no reason to touch
+    # src.retrieval.cache, and importing it unconditionally at module load
+    # would pull in diskcache's on-disk init for a CLI path that might
+    # never need it (e.g. --help).
+    from src.retrieval.cache import _exact_cache
+
+    count = len(_exact_cache)
+    _exact_cache.clear()
+    logger.info("wiped %d entr%s from the local exact cache", count, "y" if count == 1 else "ies")
 
 
 def ingest_directory(directory: Path) -> dict:
@@ -128,7 +150,12 @@ def main() -> None:
         )
     )
     parser.add_argument("data_dir", type=Path, help="e.g. DATA, containing true_data/ and/or noisy_data/")
-    parser.add_argument("--wipe", action="store_true", help="delete and recreate the docs collection first")
+    parser.add_argument(
+        "--wipe",
+        action="store_true",
+        help="delete and recreate the docs collection AND the semantic/exact caches first "
+        "(a corpus refresh without --wipe leaves stale cached answers pointing at old content)",
+    )
     args = parser.parse_args()
 
     ensure_collection(wipe=args.wipe)

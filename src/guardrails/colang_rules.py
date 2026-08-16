@@ -1,15 +1,15 @@
 # Colang intent definitions + flows for the NeMo Guardrails-based gate.
-# Ported from the 8hr-MARATHON project's app/guardrails/colang_rules.py,
-# narrowed from its original "Kubernetes, Intel hardware, and networking"
-# enterprise-IT scope down to Kubernetes only, to match this project's
-# actual topic boundary (see TOPIC_SYSTEM_PROMPT's predecessor in the old
-# direct-classifier guardrails.py).
-#
-# greeting / capabilities / farewell flows are kept even though nothing in
-# src/guardrails.py checks for their indicator strings: they give the
-# underlying few-shot intent matcher more labeled "not off-topic, not a
-# jailbreak" examples, which should only help discrimination quality on the
-# two flows that actually gate the pipeline.
+# This gate's only authoritative output is jailbreak-pattern detection (see
+# JAILBREAK_INDICATORS below and check_safety() in gates.py) — every other
+# flow defined here (off topic, greeting, capabilities, farewell) exists
+# purely to give the underlying few-shot intent matcher more labeled
+# examples to discriminate against. None of their outputs are read; they
+# improve the jailbreak flow's discrimination quality by giving the matcher
+# more "not a jailbreak" contrast examples, nothing more. Off-topic
+# classification itself is handled by NeMoGuard's topic-control model
+# (check_topic() in gates.py), not by this Colang flow — see check_topic's
+# docstring for why a fixed few-shot example list generalizes poorly to
+# open-ended topic classification.
 
 COLANG_CONTENT = """
 define user ask off topic
@@ -134,12 +134,8 @@ instructions:
 # place to check.
 
 # distinctive substring from the "bot refuse jailbreak" block above, used to
-# detect that this specific flow fired, independent of off-topic firing.
+# detect that this specific flow fired. This is the only indicator actually
+# read anywhere in the guardrails package — see the module docstring above.
 JAILBREAK_INDICATORS = [
     "I maintain consistent guidelines regardless of how I am prompted",
-]
-
-# distinctive substring from the "bot refuse off topic" block above.
-OFF_TOPIC_INDICATORS = [
-    "I'm built to help with Kubernetes questions specifically",
 ]

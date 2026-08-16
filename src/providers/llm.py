@@ -1,8 +1,6 @@
 import logging
 from dataclasses import dataclass
 
-from google.genai import types
-from google.genai.errors import ClientError, ServerError
 from openai import (
     OpenAI,
     APITimeoutError,
@@ -10,9 +8,9 @@ from openai import (
     InternalServerError,
     RateLimitError,
 )
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type, retry_if_exception
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
-from src.providers.clients import nim_client, groq_client, gemini_client
+from src.providers.clients import nim_client, groq_client, groq_client_secondary
 from src.config import settings
 from src.tracing import provider_call_span
 
@@ -27,17 +25,10 @@ logger = logging.getLogger(__name__)
 # immediately instead, at whichever step in the chain they happened.
 RETRYABLE = (APITimeoutError, RateLimitError, APIConnectionError, InternalServerError)
 
-
-def _is_gemini_transient(error: BaseException) -> bool:
-    # ServerError covers Gemini's 5xx responses. ClientError covers both
-    # 429 (genuinely transient, worth a retry/failover) and non-transient
-    # 4xx like bad request or auth — only the former should trigger a
-    # retry or move to the next link in the chain.
-    if isinstance(error, ServerError):
-        return True
-    if isinstance(error, ClientError) and getattr(error, "code", None) == 429:
-        return True
-    return False
+# Gemini is deliberately not part of either chain below — it's used only for
+# embeddings (src/retrieval/embeddings.py) and as the eval judge
+# (eval/run_eval.py), both isolated from these live generation/planning
+# paths. See src/config.py for the reasoning.
 
 
 @dataclass
@@ -72,53 +63,12 @@ def _call_openai(
         return response.choices[0].message.content
 
 
-@retry(
-    stop=stop_after_attempt(2),
-    wait=wait_exponential(multiplier=1, min=1, max=8),
-    retry=retry_if_exception(_is_gemini_transient),
-    reraise=True,
-)
-def _call_gemini(model: str, messages: list[dict], temperature: float, max_tokens: int, role: str) -> str:
-    # Gemini isn't OpenAI-compatible: no chat.completions endpoint, system
-    # messages go in a dedicated config field rather than the messages list,
-    # and roles are "user"/"model" rather than "user"/"assistant".
-    system_instruction = None
-    contents = []
-    for message in messages:
-        if message["role"] == "system":
-            system_instruction = message["content"]
-        else:
-            role_name = "model" if message["role"] == "assistant" else "user"
-            contents.append({"role": role_name, "parts": [{"text": message["content"]}]})
-
-    with provider_call_span(provider="gemini", model=model, role=role):
-        response = gemini_client.models.generate_content(
-            model=model,
-            contents=contents,
-            config=types.GenerateContentConfig(
-                system_instruction=system_instruction,
-                temperature=temperature,
-                max_output_tokens=max_tokens,
-            ),
-        )
-        return response.text
-
-
 def _openai_link(client: OpenAI, model: str, name: str, messages: list, temperature: float, max_tokens: int, role: str) -> dict:
     return {
         "name": name,
         "model": model,
         "call": lambda: _call_openai(client, model, messages, temperature, max_tokens, name, role),
         "is_transient": lambda error: isinstance(error, RETRYABLE),
-    }
-
-
-def _gemini_link(model: str, messages: list, temperature: float, max_tokens: int, role: str) -> dict:
-    return {
-        "name": "gemini",
-        "model": model,
-        "call": lambda: _call_gemini(model, messages, temperature, max_tokens, role),
-        "is_transient": _is_gemini_transient,
     }
 
 
@@ -147,18 +97,31 @@ def _run_chain(chain: list[dict]) -> CompletionResult:
 
 
 def generate_main(messages: list[dict], temperature: float = 0.2, max_tokens: int = 1024) -> CompletionResult:
+    # groq (primary account) -> groq (secondary account, same model) -> nim.
+    # The first two links share a model and only differ by API key/account,
+    # so a per-key rate cap on the primary doesn't immediately cost a hop to
+    # the slower cross-vendor NIM link; nim is still there for a genuine
+    # Groq-platform-wide outage.
     chain = [
         _openai_link(groq_client, settings.groq_main_model, "groq", messages, temperature, max_tokens, "main"),
+        _openai_link(
+            groq_client_secondary,
+            settings.groq_main_model_secondary,
+            "groq-secondary",
+            messages,
+            temperature,
+            max_tokens,
+            "main",
+        ),
         _openai_link(nim_client, settings.nim_main_model, "nim", messages, temperature, max_tokens, "main"),
-        _gemini_link(settings.gemini_main_model, messages, temperature, max_tokens, "main"),
     ]
     return _run_chain(chain)
 
 
 def generate_planner(messages: list[dict], temperature: float = 0.0, max_tokens: int = 256) -> CompletionResult:
+    # nim primary, groq fallback — reversed from generate_main deliberately.
     chain = [
-        _openai_link(groq_client, settings.groq_planner_model, "groq", messages, temperature, max_tokens, "planner"),
         _openai_link(nim_client, settings.nim_planner_model, "nim", messages, temperature, max_tokens, "planner"),
-        _gemini_link(settings.gemini_planner_model, messages, temperature, max_tokens, "planner"),
+        _openai_link(groq_client, settings.groq_planner_model, "groq", messages, temperature, max_tokens, "planner"),
     ]
     return _run_chain(chain)

@@ -30,6 +30,16 @@ def test_normalize_does_not_collapse_different_questions():
     assert a != b
 
 
+def test_normalize_preserves_hyphens_in_kubernetes_identifiers():
+    # regression test: stripping hyphens as ordinary punctuation used to
+    # collapse "kube-system" and "kubesystem" (or "front-end" and
+    # "frontend") onto the same cache key, conflating two different terms.
+    a = normalize_exact("What does the kube-system namespace do?")
+    b = normalize_exact("What does the kubesystem namespace do?")
+    assert a != b
+    assert "kube-system" in a
+
+
 def test_exact_cache_roundtrip():
     exact_cache_set("How do I create a resource?", "answer text")
     assert exact_cache_get("how do i create a resource") == "answer text"

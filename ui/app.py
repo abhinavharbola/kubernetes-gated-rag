@@ -56,28 +56,39 @@ PIPELINE_ERROR_MESSAGE = (
 
 CUSTOM_CSS = """
 <style>
-@import url('https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,600;9..144,700&family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Newsreader:ital,opsz,wght@0,6..72,400;0,6..72,500;0,6..72,600;1,6..72,500&family=Inter:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap');
 
+/* --- Design system ---
+   This app is a series of clearance gates (safety, topic, ingestion), so
+   the signature motif is a customs/ledger "clearance stamp" rather than a
+   generic pill badge — see .trace-stamp below. Palette is a warm ledger
+   cream with a desaturated slate-blue accent (a nod to Kubernetes' own
+   brand blue, deliberately not the terracotta-on-cream combo that reads
+   as an obvious AI default) and a muted brass reserved for the stamp
+   itself, the one place this page spends its visual boldness. */
 :root {
-    --bg: #14171C;
-    --surface: #1B1F26;
-    --border: rgba(237, 234, 228, 0.09);
-    --border-accent: rgba(217, 164, 65, 0.30);
-    --text-primary: #EDEAE4;
-    --text-muted: #9B968D;
-    --text-faint: #625D54;
-    --accent: #D9A441;
-    --accent-strong: #C08A2E;
-    --accent-soft: rgba(217, 164, 65, 0.12);
-    --danger: #E2685A;
-    --danger-soft: rgba(226, 104, 90, 0.12);
-    --neutral: #625D54;
-    --font-display: "Fraunces", Georgia, serif;
-    --font-sans: "IBM Plex Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    --bg: #EFE7D6;
+    --surface: #F8F2E5;
+    --surface-raised: #FFFDF7;
+    --border: rgba(43, 38, 28, 0.14);
+    --border-accent: rgba(60, 89, 112, 0.32);
+    --ink: #2B2620;
+    --ink-muted: #6E6656;
+    --ink-faint: #A79C86;
+    --accent: #3C5970;
+    --accent-strong: #2A4356;
+    --accent-soft: rgba(60, 89, 112, 0.10);
+    --brass: #93712F;
+    --brass-soft: rgba(147, 113, 47, 0.14);
+    --danger: #9C4A36;
+    --danger-soft: rgba(156, 74, 54, 0.11);
+    --neutral: #8C8370;
+    --font-display: "Newsreader", Georgia, serif;
+    --font-sans: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
     --font-mono: "IBM Plex Mono", "Fira Code", ui-monospace, monospace;
 }
 
-.stApp { font-family: var(--font-sans); background: var(--bg); }
+.stApp { font-family: var(--font-sans); background: var(--bg); color: var(--ink); }
 .stApp [data-testid="stChatMessage"] { gap: 0.6rem; }
 code, .mono { font-family: var(--font-mono); }
 
@@ -91,84 +102,113 @@ code, .mono { font-family: var(--font-mono); }
     background: var(--bg) !important;
 }
 [data-testid="stChatInput"] {
-    background: var(--surface) !important;
+    background: var(--surface-raised) !important;
     border: 1px solid var(--border-accent) !important;
-    border-radius: 10px !important;
+    border-radius: 4px !important;
 }
-[data-testid="stChatInput"] textarea { color: var(--text-primary) !important; }
+[data-testid="stChatInput"] textarea { color: var(--ink) !important; }
 .stButton button {
-    border-radius: 8px !important;
+    border-radius: 3px !important;
     border: 1px solid var(--border-accent) !important;
+    color: var(--ink) !important;
+    background: var(--surface-raised) !important;
 }
+.stButton button:hover {
+    border-color: var(--accent) !important;
+    color: var(--accent-strong) !important;
+}
+.stMarkdown, .stApp p, .stApp li { color: var(--ink); }
 
 /* the "usable width" of centered layout is capped by Streamlit's own
    block-container max-width (~730px); widen it so the header, diagram, and
    example grid all have room to breathe instead of wrapping constantly. */
 .block-container, [data-testid="stMainBlockContainer"] {
     max-width: 980px !important;
-    padding-top: 2.2rem !important;
+    padding-top: 2rem !important;
 }
 
-/* --- header --- */
+/* --- masthead ---
+   Ledger/manifest framing: a small eyebrow label above the title, thin
+   double rule below it (top rule solid, bottom rule dashed, like a form's
+   cut line), title set in Newsreader italic for a document-of-record feel
+   rather than a marketing headline. */
 .app-header {
     display: flex; flex-direction: column; align-items: center; text-align: center;
-    padding: 0.9rem 0 1.4rem 0; margin-bottom: 0.5rem;
-    border-bottom: 2px solid transparent;
-    border-image: linear-gradient(90deg, transparent, var(--accent) 20%, var(--accent) 80%, transparent) 1;
+    padding: 0.2rem 0 0.85rem 0; margin-bottom: 0.3rem;
+}
+.app-header .masthead-eyebrow {
+    font-family: var(--font-mono); font-size: 0.68rem; letter-spacing: 0.16em;
+    text-transform: uppercase; color: var(--ink-faint); margin-bottom: 0.55rem;
 }
 .app-header .title-block h1 {
-    margin: 0; font-family: var(--font-display); font-size: 2.9rem;
-    font-weight: 600; letter-spacing: -0.01em; color: var(--text-primary); line-height: 1.15;
+    margin: 0; font-family: var(--font-display); font-style: italic; font-size: 2.6rem;
+    font-weight: 500; letter-spacing: -0.005em; color: var(--ink); line-height: 1.1;
 }
 .app-header .title-block .tagline {
-    color: var(--text-muted); font-size: 1.02rem; margin: 0.6rem auto 0 auto;
-    max-width: 700px; line-height: 1.5;
+    color: var(--ink-muted); font-size: 0.98rem; margin: 0.65rem auto 0 auto;
+    max-width: 640px; line-height: 1.5;
+}
+.app-header .masthead-rule {
+    width: 100%; max-width: 560px; margin-top: 1.1rem;
+    border: none; border-top: 1px solid var(--ink); opacity: 0.55;
+}
+.app-header .masthead-rule.dashed {
+    margin-top: 0.28rem; border-top: 1px dashed var(--border-accent);
 }
 
 /* --- welcome / onboarding --- */
-.welcome-block { max-width: 900px; margin: 1.75rem auto 1.5rem auto; text-align: center; }
+.welcome-block { max-width: 900px; margin: 0.9rem auto 1.5rem auto; text-align: center; }
 .welcome-block .trace-row { justify-content: center; }
 
-/* history fade opacity is now injected dynamically alongside the container,
-   see the history_block section below, not fixed here */
-
-/* --- pipeline trace (live, per-turn) --- */
-.trace-row { display: flex; flex-wrap: wrap; align-items: stretch; gap: 0.4rem; margin: 0.6rem 0 0.15rem 0; }
+/* --- pipeline trace (live, per-turn) ---
+   Each step is a ledger entry; passed steps get a rotated brass clearance
+   stamp instead of a checkmark icon — the signature element, used only
+   here so it stays meaningful rather than decorative. */
+.trace-row { display: flex; flex-wrap: wrap; align-items: stretch; gap: 0.5rem; margin: 0.7rem 0 0.2rem 0; }
 .trace-step {
-    display: flex; flex-direction: column; justify-content: center; gap: 0.08rem;
-    padding: 0.32rem 0.65rem; border-radius: 6px;
+    position: relative;
+    display: flex; flex-direction: column; justify-content: center; gap: 0.1rem;
+    padding: 0.36rem 0.7rem; border-radius: 3px;
     background: var(--surface);
     border: 1px solid var(--border);
     border-left: 3px solid var(--accent);
-    min-width: 82px;
+    min-width: 88px;
 }
 .trace-step.fail { border-left-color: var(--danger); }
-.trace-step.hit { border-left-color: var(--accent-strong); background: var(--accent-soft); }
-.trace-step.skip { border-left-color: var(--neutral); opacity: 0.65; }
-.trace-step.pending { border-left-color: var(--text-faint); border-left-style: dashed; opacity: 0.6; background: transparent; }
+.trace-step.hit { border-left-color: var(--brass); background: var(--brass-soft); }
+.trace-step.skip { border-left-color: var(--neutral); opacity: 0.6; }
+.trace-step.pending { border-left-color: var(--ink-faint); border-left-style: dashed; opacity: 0.55; background: transparent; }
 .trace-step .trace-label {
-    font-family: var(--font-mono); font-size: 0.6rem; letter-spacing: 0.07em;
-    text-transform: uppercase; color: var(--text-muted);
+    font-family: var(--font-mono); font-size: 0.6rem; letter-spacing: 0.08em;
+    text-transform: uppercase; color: var(--ink-muted);
 }
 .trace-step .trace-value {
-    font-family: var(--font-mono); font-size: 0.76rem; color: var(--text-primary);
-    display: flex; align-items: center; gap: 0.3rem;
+    font-family: var(--font-mono); font-size: 0.78rem; color: var(--ink);
+    display: flex; align-items: center; gap: 0.32rem;
 }
-.trace-glyph { font-size: 0.7rem; line-height: 1; }
+.trace-glyph { font-size: 0.72rem; line-height: 1; }
 .trace-glyph.ok { color: var(--accent-strong); }
 .trace-glyph.fail { color: var(--danger); }
-.trace-glyph.skip { color: var(--text-faint); }
-.trace-arrow { display: flex; align-items: center; color: var(--neutral); font-size: 0.85rem; padding: 0 0.05rem; }
+.trace-glyph.skip { color: var(--ink-faint); }
+.trace-arrow { display: flex; align-items: center; color: var(--neutral); font-size: 0.85rem; padding: 0 0.1rem; }
 .trace-latency {
     margin-left: auto; align-self: center; font-family: var(--font-mono);
-    font-size: 0.7rem; color: var(--text-faint); white-space: nowrap; padding-left: 0.5rem;
+    font-size: 0.7rem; color: var(--ink-faint); white-space: nowrap; padding-left: 0.5rem;
+}
+/* the clearance stamp itself: a rotated brass ring in the corner of any
+   "ok" step, evoking a customs clearance stamp on a manifest page */
+.trace-step.ok::after {
+    content: "CLEAR";
+    position: absolute; top: -8px; right: -10px;
+    width: 30px; height: 30px; border-radius: 50%;
+    border: 1.5px solid var(--brass); color: var(--brass);
+    font-family: var(--font-mono); font-size: 0.36rem; font-weight: 600;
+    letter-spacing: 0.03em; text-align: center; line-height: 30px;
+    transform: rotate(-14deg); background: var(--surface-raised);
+    box-shadow: 0 1px 2px rgba(43, 38, 28, 0.12);
 }
 
-/* --- pipeline diagram (static, explanatory, inside "How this works") ---
-   flex-wrap previously broke the arrow chain: nodes that wrapped to a
-   second row left a dangling arrow at the row break with no connector
-   picking back up on the next row. nowrap + horizontal scroll keeps the
-   chain visually intact at any width instead. */
+/* --- pipeline diagram (static, explanatory, inside "How this works") --- */
 .pipeline-diagram-wrap { overflow-x: auto; padding: 0.2rem 0.1rem 0.5rem 0.1rem; }
 .pipeline-diagram {
     display: flex; flex-wrap: nowrap; align-items: stretch;
@@ -177,46 +217,40 @@ code, .mono { font-family: var(--font-mono); }
 }
 .pipeline-node {
     position: relative; display: flex; flex-direction: column; gap: 0.22rem;
-    padding: 0.65rem 0.75rem 0.6rem 0.75rem; border-radius: 10px; width: 118px; flex-shrink: 0;
+    padding: 0.65rem 0.75rem 0.6rem 0.75rem; border-radius: 3px; width: 118px; flex-shrink: 0;
     background: var(--surface); border: 1px solid var(--border);
     border-top: 3px solid var(--accent);
 }
 .pipeline-node .pipeline-node-badge {
     position: absolute; top: -9px; right: -9px; width: 18px; height: 18px; border-radius: 50%;
-    background: var(--accent); color: #fff; font-family: var(--font-mono); font-size: 0.62rem;
+    background: var(--accent); color: var(--surface-raised); font-family: var(--font-mono); font-size: 0.62rem;
     font-weight: 600; display: flex; align-items: center; justify-content: center;
 }
 .pipeline-node .pipeline-node-title {
     font-family: var(--font-mono); font-size: 0.74rem; font-weight: 600;
-    letter-spacing: 0.03em; color: var(--text-primary);
+    letter-spacing: 0.03em; color: var(--ink);
 }
 .pipeline-node .pipeline-node-desc {
-    font-size: 0.71rem; line-height: 1.4; color: var(--text-muted);
+    font-size: 0.71rem; line-height: 1.4; color: var(--ink-muted);
 }
 .pipeline-arrow {
     display: flex; align-items: center; color: var(--accent); font-size: 1.15rem; flex-shrink: 0;
-    opacity: 0.55;
+    opacity: 0.6;
 }
 
-/* --- sources --- */
+/* --- sources: styled as a cargo/document manifest table, not a card list --- */
 .source-row {
     display: grid; grid-template-columns: 1fr 90px 54px; align-items: center; gap: 0.6rem;
     font-family: var(--font-mono); font-size: 0.78rem;
-    padding: 0.42rem 0; border-bottom: 1px solid var(--border);
+    padding: 0.42rem 0; border-bottom: 1px dashed var(--border);
 }
 .source-row:last-child { border-bottom: none; }
-.source-meta { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-primary); }
-.source-score-wrap { height: 5px; border-radius: 3px; background: var(--border); overflow: hidden; }
+.source-meta { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--ink); }
+.source-score-wrap { height: 5px; border-radius: 2px; background: var(--border); overflow: hidden; }
 .source-score-bar { height: 100%; background: var(--accent); }
 .source-row .score { color: var(--accent-strong); text-align: right; }
 
-/* --- welcome / onboarding: example question buttons ---
-   targeting the key-based wrapper class Streamlit applies to the widget's
-   own container (the same mechanism already used for .st-key-history_block
-   below), not a hand-rolled markdown div — st.markdown('<div>') / st.button
-   / st.markdown('</div>') render as sibling DOM nodes, not nested ones, so
-   a ".example-btn button" selector never actually matched anything, which
-   is why the previous fixed-height attempt had no visible effect. */
+/* --- welcome / onboarding: example question buttons --- */
 [class*="st-key-example_"] button {
     text-align: left !important;
     height: 104px !important;
@@ -230,28 +264,30 @@ code, .mono { font-family: var(--font-mono); }
     line-height: 1.35;
     padding: 0.9rem 1.1rem !important;
 }
-.welcome-caption { color: var(--text-faint); font-size: 0.74rem; margin: 0.3rem 0 1.1rem 0; }
+.welcome-caption { color: var(--ink-faint); font-size: 0.74rem; margin: 0.3rem 0 1.1rem 0; }
 
-/* --- sidebar --- */
+/* --- sidebar: instrument-panel / ship's-log framing --- */
 [data-testid="stSidebar"] { border-right: 1px solid var(--border-accent); background: var(--surface); }
+[data-testid="stSidebar"] .stMarkdown, [data-testid="stSidebar"] p { color: var(--ink); }
 .eyebrow {
-    font-family: var(--font-mono); font-size: 0.68rem; letter-spacing: 0.08em;
-    text-transform: uppercase; color: var(--text-faint); margin: 0.2rem 0 0.5rem 0;
+    font-family: var(--font-mono); font-size: 0.68rem; letter-spacing: 0.1em;
+    text-transform: uppercase; color: var(--ink-faint); margin: 0.2rem 0 0.5rem 0;
+    border-bottom: 1px dashed var(--border); padding-bottom: 0.3rem;
 }
 [data-testid="stSidebar"] [data-testid="stMetricValue"] {
     font-family: var(--font-mono); font-size: 1.2rem; color: var(--accent-strong);
 }
-[data-testid="stSidebar"] [data-testid="stMetricLabel"] { font-size: 0.66rem; color: var(--text-muted); }
+[data-testid="stSidebar"] [data-testid="stMetricLabel"] { font-size: 0.66rem; color: var(--ink-muted); }
 
 .provider-list { display: flex; flex-direction: column; gap: 0.4rem; }
 .provider-row {
-    font-family: var(--font-mono); font-size: 0.78rem; color: var(--text-primary);
+    font-family: var(--font-mono); font-size: 0.78rem; color: var(--ink);
     display: flex; align-items: center; gap: 0.55rem;
     padding: 0.15rem 0;
 }
 .provider-row .provider-name { flex-shrink: 0; }
 .provider-row .provider-role {
-    margin-left: auto; font-size: 0.66rem; color: var(--text-faint);
+    margin-left: auto; font-size: 0.66rem; color: var(--ink-faint);
     text-transform: uppercase; letter-spacing: 0.04em;
 }
 .status-dot-inline { width: 7px; height: 7px; border-radius: 50%; display: inline-block; flex-shrink: 0; }
@@ -260,8 +296,8 @@ code, .mono { font-family: var(--font-mono); }
 
 .error-note {
     font-family: var(--font-mono); font-size: 0.76rem; color: var(--danger);
-    background: var(--danger-soft); border: 1px solid rgba(168, 64, 46, 0.25);
-    border-radius: 6px; padding: 0.5rem 0.7rem; margin-top: 0.5rem;
+    background: var(--danger-soft); border: 1px solid rgba(156, 74, 54, 0.22);
+    border-radius: 3px; padding: 0.5rem 0.7rem; margin-top: 0.5rem;
 }
 </style>
 """
@@ -280,9 +316,14 @@ EXAMPLE_QUESTIONS = [
 ]
 
 PROVIDERS = [
-    {"label": "Groq", "role": "primary", "check": lambda: bool(settings.groq_api_key)},
-    {"label": "NIM", "role": "fallback", "check": lambda: bool(settings.nvidia_nim_api_key)},
-    {"label": "Gemini", "role": "fallback \u00b7 embeddings", "check": lambda: bool(settings.gemini_api_key)},
+    {"label": "Groq", "role": "generation \u00b7 acct A", "check": lambda: bool(settings.groq_api_key)},
+    {
+        "label": "Groq",
+        "role": "generation \u00b7 acct B",
+        "check": lambda: bool(settings.groq_api_key_secondary),
+    },
+    {"label": "NIM", "role": "generation fallback \u00b7 planner \u00b7 NeMoGuard", "check": lambda: bool(settings.nvidia_nim_api_key)},
+    {"label": "Gemini", "role": "embeddings \u00b7 eval judge", "check": lambda: bool(settings.gemini_api_key)},
     {
         "label": "Qdrant",
         "role": "vector store",
@@ -343,11 +384,14 @@ is_generating = bool(prompt)
 st.markdown(
     """
     <div class="app-header">
+        <div class="masthead-eyebrow">Cluster documentation &middot; advisory service</div>
         <div class="title-block">
             <h1>Kubernetes Q&amp;A</h1>
             <div class="tagline">Grounded Kubernetes answers from your own docs, safety-checked,
             relevance-gated, and cached for speed.</div>
         </div>
+        <hr class="masthead-rule" />
+        <hr class="masthead-rule dashed" />
     </div>
     """,
     unsafe_allow_html=True,

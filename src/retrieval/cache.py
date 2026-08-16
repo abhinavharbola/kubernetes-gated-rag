@@ -11,7 +11,12 @@ from src.retrieval.embeddings import embed_for_cache
 
 _exact_cache = diskcache.Cache(".cache/exact")
 
-_PUNCT_TABLE = str.maketrans("", "", string.punctuation)
+# hyphen deliberately excluded: Kubernetes identifiers are full of hyphens
+# ("kube-system", "front-end", "-n" flags) and stripping it merges genuinely
+# different terms into the same normalized string ("kube-system" and
+# "kubesystem" would otherwise collapse to one cache key). Every other
+# punctuation character is still stripped.
+_PUNCT_TABLE = str.maketrans("", "", string.punctuation.replace("-", ""))
 
 
 def normalize_exact(question: str) -> str:

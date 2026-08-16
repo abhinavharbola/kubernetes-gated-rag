@@ -25,6 +25,16 @@ NO_CONTEXT_MESSAGE = (
     "a specific resource, provider, or module."
 )
 
+# shared with eval/run_eval.py's _generate_answer, which needs to score
+# generation quality against the exact prompt production actually uses —
+# duplicating this string there would let the eval harness silently drift
+# out of sync with what live traffic is graded against.
+ANSWER_SYSTEM_PROMPT = (
+    "Answer the Kubernetes question using ONLY the provided context. "
+    "If the context doesn't fully cover the question, say what's missing "
+    "rather than guessing."
+)
+
 
 class GraphState(TypedDict, total=False):
     raw_message: str
@@ -167,12 +177,7 @@ def generate_node(state: GraphState) -> GraphState:
         context = "\n\n---\n\n".join(c["text"] for c in state["reranked"])
         result = generate_main(
             [
-                {
-                    "role": "system",
-                    "content": "Answer the Kubernetes question using ONLY the provided context. "
-                    "If the context doesn't fully cover the question, say what's missing "
-                    "rather than guessing.",
-                },
+                {"role": "system", "content": ANSWER_SYSTEM_PROMPT},
                 {"role": "user", "content": f"Context:\n{context}\n\nQuestion: {state['standalone_question']}"},
             ]
         )

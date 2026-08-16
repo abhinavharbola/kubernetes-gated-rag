@@ -2,7 +2,18 @@ import logfire
 
 from src.config import settings
 
-logfire.configure(token=settings.logfire_token, service_name="kubernetes-agentic-rag")
+# send_to_logfire defaults to None (auto-detect), which raises
+# LogfireConfigError on startup if there's no token AND no cached
+# `logfire auth` credentials — the opposite of "just no-ops without it".
+# 'if-token-present' only attempts to send when settings.logfire_token is
+# actually set, and runs as a local no-op otherwise, matching the README's
+# documented behavior and letting `streamlit run` / `python ingest.py` work
+# with zero Logfire setup.
+logfire.configure(
+    token=settings.logfire_token,
+    send_to_logfire="if-token-present",
+    service_name="kubernetes-agentic-rag",
+)
 
 
 def turn_span(user_message: str):

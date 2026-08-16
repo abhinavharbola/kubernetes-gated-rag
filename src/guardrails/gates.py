@@ -26,21 +26,34 @@ UNSAFE_REFUSAL = (
 # cross-provider chain to fail over through; an error here is caught by
 # topic_gate() below and fails closed like everything else). ---
 #
-# Prompt shape follows NVIDIA's documented format for this model: a system
-# prompt stating the topical policy, an output-restriction instruction
-# appended to it, and the message to classify as the final user turn.
+# This is a narrowly LoRA-tuned classifier (not a general instruction-
+# following model), fine-tuned on a specific system-prompt shape: a
+# persona assignment ("you are a ___ assistant, providing users with
+# ___") plus a bulleted guidelines list, not a meta-instruction telling
+# the model it IS a topic classifier. Deviating from that shape is what
+# caused this gate to misclassify obviously on-topic questions as
+# off-topic — the model was answering "does this fit the assigned
+# persona's domain" against a persona it never got a clean read on.
+# Structure and the output-restriction sentence follow NVIDIA's
+# documented format as closely as sensible; the bulleted guidelines
+# content itself is ours.
 # https://docs.nvidia.com/nim/llama-3-1-nemoguard-8b-topiccontrol/latest/getting-started.html
 TOPIC_POLICY_PROMPT = (
-    "You are the Kubernetes documentation assistant's topic gate. Only allow messages "
-    "that concern Kubernetes objects, manifests, controllers (Deployments, StatefulSets, "
-    "Services, etc.), cluster operations, or container orchestration workflows, plus "
-    "ordinary small talk (greetings, thanks). Do not allow general programming requests "
-    "(writing code, solving an algorithm, explaining a language feature) that are not "
-    "specifically about Kubernetes, even though they are technical, and do not allow any "
-    "other subject unrelated to Kubernetes.\n\n"
-    "If the user's message violates the policy above, answer only with \"off-topic\". "
-    "If it does not violate the policy, answer only with \"on-topic\". Your entire reply "
-    "must be exactly \"on-topic\" or \"off-topic\" and nothing else."
+    "You are a Kubernetes documentation assistant, providing users with factual, "
+    "technical information about Kubernetes and container orchestration. Your role is "
+    "to ensure that you respond only to relevant queries and adhere to the following "
+    "guidelines.\n\n"
+    "Guidelines for the user messages:\n"
+    "- Allow questions about Kubernetes objects, manifests, controllers (Deployments, "
+    "StatefulSets, Services, etc.), cluster operations, and container orchestration "
+    "workflows, including basic definitional questions like \"what is Kubernetes\".\n"
+    "- Allow ordinary small talk such as greetings and thanks.\n"
+    "- Do not allow general programming requests (writing code, solving an algorithm, "
+    "explaining a language feature) that are not specifically about Kubernetes, even "
+    "though they are technical.\n"
+    "- Do not allow any other subject unrelated to Kubernetes.\n\n"
+    'If any of the above guidelines are violated, please respond with "off-topic". '
+    'Otherwise, respond with "on-topic".'
 )
 
 # --- NeMoGuard content-safety (nemoguard_safety_model). Prompt shape and
@@ -117,7 +130,20 @@ def _get_rails() -> LLMRails:
     # also not worth paying at all for code paths that never call the gate.
     global _rails
     if _rails is None:
-        guard_llm = ChatGroq(api_key=settings.groq_api_key, model=settings.groq_planner_model, temperature=0)
+        # request_timeout/max_retries match every other client in this app
+        # (see src/providers/clients.py) — ChatGroq's own defaults are
+        # request_timeout=None (falls back to the SDK's ~60s default) and
+        # max_retries=2, which with backoff can sum to 90+ seconds for a
+        # single slow/erroring call. That mismatch was the actual cause of
+        # multi-minute safety-gate latency: this call was silently exempt
+        # from the tight timeout budget every other provider call honors.
+        guard_llm = ChatGroq(
+            api_key=settings.groq_api_key,
+            model=settings.groq_planner_model,
+            temperature=0,
+            request_timeout=15.0,
+            max_retries=0,
+        )
         config = RailsConfig.from_content(colang_content=COLANG_CONTENT, yaml_content=YAML_CONTENT)
         _rails = LLMRails(config, llm=guard_llm)
         logger.info("guardrails: NeMo Colang rails initialized")
@@ -220,6 +246,7 @@ def check_topic(standalone_question: str) -> bool:
             max_tokens=20,
         )
     raw = response.choices[0].message.content or ""
+    logger.info("topic gate raw response: %r", raw)
     verdict = _parse_binary_verdict(raw, true_word="on-topic", false_word="off-topic")
     if verdict is None:
         logger.warning("topic gate got unparseable verdict %r, failing closed", raw)

@@ -56,7 +56,7 @@ PIPELINE_ERROR_MESSAGE = (
 
 CUSTOM_CSS = """
 <style>
-@import url('https://fonts.googleapis.com/css2?family=Newsreader:ital,opsz,wght@0,6..72,400;0,6..72,500;0,6..72,600;1,6..72,500&family=Inter:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap');
 
 /* --- Design system ---
    This app is a series of clearance gates (safety, topic, ingestion), so
@@ -83,7 +83,6 @@ CUSTOM_CSS = """
     --danger: #9C4A36;
     --danger-soft: rgba(156, 74, 54, 0.11);
     --neutral: #8C8370;
-    --font-display: "Newsreader", Georgia, serif;
     --font-sans: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
     --font-mono: "IBM Plex Mono", "Fira Code", ui-monospace, monospace;
 }
@@ -130,8 +129,8 @@ code, .mono { font-family: var(--font-mono); }
 /* --- masthead ---
    Ledger/manifest framing: a small eyebrow label above the title, thin
    double rule below it (top rule solid, bottom rule dashed, like a form's
-   cut line), title set in Newsreader italic for a document-of-record feel
-   rather than a marketing headline. */
+   cut line). Title is a clean sans-serif, not italic — a professional
+   documentation-tool register rather than an editorial one. */
 .app-header {
     display: flex; flex-direction: column; align-items: center; text-align: center;
     padding: 0.2rem 0 0.85rem 0; margin-bottom: 0.3rem;
@@ -141,19 +140,25 @@ code, .mono { font-family: var(--font-mono); }
     text-transform: uppercase; color: var(--ink-faint); margin-bottom: 0.55rem;
 }
 .app-header .title-block h1 {
-    margin: 0; font-family: var(--font-display); font-style: italic; font-size: 2.6rem;
-    font-weight: 500; letter-spacing: -0.005em; color: var(--ink); line-height: 1.1;
+    margin: 0; font-family: var(--font-sans); font-style: normal; font-size: 2.35rem;
+    font-weight: 700; letter-spacing: -0.02em; color: var(--ink); line-height: 1.15;
 }
 .app-header .title-block .tagline {
-    color: var(--ink-muted); font-size: 0.98rem; margin: 0.65rem auto 0 auto;
-    max-width: 640px; line-height: 1.5;
+    color: var(--ink-muted); font-size: 0.96rem; margin: 0.65rem auto 0 auto;
+    max-width: 900px; line-height: 1.5; white-space: nowrap;
 }
 .app-header .masthead-rule {
-    width: 100%; max-width: 560px; margin-top: 1.1rem;
+    width: 100%; max-width: 820px; margin-top: 1.1rem;
     border: none; border-top: 1px solid var(--ink); opacity: 0.55;
 }
 .app-header .masthead-rule.dashed {
     margin-top: 0.28rem; border-top: 1px dashed var(--border-accent);
+}
+@media (max-width: 900px) {
+    /* below this width the sidebar+content area can't fit the tagline on
+       one line without horizontal overflow — fall back to normal wrapping
+       rather than forcing a scrollbar. */
+    .app-header .title-block .tagline { white-space: normal; }
 }
 
 /* --- welcome / onboarding --- */
@@ -279,16 +284,16 @@ code, .mono { font-family: var(--font-mono); }
 }
 [data-testid="stSidebar"] [data-testid="stMetricLabel"] { font-size: 0.66rem; color: var(--ink-muted); }
 
-.provider-list { display: flex; flex-direction: column; gap: 0.4rem; }
-.provider-row {
+.provider-list { display: flex; flex-direction: column; gap: 0.55rem; }
+.provider-row { padding: 0.1rem 0; }
+.provider-row .provider-name-line {
     font-family: var(--font-mono); font-size: 0.78rem; color: var(--ink);
     display: flex; align-items: center; gap: 0.55rem;
-    padding: 0.15rem 0;
 }
-.provider-row .provider-name { flex-shrink: 0; }
 .provider-row .provider-role {
-    margin-left: auto; font-size: 0.66rem; color: var(--ink-faint);
-    text-transform: uppercase; letter-spacing: 0.04em;
+    font-family: var(--font-mono); font-size: 0.64rem; color: var(--ink-faint);
+    text-transform: uppercase; letter-spacing: 0.03em; line-height: 1.4;
+    margin-top: 0.15rem; padding-left: 1.15rem;
 }
 .status-dot-inline { width: 7px; height: 7px; border-radius: 50%; display: inline-block; flex-shrink: 0; }
 .status-dot-inline.up { background: var(--accent-strong); box-shadow: 0 0 4px var(--accent-soft); }
@@ -416,9 +421,11 @@ with st.sidebar:
     st.markdown('<div class="eyebrow" style="margin-top: 1rem;">Providers</div>', unsafe_allow_html=True)
     provider_rows = "".join(
         f'<div class="provider-row">'
+        f'<div class="provider-name-line">'
         f'<span class="status-dot-inline {"up" if provider["check"]() else "down"}"></span>'
         f'<span class="provider-name">{provider["label"]}</span>'
-        f'<span class="provider-role">{provider["role"]}</span>'
+        f"</div>"
+        f'<div class="provider-role">{provider["role"]}</div>'
         f"</div>"
         for provider in PROVIDERS
     )
@@ -523,7 +530,12 @@ def render_trace(details: dict) -> None:
 
 # ---------- conversation ----------
 
-if not st.session_state.history:
+# checked against `prompt` too, not just history: history is only empty
+# BEFORE this run's user message gets appended further down, so on the
+# very first-ever submission this condition would otherwise still be true
+# during the same run that's processing that submission — showing the
+# welcome block and the "running the pipeline" spinner at once.
+if not st.session_state.history and not prompt:
     st.markdown('<div class="welcome-block">', unsafe_allow_html=True)
     with st.expander("How this works", expanded=False):
         diagram_html = ""

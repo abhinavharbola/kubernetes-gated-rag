@@ -1,8 +1,8 @@
 # Kubernetes Gated RAG
 
-A production-shaped RAG system for Kubernetes Q&A, built around defense in depth: pre-processing safety and topic gates, hard-gated retrieval, fail-closed behavior, provider failover, two-layer caching, and end-to-end tracing. It runs on a no-GPU, 16 GB laptop by offloading model inference to hosted APIs, with local compute limited to parsing, chunking, and CPU/ONNX reranking.
+A production-oriented RAG system for Kubernetes Q&A, designed around defense in depth: safety and topic gates before processing, hard relevance thresholds for retrieval, fail-closed guardrails, provider failover, two-layer caching, and end-to-end tracing. It runs on a no-GPU, 16 GB laptop by offloading model inference to hosted APIs, keeping local compute to parsing, chunking, and CPU/ONNX reranking.
 
-Not a scale project, but a demonstration of the engineering practices that distinguish robust RAG from an “LLM + vector search” demo: intent-preserving caching, structure-aware Kubernetes chunking, hard relevance thresholds, redundant inference providers, and full request tracing.
+This is not a scale-focused project; it is a practical demonstration of what separates a robust RAG pipeline from an “LLM + vector search” prototype: intent-aware caching, structure-aware Kubernetes chunking, threshold-gated reranking, redundant inference providers, and complete request tracing.
 
 ## Preview
 
@@ -123,14 +123,14 @@ kubernetes-gated-rag/
 │   │   └── filters.py                    # ingestion-time document relevance classifier (fails open)
 │   │
 │   └── retrieval/                        # online: turns a question into grounded context
+│       ├── cache.py                      # exact-match and semantic caching layers
 │       ├── embeddings.py                 # Gemini embedding generation, batched, rate-limit-aware retry
 │       ├── search.py                     # Qdrant dense vector retrieval
-│       ├── rerank.py                     # FlashRank reranking + hard relevance threshold, lazy-loaded
-│       └── cache.py                      # exact-match and semantic caching layers
+│       └── rerank.py                     # FlashRank reranking + hard relevance threshold, lazy-loading
 │
 ├── data/
-│   ├── true_data/                        # the real corpus, bring your own
-│   └── noisy_data/                       # off-topic content the ingestion gate should reject
+│   ├── noisy_data/                       # off-topic content the ingestion gate should reject
+│   └── true_data/                        # the real corpus, bring your own
 │
 ├── eval/
 │   ├── eval_set.json                     # starter evaluation dataset

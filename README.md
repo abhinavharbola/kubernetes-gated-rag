@@ -1,8 +1,8 @@
 # Kubernetes Gated RAG
 
-A retrieval-augmented Q&A system for Kubernetes questions, gated at every stage rather than trusting any single check: a safety gate and topic gate before a message is even processed, a hard relevance threshold that drops weak retrieval matches instead of just reordering them, and fail-closed behavior at every one of those gates except one documented exception (see Guardrails below), a classifier error blocks a request rather than letting it through. Built to run entirely on a no-GPU, 16GB laptop by offloading every model-weight operation to free-tier hosted APIs; local compute is limited to parsing, chunking, and CPU/ONNX reranking.
+A production-shaped RAG system for Kubernetes Q&A, built around defense in depth: pre-processing safety and topic gates, hard-gated retrieval, fail-closed behavior, provider failover, two-layer caching, and end-to-end tracing. It runs on a no-GPU, 16 GB laptop by offloading model inference to hosted APIs, with local compute limited to parsing, chunking, and CPU/ONNX reranking.
 
-Not a scale project, a demonstration of the pieces that separate a "wrap an LLM around a vector search" demo from something closer to production shape: two-layer caching with intent preservation, structure-aware chunking that respects Kubernetes manifest boundaries, a hard-gated reranker instead of similarity-only retrieval, redundant provider failover, and full request tracing.
+Not a scale project, but a demonstration of the engineering practices that distinguish robust RAG from an “LLM + vector search” demo: intent-preserving caching, structure-aware Kubernetes chunking, hard relevance thresholds, redundant inference providers, and full request tracing.
 
 ## Preview
 
@@ -16,7 +16,7 @@ Not a scale project, a demonstration of the pieces that separate a "wrap an LLM 
 
 ## What this is
 
-Given a message, the system:
+Given a message/question, the system:
 
 1. **Guards first:** Runs independent safety and topic gates before any downstream processing; both fail closed on classifier errors.
 2. **Cache lookup:** Checks exact-match, then canonicalized semantic-match cache, returning immediately on a hit.
@@ -32,21 +32,21 @@ Every node and provider call is traced with **Logfire**. The system is exposed t
 
 ```mermaid
 flowchart TD
-    Start([User turn]) --> Safety[Safety Gate\nColang + NeMoGuard content-safety]
+    Start([User turn]) --> Safety["Safety Gate<br/>Colang + NeMoGuard content-safety"]
     Safety -->|blocked| RefusalUnsafe([Refusal: unsafe / jailbreak])
-    Safety -->|allowed| Rewrite[Rewrite with History\nplanner chain]
-    Rewrite --> Topic[Topic Gate\nNeMoGuard topic-control]
+    Safety -->|allowed| Rewrite["Rewrite with History<br/>planner chain"]
+    Rewrite --> Topic["Topic Gate<br/>NeMoGuard topic-control"]
     Topic -->|blocked| RefusalOffTopic([Refusal: off-topic])
-    Topic -->|allowed| ExactCache{Exact cache hit?\nSQLite}
+    Topic -->|allowed| ExactCache{"Exact cache hit?<br/>SQLite"}
     ExactCache -->|hit| ReturnExact([Return cached answer])
-    ExactCache -->|miss| Canonicalize[Canonicalize Question\nplanner chain]
-    Canonicalize --> SemanticCache{Semantic cache hit?\nQdrant, cosine at least 0.95}
+    ExactCache -->|miss| Canonicalize["Canonicalize Question<br/>planner chain"]
+    Canonicalize --> SemanticCache{"Semantic cache hit?<br/>Qdrant, cosine at least 0.95"}
     SemanticCache -->|hit| ReturnSemantic([Return cached answer])
-    SemanticCache -->|miss| Retrieve[Retrieve top 20\nQdrant dense search]
-    Retrieve --> Rerank[Rerank + hard threshold gate\nFlashRank cross-encoder]
+    SemanticCache -->|miss| Retrieve["Retrieve top 20<br/>Qdrant dense search"]
+    Retrieve --> Rerank["Rerank + hard threshold gate<br/>FlashRank cross-encoder"]
     Rerank -->|zero survivors| NoContext([No grounded documentation, cached])
-    Rerank -->|survivors| Generate[Generate\nGroq -> Groq(2nd acct) -> NIM chain]
-    Generate --> WriteCache[Write exact + semantic cache]
+    Rerank -->|survivors| Generate["Generate<br/>Groq → Groq (2nd acct) → NIM chain"]
+    Generate --> WriteCache([Write exact + semantic cache])
     WriteCache --> ReturnAnswer([Return answer])
 ```
 

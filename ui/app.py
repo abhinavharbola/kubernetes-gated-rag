@@ -56,34 +56,36 @@ PIPELINE_ERROR_MESSAGE = (
 
 CUSTOM_CSS = """
 <style>
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&family=IBM+Plex+Mono:wght@400;500;600&display=swap');
 
 /* --- Design system ---
    This app is a series of clearance gates (safety, topic, ingestion), so
    the signature motif is a customs/ledger "clearance stamp" rather than a
-   generic pill badge — see .trace-stamp below. Palette is a warm ledger
-   cream with a desaturated slate-blue accent (a nod to Kubernetes' own
-   brand blue, deliberately not the terracotta-on-cream combo that reads
-   as an obvious AI default) and a muted brass reserved for the stamp
-   itself, the one place this page spends its visual boldness. */
+   generic pill badge — see .trace-stamp below. Palette is a rich warm
+   ledger cream with a deep navy-indigo accent (a nod to Kubernetes' own
+   brand blue, pushed darker/more saturated than a mid-tone slate for a
+   more premium, higher-contrast feel, and deliberately not the
+   terracotta-on-cream combo that reads as an obvious AI default) and a
+   muted brass reserved for the stamp itself, the one place this page
+   spends its visual boldness. */
 :root {
-    --bg: #EFE7D6;
-    --surface: #F8F2E5;
+    --bg: #F1E9D8;
+    --surface: #FAF4E6;
     --surface-raised: #FFFDF7;
-    --border: rgba(43, 38, 28, 0.14);
-    --border-accent: rgba(60, 89, 112, 0.32);
-    --ink: #2B2620;
-    --ink-muted: #6E6656;
-    --ink-faint: #A79C86;
-    --accent: #3C5970;
-    --accent-strong: #2A4356;
-    --accent-soft: rgba(60, 89, 112, 0.10);
+    --border: rgba(40, 34, 24, 0.14);
+    --border-accent: rgba(31, 58, 92, 0.32);
+    --ink: #29231A;
+    --ink-muted: #6B5E4C;
+    --ink-faint: #A69577;
+    --accent: #1F3A5C;
+    --accent-strong: #16283F;
+    --accent-soft: rgba(31, 58, 92, 0.10);
     --brass: #93712F;
     --brass-soft: rgba(147, 113, 47, 0.14);
     --danger: #9C4A36;
     --danger-soft: rgba(156, 74, 54, 0.11);
     --neutral: #8C8370;
-    --font-sans: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    --font-sans: "Manrope", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
     --font-mono: "IBM Plex Mono", "Fira Code", ui-monospace, monospace;
 }
 
@@ -120,10 +122,14 @@ code, .mono { font-family: var(--font-mono); }
 
 /* the "usable width" of centered layout is capped by Streamlit's own
    block-container max-width (~730px); widen it so the header, diagram, and
-   example grid all have room to breathe instead of wrapping constantly. */
+   example grid all have room to breathe instead of wrapping constantly.
+   padding-top must clear stHeader's own height (a fixed bar painted over
+   the top of the scrollable content, same bg color as the page above) —
+   2rem wasn't enough, so the masthead eyebrow was visually clipped by the
+   header bar sitting on top of it as content scrolled underneath. */
 .block-container, [data-testid="stMainBlockContainer"] {
     max-width: 980px !important;
-    padding-top: 2rem !important;
+    padding-top: 4.5rem !important;
 }
 
 /* --- masthead ---
@@ -133,7 +139,7 @@ code, .mono { font-family: var(--font-mono); }
    documentation-tool register rather than an editorial one. */
 .app-header {
     display: flex; flex-direction: column; align-items: center; text-align: center;
-    padding: 0.2rem 0 0.85rem 0; margin-bottom: 0.3rem;
+    padding: 0.2rem 0 0.3rem 0; margin-bottom: 0;
 }
 .app-header .masthead-eyebrow {
     font-family: var(--font-mono); font-size: 0.68rem; letter-spacing: 0.16em;
@@ -162,8 +168,7 @@ code, .mono { font-family: var(--font-mono); }
 }
 
 /* --- welcome / onboarding --- */
-.welcome-block { max-width: 900px; margin: 0.9rem auto 1.5rem auto; text-align: center; }
-.welcome-block .trace-row { justify-content: center; }
+.st-key-welcome_block { max-width: 900px; margin: 0 auto; text-align: center; }
 
 /* --- pipeline trace (live, per-turn) ---
    Each step is a ledger entry; passed steps get a rotated brass clearance
@@ -382,8 +387,6 @@ if not prompt and st.session_state.pending_prompt:
     prompt = st.session_state.pending_prompt
     st.session_state.pending_prompt = None
 
-is_generating = bool(prompt)
-
 # ---------- header ----------
 
 st.markdown(
@@ -536,25 +539,24 @@ def render_trace(details: dict) -> None:
 # during the same run that's processing that submission — showing the
 # welcome block and the "running the pipeline" spinner at once.
 if not st.session_state.history and not prompt:
-    st.markdown('<div class="welcome-block">', unsafe_allow_html=True)
-    with st.expander("How this works", expanded=False):
-        diagram_html = ""
-        for i, stage in enumerate(PIPELINE_STAGES):
-            diagram_html += (
-                f'<div class="pipeline-node">'
-                f'<span class="pipeline-node-badge">{i + 1}</span>'
-                f'<span class="pipeline-node-title">{stage["label"]}</span>'
-                f'<span class="pipeline-node-desc">{stage["desc"]}</span>'
-                f"</div>"
+    with st.container(key="welcome_block"):
+        with st.expander("How this works", expanded=False):
+            diagram_html = ""
+            for i, stage in enumerate(PIPELINE_STAGES):
+                diagram_html += (
+                    f'<div class="pipeline-node">'
+                    f'<span class="pipeline-node-badge">{i + 1}</span>'
+                    f'<span class="pipeline-node-title">{stage["label"]}</span>'
+                    f'<span class="pipeline-node-desc">{stage["desc"]}</span>'
+                    f"</div>"
+                )
+                if i < len(PIPELINE_STAGES) - 1:
+                    diagram_html += '<div class="pipeline-arrow">&#8594;</div>'
+            st.markdown(
+                f'<div class="pipeline-diagram-wrap"><div class="pipeline-diagram">{diagram_html}</div></div>',
+                unsafe_allow_html=True,
             )
-            if i < len(PIPELINE_STAGES) - 1:
-                diagram_html += '<div class="pipeline-arrow">&#8594;</div>'
-        st.markdown(
-            f'<div class="pipeline-diagram-wrap"><div class="pipeline-diagram">{diagram_html}</div></div>',
-            unsafe_allow_html=True,
-        )
-    st.markdown('<p class="welcome-caption">Try one of these, or ask your own below.</p>', unsafe_allow_html=True)
-    st.markdown("</div>", unsafe_allow_html=True)
+        st.markdown('<p class="welcome-caption">Try one of these, or ask your own below.</p>', unsafe_allow_html=True)
 
     cols = st.columns(2)
     for i, question in enumerate(EXAMPLE_QUESTIONS):
@@ -562,23 +564,6 @@ if not st.session_state.history and not prompt:
             if st.button(question, key=f"example_{i}", use_container_width=True):
                 st.session_state.pending_prompt = question
 
-# past turns fade out while a new one is being generated, so attention goes
-# to the active exchange below rather than the settled conversation above it.
-# The container's own key MUST stay constant across runs — switching keys
-# based on state makes Streamlit treat it as a different element each time,
-# which breaks reconciliation mid-run and was leaving stale content behind
-# during generation. Only the injected CSS values change, not the container.
-st.markdown(
-    f"""<style>
-    .st-key-history_block {{
-        opacity: {"0.38" if is_generating else "1"};
-        filter: saturate({"0.7" if is_generating else "1"});
-        transition: opacity 0.3s ease;
-        pointer-events: {"none" if is_generating else "auto"};
-    }}
-    </style>""",
-    unsafe_allow_html=True,
-)
 history_container = st.container(key="history_block")
 with history_container:
     for turn in st.session_state.history:

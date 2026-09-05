@@ -92,9 +92,12 @@ def split_by_manifest_blocks(section_text: str) -> list[dict]:
             blocks.append({"text": block_text, "kind": kind, "name": name})
         cursor = end
 
-    if cursor < len(section_text):
-        leftover = _strip_separator_lines(section_text[cursor:])
-        blocks.extend(_fallback_window(leftover))
+    # no trailing-leftover step after this loop: `end` for the last match is
+    # always len(section_text) (see the conditional above), so cursor always
+    # equals len(section_text) once the loop finishes — there is never
+    # content after the last manifest block left to sweep up separately. An
+    # earlier version had a dead `if cursor < len(section_text)` branch here
+    # that could never run; removed rather than left as misleading dead code.
 
     return blocks
 

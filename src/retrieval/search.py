@@ -9,8 +9,14 @@ def retrieve(question: str, manifest_kind: str | None = None, top_k: int | None 
     vector = embed_query(question)
     query_filter = None
     if manifest_kind:
+        # ingest.py stores this nested under payload["metadata"]["manifest_kind"]
+        # (see chunk_document in src/ingestion/chunking.py), not as a
+        # top-level field, so the filter key needs the "metadata." prefix,
+        # Qdrant's dot notation for a nested JSON field. Filtering on a bare
+        # "manifest_kind" key silently matched nothing, since no point has
+        # a top-level field by that name.
         query_filter = Filter(
-            must=[FieldCondition(key="manifest_kind", match=MatchValue(value=manifest_kind))]
+            must=[FieldCondition(key="metadata.manifest_kind", match=MatchValue(value=manifest_kind))]
         )
 
     results = qdrant_client.query_points(

@@ -10,8 +10,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 # NeMo Guardrails and httpx both log at INFO by default, including the full
 # Colang phase-by-phase prompt/response trace for every gate check. That's
-# not a separate or leaked conversation — it's this app's own safety_gate()
-# doing its job — but it's not meant for a normal terminal, only useful when
+# not a separate or leaked conversation, it's this app's own safety_gate()
+# doing its job, but it's not meant for a normal terminal, only useful when
 # actually debugging the gate itself. Quiet by default; flip back to INFO
 # locally if you need to see what a gate call is actually doing.
 logging.getLogger("nemoguardrails").setLevel(logging.WARNING)
@@ -35,7 +35,7 @@ st.set_page_config(page_title="Kubernetes RAG", page_icon="◧", layout="centere
 def _warm_up_models() -> bool:
     # NeMo Guardrails' Colang flow matcher and FlashRank's cross-encoder are
     # both lazily built on first use by default (see their preload()
-    # docstrings in src/guardrails/gates.py and src/retrieval/rerank.py) —
+    # docstrings in src/guardrails/gates.py and src/retrieval/rerank.py),
     # deliberately so, since a process that never runs a real turn (tests,
     # ingest.py) shouldn't pay for either. This app always needs both, so
     # force them to build now, during page load with its own spinner,
@@ -56,45 +56,46 @@ PIPELINE_ERROR_MESSAGE = (
 
 CUSTOM_CSS = """
 <style>
-@import url('https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&family=IBM+Plex+Mono:wght@400;500;600&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500;600&display=swap');
 
 /* --- Design system ---
-   This app is a series of clearance gates (safety, topic, ingestion), so
-   the signature motif is a customs/ledger "clearance stamp" rather than a
-   generic pill badge — see .trace-stamp below. Palette is a rich warm
-   ledger cream with a deep navy-indigo accent (a nod to Kubernetes' own
-   brand blue, pushed darker/more saturated than a mid-tone slate for a
-   more premium, higher-contrast feel, and deliberately not the
-   terracotta-on-cream combo that reads as an obvious AI default) and a
-   muted brass reserved for the stamp itself, the one place this page
-   spends its visual boldness. */
+   This is a Kubernetes Q&A tool built around admission-style gating: every
+   question passes through checks before it's allowed to reach generation,
+   the same way the API server runs admission webhooks on a request before
+   it's persisted. The trace panel below is deliberately shaped like
+   `kubectl describe`'s Conditions table (TYPE / STATUS / MESSAGE, True or
+   False) rather than an invented metaphor, since that's the vocabulary
+   this tool's own audience already reads every day. Dark control-plane
+   console palette; monospace is reserved for real data (paths, scores,
+   provider names, latency), not for decorative labels. */
 :root {
-    --bg: #F1E9D8;
-    --surface: #FAF4E6;
-    --surface-raised: #FFFDF7;
-    --border: rgba(40, 34, 24, 0.14);
-    --border-accent: rgba(31, 58, 92, 0.32);
-    --ink: #29231A;
-    --ink-muted: #6B5E4C;
-    --ink-faint: #A69577;
-    --accent: #1F3A5C;
-    --accent-strong: #16283F;
-    --accent-soft: rgba(31, 58, 92, 0.10);
-    --brass: #93712F;
-    --brass-soft: rgba(147, 113, 47, 0.14);
-    --danger: #9C4A36;
-    --danger-soft: rgba(156, 74, 54, 0.11);
-    --neutral: #8C8370;
-    --font-sans: "Manrope", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    --bg: #0E1013;
+    --panel: #161920;
+    --panel-raised: #1C2028;
+    --border: rgba(255, 255, 255, 0.08);
+    --border-strong: rgba(255, 255, 255, 0.18);
+    --text: #E8EAED;
+    --text-muted: #9BA2AD;
+    --text-faint: #5C636E;
+    --blue: #5B8DEF;
+    --blue-soft: rgba(91, 141, 239, 0.12);
+    --green: #4FB477;
+    --green-soft: rgba(79, 180, 119, 0.13);
+    --amber: #D9A44A;
+    --amber-soft: rgba(217, 164, 74, 0.13);
+    --red: #E0605A;
+    --red-soft: rgba(224, 96, 90, 0.13);
+    --font-display: "Space Grotesk", "Segoe UI", sans-serif;
+    --font-sans: "IBM Plex Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
     --font-mono: "IBM Plex Mono", "Fira Code", ui-monospace, monospace;
 }
 
-.stApp { font-family: var(--font-sans); background: var(--bg); color: var(--ink); }
+.stApp { font-family: var(--font-sans); background: var(--bg); color: var(--text); }
 .stApp [data-testid="stChatMessage"] { gap: 0.6rem; }
 code, .mono { font-family: var(--font-mono); }
 
 /* Streamlit paints its header bar and the bottom chat-input bar from
-   separate containers that don't inherit .stApp's background — theme.toml
+   separate containers that don't inherit .stApp's background, theme.toml
    now matches this palette too (belt and suspenders: the toml drives
    Streamlit's own native widget colors, this covers anything it doesn't). */
 [data-testid="stHeader"],
@@ -103,167 +104,130 @@ code, .mono { font-family: var(--font-mono); }
     background: var(--bg) !important;
 }
 [data-testid="stChatInput"] {
-    background: var(--surface-raised) !important;
-    border: 1px solid var(--border-accent) !important;
-    border-radius: 4px !important;
+    background: var(--panel-raised) !important;
+    border: 1px solid var(--border-strong) !important;
+    border-radius: 6px !important;
 }
-[data-testid="stChatInput"] textarea { color: var(--ink) !important; }
+[data-testid="stChatInput"] textarea { color: var(--text) !important; }
 .stButton button {
-    border-radius: 3px !important;
-    border: 1px solid var(--border-accent) !important;
-    color: var(--ink) !important;
-    background: var(--surface-raised) !important;
+    border-radius: 5px !important;
+    border: 1px solid var(--border-strong) !important;
+    color: var(--text) !important;
+    background: var(--panel-raised) !important;
 }
 .stButton button:hover {
-    border-color: var(--accent) !important;
-    color: var(--accent-strong) !important;
+    border-color: var(--blue) !important;
+    color: var(--blue) !important;
 }
-.stMarkdown, .stApp p, .stApp li { color: var(--ink); }
+.stMarkdown, .stApp p, .stApp li { color: var(--text); }
 
 /* the "usable width" of centered layout is capped by Streamlit's own
    block-container max-width (~730px); widen it so the header, diagram, and
    example grid all have room to breathe instead of wrapping constantly.
    padding-top must clear stHeader's own height (a fixed bar painted over
-   the top of the scrollable content, same bg color as the page above) —
-   2rem wasn't enough, so the masthead eyebrow was visually clipped by the
-   header bar sitting on top of it as content scrolled underneath. */
+   the top of the scrollable content, same bg color as the page above). */
 .block-container, [data-testid="stMainBlockContainer"] {
     max-width: 980px !important;
-    padding-top: 4.5rem !important;
+    padding-top: 3.5rem !important;
 }
 
 /* --- masthead ---
-   Ledger/manifest framing: a small eyebrow label above the title, thin
-   double rule below it (top rule solid, bottom rule dashed, like a form's
-   cut line). Title is a clean sans-serif, not italic — a professional
-   documentation-tool register rather than an editorial one. */
+   Left-aligned, one hairline rule, no eyebrow chrome above it: the title
+   and one line under it already say what this is, so nothing needed to
+   sit above it and announce that. */
 .app-header {
-    display: flex; flex-direction: column; align-items: center; text-align: center;
-    padding: 0.2rem 0 0.3rem 0; margin-bottom: 0;
-}
-.app-header .masthead-eyebrow {
-    font-family: var(--font-mono); font-size: 0.68rem; letter-spacing: 0.16em;
-    text-transform: uppercase; color: var(--ink-faint); margin-bottom: 0.55rem;
+    padding: 0 0 1.1rem 0; margin-bottom: 1.4rem;
+    border-bottom: 1px solid var(--border);
 }
 .app-header .title-block h1 {
-    margin: 0; font-family: var(--font-sans); font-style: normal; font-size: 2.35rem;
-    font-weight: 700; letter-spacing: -0.02em; color: var(--ink); line-height: 1.15;
+    margin: 0; font-family: var(--font-display); font-size: 2.15rem;
+    font-weight: 700; letter-spacing: -0.01em; color: var(--text); line-height: 1.2;
 }
 .app-header .title-block .tagline {
-    color: var(--ink-muted); font-size: 0.96rem; margin: 0.65rem auto 0 auto;
-    max-width: 900px; line-height: 1.5; white-space: nowrap;
-}
-.app-header .masthead-rule {
-    width: 100%; max-width: 820px; margin-top: 1.1rem;
-    border: none; border-top: 1px solid var(--ink); opacity: 0.55;
-}
-.app-header .masthead-rule.dashed {
-    margin-top: 0.28rem; border-top: 1px dashed var(--border-accent);
-}
-@media (max-width: 900px) {
-    /* below this width the sidebar+content area can't fit the tagline on
-       one line without horizontal overflow — fall back to normal wrapping
-       rather than forcing a scrollbar. */
-    .app-header .title-block .tagline { white-space: normal; }
+    color: var(--text-muted); font-size: 0.98rem; margin: 0.6rem 0 0 0;
+    max-width: 640px; line-height: 1.55;
 }
 
 /* --- welcome / onboarding --- */
-.st-key-welcome_block { max-width: 900px; margin: 0 auto; text-align: center; }
+.st-key-welcome_block { max-width: 900px; margin: 0 auto 0.4rem auto; }
 
 /* --- pipeline trace (live, per-turn) ---
-   Each step is a ledger entry; passed steps get a rotated brass clearance
-   stamp instead of a checkmark icon — the signature element, used only
-   here so it stays meaningful rather than decorative. */
-.trace-row { display: flex; flex-wrap: wrap; align-items: stretch; gap: 0.5rem; margin: 0.7rem 0 0.2rem 0; }
-.trace-step {
-    position: relative;
-    display: flex; flex-direction: column; justify-content: center; gap: 0.1rem;
-    padding: 0.36rem 0.7rem; border-radius: 3px;
-    background: var(--surface);
-    border: 1px solid var(--border);
-    border-left: 3px solid var(--accent);
-    min-width: 88px;
+   Shaped like `kubectl describe`'s Conditions table: TYPE / STATUS /
+   MESSAGE, True or False, because that's the exact table this app's own
+   audience already reads every day when debugging a cluster. */
+.cond-table {
+    margin: 0.8rem 0 0.3rem 0; border: 1px solid var(--border);
+    border-radius: 6px; overflow: hidden; background: var(--panel);
 }
-.trace-step.fail { border-left-color: var(--danger); }
-.trace-step.hit { border-left-color: var(--brass); background: var(--brass-soft); }
-.trace-step.skip { border-left-color: var(--neutral); opacity: 0.6; }
-.trace-step.pending { border-left-color: var(--ink-faint); border-left-style: dashed; opacity: 0.55; background: transparent; }
-.trace-step .trace-label {
-    font-family: var(--font-mono); font-size: 0.6rem; letter-spacing: 0.08em;
-    text-transform: uppercase; color: var(--ink-muted);
+.cond-header, .cond-row {
+    display: grid; grid-template-columns: 100px 70px 1fr;
+    gap: 0.6rem; padding: 0.42rem 0.75rem; align-items: center;
 }
-.trace-step .trace-value {
-    font-family: var(--font-mono); font-size: 0.78rem; color: var(--ink);
-    display: flex; align-items: center; gap: 0.32rem;
+.cond-header {
+    font-family: var(--font-mono); font-size: 0.66rem; letter-spacing: 0.04em;
+    color: var(--text-faint); border-bottom: 1px solid var(--border);
+    background: var(--panel-raised);
 }
-.trace-glyph { font-size: 0.72rem; line-height: 1; }
-.trace-glyph.ok { color: var(--accent-strong); }
-.trace-glyph.fail { color: var(--danger); }
-.trace-glyph.skip { color: var(--ink-faint); }
-.trace-arrow { display: flex; align-items: center; color: var(--neutral); font-size: 0.85rem; padding: 0 0.1rem; }
-.trace-latency {
-    margin-left: auto; align-self: center; font-family: var(--font-mono);
-    font-size: 0.7rem; color: var(--ink-faint); white-space: nowrap; padding-left: 0.5rem;
-}
-/* the clearance stamp itself: a rotated brass ring in the corner of any
-   "ok" step, evoking a customs clearance stamp on a manifest page */
-.trace-step.ok::after {
-    content: "CLEAR";
-    position: absolute; top: -8px; right: -10px;
-    width: 30px; height: 30px; border-radius: 50%;
-    border: 1.5px solid var(--brass); color: var(--brass);
-    font-family: var(--font-mono); font-size: 0.36rem; font-weight: 600;
-    letter-spacing: 0.03em; text-align: center; line-height: 30px;
-    transform: rotate(-14deg); background: var(--surface-raised);
-    box-shadow: 0 1px 2px rgba(43, 38, 28, 0.12);
+.cond-row { border-bottom: 1px solid var(--border); font-size: 0.83rem; }
+.cond-row:last-child { border-bottom: none; }
+.cond-type { color: var(--text); font-weight: 500; }
+.cond-status { font-family: var(--font-mono); font-size: 0.78rem; font-weight: 600; }
+.cond-status.true { color: var(--green); }
+.cond-status.false { color: var(--red); }
+.cond-status.unknown { color: var(--amber); }
+.cond-message { font-family: var(--font-mono); font-size: 0.78rem; color: var(--text-muted); }
+.cond-footer {
+    display: flex; justify-content: flex-end; padding: 0.35rem 0.75rem;
+    font-family: var(--font-mono); font-size: 0.72rem; color: var(--text-faint);
+    background: var(--panel-raised); border-top: 1px solid var(--border);
 }
 
-/* --- pipeline diagram (static, explanatory, inside "How this works") --- */
+/* --- pipeline diagram (static, explanatory, inside "How this works") ---
+   This one genuinely is a numbered sequence, a request moves through these
+   stages in order, so numbering here documents structure rather than
+   decorating it. */
 .pipeline-diagram-wrap { overflow-x: auto; padding: 0.2rem 0.1rem 0.5rem 0.1rem; }
 .pipeline-diagram {
     display: flex; flex-wrap: nowrap; align-items: stretch;
-    gap: 0.45rem; margin: 0.6rem 0 0.2rem 0; width: max-content; min-width: 100%;
-    justify-content: center;
+    gap: 0.5rem; margin: 0.6rem 0 0.2rem 0; width: max-content; min-width: 100%;
 }
 .pipeline-node {
     position: relative; display: flex; flex-direction: column; gap: 0.22rem;
-    padding: 0.65rem 0.75rem 0.6rem 0.75rem; border-radius: 3px; width: 118px; flex-shrink: 0;
-    background: var(--surface); border: 1px solid var(--border);
-    border-top: 3px solid var(--accent);
+    padding: 0.65rem 0.75rem 0.6rem 0.75rem; border-radius: 6px; width: 118px; flex-shrink: 0;
+    background: var(--panel); border: 1px solid var(--border);
+    border-top: 2px solid var(--blue);
 }
 .pipeline-node .pipeline-node-badge {
     position: absolute; top: -9px; right: -9px; width: 18px; height: 18px; border-radius: 50%;
-    background: var(--accent); color: var(--surface-raised); font-family: var(--font-mono); font-size: 0.62rem;
+    background: var(--blue); color: var(--bg); font-family: var(--font-mono); font-size: 0.62rem;
     font-weight: 600; display: flex; align-items: center; justify-content: center;
 }
 .pipeline-node .pipeline-node-title {
-    font-family: var(--font-mono); font-size: 0.74rem; font-weight: 600;
-    letter-spacing: 0.03em; color: var(--ink);
+    font-family: var(--font-sans); font-size: 0.78rem; font-weight: 600; color: var(--text);
 }
 .pipeline-node .pipeline-node-desc {
-    font-size: 0.71rem; line-height: 1.4; color: var(--ink-muted);
+    font-size: 0.71rem; line-height: 1.4; color: var(--text-muted);
 }
 .pipeline-arrow {
-    display: flex; align-items: center; color: var(--accent); font-size: 1.15rem; flex-shrink: 0;
-    opacity: 0.6;
+    display: flex; align-items: center; color: var(--text-faint); font-size: 1.1rem; flex-shrink: 0;
 }
 
-/* --- sources: styled as a cargo/document manifest table, not a card list --- */
+/* --- sources: a manifest of what actually got retrieved and passed --- */
 .source-row {
     display: grid; grid-template-columns: 1fr 90px 54px; align-items: center; gap: 0.6rem;
     font-family: var(--font-mono); font-size: 0.78rem;
-    padding: 0.42rem 0; border-bottom: 1px dashed var(--border);
+    padding: 0.42rem 0; border-bottom: 1px solid var(--border);
 }
 .source-row:last-child { border-bottom: none; }
-.source-meta { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--ink); }
-.source-score-wrap { height: 5px; border-radius: 2px; background: var(--border); overflow: hidden; }
-.source-score-bar { height: 100%; background: var(--accent); }
-.source-row .score { color: var(--accent-strong); text-align: right; }
+.source-meta { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text); }
+.source-score-wrap { height: 5px; border-radius: 3px; background: var(--border); overflow: hidden; }
+.source-score-bar { height: 100%; background: var(--blue); }
+.source-row .score { color: var(--text-muted); text-align: right; }
 
 /* --- welcome / onboarding: example question buttons --- */
 [class*="st-key-example_"] button {
     text-align: left !important;
-    height: 104px !important;
+    height: 96px !important;
     width: 100% !important;
     box-sizing: border-box !important;
     display: flex !important;
@@ -274,40 +238,39 @@ code, .mono { font-family: var(--font-mono); }
     line-height: 1.35;
     padding: 0.9rem 1.1rem !important;
 }
-.welcome-caption { color: var(--ink-faint); font-size: 0.74rem; margin: 0.3rem 0 1.1rem 0; }
+.welcome-caption { color: var(--text-faint); font-size: 0.82rem; margin: 0.2rem 0 1.1rem 0; }
 
-/* --- sidebar: instrument-panel / ship's-log framing --- */
-[data-testid="stSidebar"] { border-right: 1px solid var(--border-accent); background: var(--surface); }
-[data-testid="stSidebar"] .stMarkdown, [data-testid="stSidebar"] p { color: var(--ink); }
-.eyebrow {
-    font-family: var(--font-mono); font-size: 0.68rem; letter-spacing: 0.1em;
-    text-transform: uppercase; color: var(--ink-faint); margin: 0.2rem 0 0.5rem 0;
-    border-bottom: 1px dashed var(--border); padding-bottom: 0.3rem;
+/* --- sidebar: cluster status panel --- */
+[data-testid="stSidebar"] { border-right: 1px solid var(--border); background: var(--panel); }
+[data-testid="stSidebar"] .stMarkdown, [data-testid="stSidebar"] p { color: var(--text); }
+.section-label {
+    font-family: var(--font-sans); font-size: 0.76rem; font-weight: 600;
+    color: var(--text-muted); margin: 0.2rem 0 0.5rem 0;
+    border-bottom: 1px solid var(--border); padding-bottom: 0.3rem;
 }
 [data-testid="stSidebar"] [data-testid="stMetricValue"] {
-    font-family: var(--font-mono); font-size: 1.2rem; color: var(--accent-strong);
+    font-family: var(--font-mono); font-size: 1.15rem; color: var(--text);
 }
-[data-testid="stSidebar"] [data-testid="stMetricLabel"] { font-size: 0.66rem; color: var(--ink-muted); }
+[data-testid="stSidebar"] [data-testid="stMetricLabel"] { font-size: 0.66rem; color: var(--text-muted); }
 
-.provider-list { display: flex; flex-direction: column; gap: 0.55rem; }
+.provider-list { display: flex; flex-direction: column; gap: 0.6rem; }
 .provider-row { padding: 0.1rem 0; }
 .provider-row .provider-name-line {
-    font-family: var(--font-mono); font-size: 0.78rem; color: var(--ink);
+    font-family: var(--font-sans); font-size: 0.83rem; font-weight: 500; color: var(--text);
     display: flex; align-items: center; gap: 0.55rem;
 }
 .provider-row .provider-role {
-    font-family: var(--font-mono); font-size: 0.64rem; color: var(--ink-faint);
-    text-transform: uppercase; letter-spacing: 0.03em; line-height: 1.4;
-    margin-top: 0.15rem; padding-left: 1.15rem;
+    font-family: var(--font-mono); font-size: 0.68rem; color: var(--text-faint);
+    line-height: 1.4; margin-top: 0.15rem; padding-left: 1.15rem;
 }
 .status-dot-inline { width: 7px; height: 7px; border-radius: 50%; display: inline-block; flex-shrink: 0; }
-.status-dot-inline.up { background: var(--accent-strong); box-shadow: 0 0 4px var(--accent-soft); }
-.status-dot-inline.down { background: var(--danger); }
+.status-dot-inline.up { background: var(--green); box-shadow: 0 0 4px var(--green-soft); }
+.status-dot-inline.down { background: var(--red); }
 
 .error-note {
-    font-family: var(--font-mono); font-size: 0.76rem; color: var(--danger);
-    background: var(--danger-soft); border: 1px solid rgba(156, 74, 54, 0.22);
-    border-radius: 3px; padding: 0.5rem 0.7rem; margin-top: 0.5rem;
+    font-family: var(--font-mono); font-size: 0.76rem; color: var(--red);
+    background: var(--red-soft); border: 1px solid rgba(224, 96, 90, 0.28);
+    border-radius: 5px; padding: 0.5rem 0.7rem; margin-top: 0.5rem;
 }
 </style>
 """
@@ -326,14 +289,14 @@ EXAMPLE_QUESTIONS = [
 ]
 
 PROVIDERS = [
-    {"label": "Groq", "role": "generation \u00b7 acct A", "check": lambda: bool(settings.groq_api_key)},
+    {"label": "Groq", "role": "generation (account A)", "check": lambda: bool(settings.groq_api_key)},
     {
         "label": "Groq",
-        "role": "generation \u00b7 acct B",
+        "role": "generation (account B)",
         "check": lambda: bool(settings.groq_api_key_secondary),
     },
-    {"label": "NIM", "role": "generation fallback \u00b7 planner \u00b7 NeMoGuard", "check": lambda: bool(settings.nvidia_nim_api_key)},
-    {"label": "Gemini", "role": "embeddings \u00b7 eval judge", "check": lambda: bool(settings.gemini_api_key)},
+    {"label": "NIM", "role": "generation fallback, planner, NeMoGuard", "check": lambda: bool(settings.nvidia_nim_api_key)},
+    {"label": "Gemini", "role": "embeddings, eval judge", "check": lambda: bool(settings.gemini_api_key)},
     {
         "label": "Qdrant",
         "role": "vector store",
@@ -349,8 +312,6 @@ PIPELINE_STAGES = [
     {"label": "Rerank", "desc": "cross-encoder relevance gate"},
     {"label": "Generate", "desc": "grounded answer"},
 ]
-
-STATUS_GLYPH = {"ok": "&#10003;", "hit": "&#10003;", "fail": "&#10007;", "skip": "&#8722;"}
 
 
 @st.cache_data(ttl=30)
@@ -379,7 +340,7 @@ def get_session_stats():
 
 
 # chat_input is called early, even though it visually renders pinned to the
-# bottom of the page regardless of call order (Streamlit's own behavior) —
+# bottom of the page regardless of call order (Streamlit's own behavior),
 # doing this before rendering history lets the history block below know
 # whether a new turn is about to be generated, so it can fade itself.
 prompt = st.chat_input("Ask a Kubernetes question")
@@ -392,14 +353,11 @@ if not prompt and st.session_state.pending_prompt:
 st.markdown(
     """
     <div class="app-header">
-        <div class="masthead-eyebrow">Cluster documentation &middot; advisory service</div>
         <div class="title-block">
             <h1>Kubernetes Q&amp;A</h1>
-            <div class="tagline">Grounded Kubernetes answers from your own docs, safety-checked,
+            <div class="tagline">Grounded Kubernetes answers from your own docs. Safety-checked,
             relevance-gated, and cached for speed.</div>
         </div>
-        <hr class="masthead-rule" />
-        <hr class="masthead-rule dashed" />
     </div>
     """,
     unsafe_allow_html=True,
@@ -408,20 +366,20 @@ st.markdown(
 # ---------- sidebar ----------
 
 with st.sidebar:
-    st.markdown('<div class="eyebrow">Corpus</div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-label">Corpus</div>', unsafe_allow_html=True)
     doc_count, cache_count = get_corpus_stats()
     corpus_col1, corpus_col2 = st.columns(2)
     corpus_col1.metric("Chunks indexed", doc_count if doc_count is not None else "—")
     corpus_col2.metric("Cached answers", cache_count if cache_count is not None else "—")
 
-    st.markdown('<div class="eyebrow" style="margin-top: 1rem;">This session</div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-label" style="margin-top: 1rem;">This session</div>', unsafe_allow_html=True)
     questions_asked, hit_rate, avg_latency = get_session_stats()
     session_col1, session_col2, session_col3 = st.columns(3)
     session_col1.metric("Asked", questions_asked)
     session_col2.metric("Cache hit", hit_rate)
     session_col3.metric("Avg time", avg_latency)
 
-    st.markdown('<div class="eyebrow" style="margin-top: 1rem;">Providers</div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-label" style="margin-top: 1rem;">Providers</div>', unsafe_allow_html=True)
     provider_rows = "".join(
         f'<div class="provider-row">'
         f'<div class="provider-name-line">'
@@ -434,7 +392,7 @@ with st.sidebar:
     )
     st.markdown(f'<div class="provider-list">{provider_rows}</div>', unsafe_allow_html=True)
 
-    st.markdown('<div class="eyebrow" style="margin-top: 1rem;">Display</div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-label" style="margin-top: 1rem;">Display</div>', unsafe_allow_html=True)
     show_trace = st.toggle("Show pipeline trace", value=False)
 
     st.divider()
@@ -446,69 +404,80 @@ with st.sidebar:
 
 # ---------- pipeline trace ----------
 
-def build_trace_steps(details: dict) -> list[dict]:
+def build_trace_conditions(details: dict) -> list[dict]:
     """Mirrors the actual LangGraph routing in src/graph.py, so what's shown
-    here is the real path this specific turn took, not a generic summary."""
+    here is the real path this specific turn took, not a generic summary.
+    Shaped like `kubectl describe`'s Conditions table: each stage is either
+    True (passed), False (blocked/failed), or unknown (skipped, e.g. a
+    cache miss, the equivalent of a condition that hasn't been evaluated)."""
     if details.get("error"):
-        return [{"label": "Pipeline", "value": "error", "status": "fail"}]
+        return [{"type": "Pipeline", "status": False, "message": "error"}]
 
-    steps = []
+    conditions = []
     blocked_stage = details.get("blocked_stage")
 
     if blocked_stage == "safety":
-        steps.append({"label": "Safety", "value": "blocked", "status": "fail"})
-        return steps
-    steps.append({"label": "Safety", "value": "passed", "status": "ok"})
+        conditions.append({"type": "Safety", "status": False, "message": "blocked"})
+        return conditions
+    conditions.append({"type": "Safety", "status": True, "message": "passed"})
 
     if blocked_stage == "topic":
-        steps.append({"label": "Topic", "value": "off-topic", "status": "fail"})
-        return steps
-    steps.append({"label": "Topic", "value": "on-topic", "status": "ok"})
+        conditions.append({"type": "Topic", "status": False, "message": "off-topic"})
+        return conditions
+    conditions.append({"type": "Topic", "status": True, "message": "on-topic"})
 
     cache_layer = details.get("cache_layer")
     if cache_layer:
-        steps.append({"label": "Cache", "value": f"{cache_layer} hit", "status": "hit"})
-        return steps
-    steps.append({"label": "Cache", "value": "miss", "status": "skip"})
+        conditions.append({"type": "Cache", "status": True, "message": f"{cache_layer} hit"})
+        return conditions
+    conditions.append({"type": "Cache", "status": None, "message": "miss"})
 
     candidates_count = details.get("candidates_count", 0)
-    steps.append({"label": "Retrieve", "value": f"{candidates_count} found", "status": "ok"})
+    conditions.append({"type": "Retrieve", "status": True, "message": f"{candidates_count} found"})
 
     reranked_count = details.get("reranked_count", 0)
     if reranked_count == 0:
-        steps.append({"label": "Rerank", "value": "0 survived", "status": "fail"})
-        return steps
-    steps.append({"label": "Rerank", "value": f"{reranked_count}/{candidates_count} passed", "status": "ok"})
+        conditions.append({"type": "Rerank", "status": False, "message": "0 survived"})
+        return conditions
+    conditions.append({"type": "Rerank", "status": True, "message": f"{reranked_count}/{candidates_count} passed"})
 
     provider = details.get("provider")
     model = details.get("model")
     if provider:
-        label = f"{provider} &middot; {model}" if model else provider
-        steps.append({"label": "Generate", "value": label, "status": "ok"})
+        message = f"{provider} ({model})" if model else provider
+        conditions.append({"type": "Generate", "status": True, "message": message})
 
-    return steps
+    return conditions
 
 
 def render_trace(details: dict) -> None:
-    steps = build_trace_steps(details)
-    step_html = ""
-    for i, step in enumerate(steps):
-        status = step.get("status", "fail")
-        glyph = STATUS_GLYPH.get(status, "")
-        glyph_html = f'<span class="trace-glyph {status}">{glyph}</span>' if glyph else ""
-        step_html += (
-            f'<div class="trace-step {status}">'
-            f'<span class="trace-label">{step["label"]}</span>'
-            f'<span class="trace-value">{glyph_html}{step["value"]}</span>'
+    conditions = build_trace_conditions(details)
+    row_html = ""
+    for cond in conditions:
+        if cond["status"] is True:
+            status_class, status_text = "true", "True"
+        elif cond["status"] is False:
+            status_class, status_text = "false", "False"
+        else:
+            status_class, status_text = "unknown", "Unknown"
+        row_html += (
+            f'<div class="cond-row">'
+            f'<span class="cond-type">{cond["type"]}</span>'
+            f'<span class="cond-status {status_class}">{status_text}</span>'
+            f'<span class="cond-message">{cond["message"]}</span>'
             f"</div>"
         )
-        if i < len(steps) - 1:
-            step_html += '<div class="trace-arrow">&#8594;</div>'
 
     latency = details.get("latency_seconds")
-    latency_html = f'<span class="trace-latency">{latency:.2f}s</span>' if latency is not None else ""
+    footer_html = f'<div class="cond-footer">{latency:.2f}s total</div>' if latency is not None else ""
 
-    st.markdown(f'<div class="trace-row">{step_html}{latency_html}</div>', unsafe_allow_html=True)
+    st.markdown(
+        f'<div class="cond-table">'
+        f'<div class="cond-header"><span>TYPE</span><span>STATUS</span><span>MESSAGE</span></div>'
+        f"{row_html}{footer_html}"
+        f"</div>",
+        unsafe_allow_html=True,
+    )
 
     if details.get("error"):
         st.markdown(f'<div class="error-note">{PIPELINE_ERROR_MESSAGE}</div>', unsafe_allow_html=True)
@@ -519,7 +488,22 @@ def render_trace(details: dict) -> None:
         with st.expander(f"Sources ({len(sources)})"):
             for source in sources:
                 path = source["metadata"].get("source_path", "unknown")
-                score = source["rerank_score"]
+                # rerank_score is absent when rerank_and_gate degraded to
+                # unfiltered retrieval order (FlashRank failure, see
+                # src/retrieval/rerank.py) — there's no score to gate on in
+                # that case, so show "n/a" instead of a bar rather than
+                # raising a KeyError on a candidate that was never scored.
+                score = source.get("rerank_score")
+                if score is None:
+                    st.markdown(
+                        f'<div class="source-row">'
+                        f'<div class="source-meta">{path}</div>'
+                        f'<div class="source-score-wrap"></div>'
+                        f'<span class="score">n/a</span>'
+                        f"</div>",
+                        unsafe_allow_html=True,
+                    )
+                    continue
                 bar_width = max(0.0, min(1.0, score)) * 100
                 st.markdown(
                     f'<div class="source-row">'
@@ -536,7 +520,7 @@ def render_trace(details: dict) -> None:
 # checked against `prompt` too, not just history: history is only empty
 # BEFORE this run's user message gets appended further down, so on the
 # very first-ever submission this condition would otherwise still be true
-# during the same run that's processing that submission — showing the
+# during the same run that's processing that submission, showing the
 # welcome block and the "running the pipeline" spinner at once.
 if not st.session_state.history and not prompt:
     with st.container(key="welcome_block"):

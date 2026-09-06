@@ -29,7 +29,14 @@ class Settings(BaseSettings):
     # used to ride on generate_planner's classifier calls before NeMoGuard
     # took that job over directly; rewrite/canonicalize/ingestion-relevance
     # still use it.
-    nim_planner_model: str = "meta/llama-3.1-8b-instruct"
+    # meta/llama-3.1-8b-instruct was retired from NVIDIA's hosted NIM API
+    # catalog on 2026-08-26 (self-host NIM containers of it still exist,
+    # the hosted endpoint this project calls does not). Replaced with
+    # meta/llama-3.2-3b-instruct: same weight class and provider, still
+    # live on the hosted API as of this writing, and Meta's own model card
+    # lists "query and prompt rewriting" as an intended use case, which
+    # covers everything this chain is actually used for here.
+    nim_planner_model: str = "nvidia/nemotron-3-super-120b-a12b"
     groq_planner_model: str = "openai/gpt-oss-20b"
 
     # eval judge stays on a separate model family from both live chains

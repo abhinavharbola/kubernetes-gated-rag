@@ -175,35 +175,51 @@ code, .mono { font-family: var(--font-mono); }
 }
 
 /* --- pipeline trace (live, per-turn) ---
-   Shaped like `kubectl describe`'s Conditions table: TYPE / STATUS /
-   MESSAGE, True or False, because that's the exact table this app's own
-   audience already reads every day when debugging a cluster. */
-.cond-table {
-    margin: 0.8rem 0 0.3rem 0; border: 1px solid var(--border);
-    border-radius: 8px; overflow: hidden; background: var(--panel);
-    box-shadow: var(--shadow-sm);
+   Same node-and-arrow shape as the static "How this works" diagram below,
+   just colored by what actually happened on this turn instead of showing
+   the same neutral blue for every stage: green passed, red blocked (the
+   request stopped there, later nodes never ran), amber a non-blocking
+   miss the request continued past anyway (currently only a cache miss),
+   gray a stage the request never reached because an earlier one already
+   blocked or resolved the turn. */
+.trace-diagram-wrap { overflow-x: auto; padding: 0.2rem 0.1rem 0.5rem 0.1rem; margin-top: 0.6rem; }
+.trace-diagram {
+    display: flex; flex-wrap: nowrap; align-items: stretch;
+    gap: 0.5rem; width: max-content; min-width: 100%;
 }
-.cond-header, .cond-row {
-    display: grid; grid-template-columns: 100px 70px 1fr;
-    gap: 0.6rem; padding: 0.42rem 0.75rem; align-items: center;
+.trace-node {
+    position: relative; display: flex; flex-direction: column; gap: 0.22rem;
+    padding: 0.65rem 0.75rem 0.6rem 0.75rem; border-radius: 8px; width: 128px; flex-shrink: 0;
+    background: var(--panel); border: 1px solid var(--border); box-shadow: var(--shadow-sm);
+    border-top: 3px solid var(--border-strong);
 }
-.cond-header {
-    font-family: var(--font-mono); font-size: 0.66rem; letter-spacing: 0.04em;
-    color: var(--text-faint); border-bottom: 1px solid var(--border);
-    background: var(--panel-raised);
+.trace-node.status-pass { border-top-color: var(--green); }
+.trace-node.status-fail { border-top-color: var(--red); }
+.trace-node.status-skip { border-top-color: var(--amber); }
+.trace-node.status-unreached { border-top-color: var(--border-strong); opacity: 0.45; box-shadow: none; }
+.trace-node .trace-node-badge {
+    position: absolute; top: -10px; right: -10px; width: 19px; height: 19px; border-radius: 50%;
+    color: #FFFFFF; font-size: 0.66rem; font-weight: 700; line-height: 1;
+    display: flex; align-items: center; justify-content: center;
 }
-.cond-row { border-bottom: 1px solid var(--border); font-size: 0.83rem; }
-.cond-row:last-child { border-bottom: none; }
-.cond-type { color: var(--text); font-weight: 500; }
-.cond-status { font-family: var(--font-mono); font-size: 0.78rem; font-weight: 600; }
-.cond-status.true { color: var(--green); }
-.cond-status.false { color: var(--red); }
-.cond-status.unknown { color: var(--amber); }
-.cond-message { font-family: var(--font-mono); font-size: 0.78rem; color: var(--text-muted); }
-.cond-footer {
-    display: flex; justify-content: flex-end; padding: 0.35rem 0.75rem;
+.trace-node.status-pass .trace-node-badge { background: var(--green); }
+.trace-node.status-fail .trace-node-badge { background: var(--red); }
+.trace-node.status-skip .trace-node-badge { background: var(--amber); }
+.trace-node.status-unreached .trace-node-badge { background: var(--text-faint); }
+.trace-node .trace-node-title {
+    font-family: var(--font-sans); font-size: 0.78rem; font-weight: 600; color: var(--text);
+}
+.trace-node .trace-node-message {
+    font-family: var(--font-mono); font-size: 0.68rem; line-height: 1.4; color: var(--text-muted);
+    overflow-wrap: break-word;
+}
+.trace-arrow-live {
+    display: flex; align-items: center; color: var(--text-faint); font-size: 1.1rem; flex-shrink: 0;
+}
+.trace-arrow-live.unreached { opacity: 0.35; }
+.trace-footer {
+    display: flex; justify-content: flex-end; margin: 0.35rem 0.1rem 0 0.1rem;
     font-family: var(--font-mono); font-size: 0.72rem; color: var(--text-faint);
-    background: var(--panel-raised); border-top: 1px solid var(--border);
 }
 
 /* --- pipeline diagram (static, explanatory, inside "How this works") ---
@@ -478,32 +494,61 @@ def build_trace_conditions(details: dict) -> list[dict]:
     return conditions
 
 
-def render_trace(details: dict) -> None:
+def build_trace_nodes(details: dict) -> list[dict]:
+    """Maps build_trace_conditions' real per-turn outcome onto the same
+    fixed 6-stage sequence PIPELINE_STAGES uses for the static "How this
+    works" diagram, so the live trace renders as the same node-and-arrow
+    shape rather than a different visual language for what's conceptually
+    the same pipeline. Each stage is 'pass' (green), 'fail' (red, and the
+    request stopped there, everything after is 'unreached'), 'skip'
+    (amber, a non-blocking miss the request continued past, currently only
+    a cache miss), or 'unreached' (gray, either blocked at an earlier
+    stage or the turn was already resolved by a cache hit before this
+    stage ever ran)."""
     conditions = build_trace_conditions(details)
-    row_html = ""
-    for cond in conditions:
-        if cond["status"] is True:
-            status_class, status_text = "true", "True"
-        elif cond["status"] is False:
-            status_class, status_text = "false", "False"
+    condition_by_type = {condition["type"]: condition for condition in conditions}
+    nodes = []
+    reachable = True
+    for stage in PIPELINE_STAGES:
+        condition = condition_by_type.get(stage["label"])
+        if condition is None or not reachable:
+            nodes.append({"label": stage["label"], "status": "unreached", "message": "not reached"})
+            continue
+        if condition["status"] is False:
+            nodes.append({"label": stage["label"], "status": "fail", "message": condition["message"]})
+            reachable = False
+        elif condition["status"] is None:
+            nodes.append({"label": stage["label"], "status": "skip", "message": condition["message"]})
         else:
-            status_class, status_text = "unknown", "Unknown"
-        row_html += (
-            f'<div class="cond-row">'
-            f'<span class="cond-type">{cond["type"]}</span>'
-            f'<span class="cond-status {status_class}">{status_text}</span>'
-            f'<span class="cond-message">{cond["message"]}</span>'
+            nodes.append({"label": stage["label"], "status": "pass", "message": condition["message"]})
+            if stage["label"] == "Cache" and "hit" in condition["message"]:
+                # a cache hit resolves the whole turn right there, nothing
+                # after it ran, but that's a resolution, not a failure
+                reachable = False
+    return nodes
+
+
+def render_trace(details: dict) -> None:
+    nodes = build_trace_nodes(details)
+    badge_icon = {"pass": "&#10003;", "fail": "&#10005;", "skip": "~", "unreached": "&#9675;"}
+    node_html = ""
+    for i, node in enumerate(nodes):
+        node_html += (
+            f'<div class="trace-node status-{node["status"]}">'
+            f'<span class="trace-node-badge">{badge_icon[node["status"]]}</span>'
+            f'<span class="trace-node-title">{node["label"]}</span>'
+            f'<span class="trace-node-message">{node["message"]}</span>'
             f"</div>"
         )
+        if i < len(nodes) - 1:
+            arrow_class = "trace-arrow-live unreached" if nodes[i + 1]["status"] == "unreached" else "trace-arrow-live"
+            node_html += f'<div class="{arrow_class}">&#8594;</div>'
 
     latency = details.get("latency_seconds")
-    footer_html = f'<div class="cond-footer">{latency:.2f}s total</div>' if latency is not None else ""
+    footer_html = f'<div class="trace-footer">{latency:.2f}s total</div>' if latency is not None else ""
 
     st.markdown(
-        f'<div class="cond-table">'
-        f'<div class="cond-header"><span>TYPE</span><span>STATUS</span><span>MESSAGE</span></div>'
-        f"{row_html}{footer_html}"
-        f"</div>",
+        f'<div class="trace-diagram-wrap"><div class="trace-diagram">{node_html}</div></div>{footer_html}',
         unsafe_allow_html=True,
     )
 

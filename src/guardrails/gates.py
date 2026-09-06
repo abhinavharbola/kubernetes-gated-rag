@@ -4,10 +4,12 @@ from concurrent.futures import ThreadPoolExecutor
 
 from langchain_groq import ChatGroq
 from nemoguardrails import LLMRails, RailsConfig
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 from src.guardrails.colang_rules import COLANG_CONTENT, JAILBREAK_INDICATORS, YAML_CONTENT
 from src.config import settings
 from src.providers.clients import nim_client
+from src.providers.llm import RETRYABLE
 from src.tracing import provider_call_span
 
 logger = logging.getLogger(__name__)
@@ -106,6 +108,43 @@ _SAFETY_RESPONSE_FORMAT = (
 _rails: LLMRails | None = None
 
 
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=1, max=4),
+    retry=retry_if_exception_type(RETRYABLE),
+    reraise=True,
+)
+def _call_nemoguard(model: str, messages: list[dict], max_tokens: int, role: str):
+    # NVIDIA's hosted NeMoGuard instances occasionally crash server-side
+    # with a TensorRT-LLM CUDA error (illegal memory access in the batch
+    # manager) rather than returning a clean error, this is infra flakiness
+    # on their end, not a property of the specific request. The openai SDK
+    # maps a 500 response to InternalServerError, which RETRYABLE already
+    # covers (see src/providers/llm.py), so this reuses that same tuple
+    # rather than defining a second one that could drift out of sync.
+    #
+    # 3 attempts, not the 2 every other chain in this app uses: those
+    # chains have a next provider to fail over to after their 2 attempts,
+    # this gate doesn't — NeMoGuard only exists on NIM, there's nowhere
+    # else to send the request. Observed failures on this specific model
+    # have repeated across consecutive requests in the same session rather
+    # than clearing on the very next call (consistent with a load balancer
+    # repeatedly routing back to the same unhealthy worker, or a sustained
+    # bad stretch on NVIDIA's end rather than one-off flakiness), so a
+    # single retry undersells what's needed here. This only costs latency
+    # on the failure path, a healthy call still returns on the first
+    # attempt, and topic_gate()/safety_gate() below still fail closed if
+    # all 3 attempts fail, this just gives a real outage more room to
+    # clear before a genuinely on-topic/safe question gets refused.
+    with provider_call_span(provider="nim", model=model, role=role):
+        return nim_client.chat.completions.create(
+            model=model,
+            messages=messages,
+            temperature=0.0,
+            max_tokens=max_tokens,
+        )
+
+
 def _parse_binary_verdict(raw: str, true_word: str, false_word: str) -> bool | None:
     # checks only the FIRST token of the response, not "does this word
     # appear anywhere" — a substring-anywhere check misfires if the model
@@ -175,13 +214,12 @@ def _direct_safety_check(raw_message: str) -> bool | None:
     # "unsafe" outright, we defer that call to check_safety's fail-closed
     # path instead so there's one place that decision is made.
     prompt = _SAFETY_TASK + f"<BEGIN CONVERSATION>\nuser: {raw_message}\n<END CONVERSATION>\n" + _SAFETY_RESPONSE_FORMAT
-    with provider_call_span(provider="nim", model=settings.nemoguard_safety_model, role="safety_gate"):
-        response = nim_client.chat.completions.create(
-            model=settings.nemoguard_safety_model,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.0,
-            max_tokens=200,
-        )
+    response = _call_nemoguard(
+        model=settings.nemoguard_safety_model,
+        messages=[{"role": "user", "content": prompt}],
+        max_tokens=200,
+        role="safety_gate",
+    )
     raw = response.choices[0].message.content or ""
     try:
         parsed = json.loads(raw.strip())
@@ -235,16 +273,15 @@ def check_topic(standalone_question: str) -> bool:
     # instead of refused. NeMoGuard's topic-control model is purpose-tuned
     # for exactly this open-ended judgment, called directly against
     # nim_client (no failover chain — see module docstring above).
-    with provider_call_span(provider="nim", model=settings.nemoguard_topic_model, role="topic_gate"):
-        response = nim_client.chat.completions.create(
-            model=settings.nemoguard_topic_model,
-            messages=[
-                {"role": "system", "content": TOPIC_POLICY_PROMPT},
-                {"role": "user", "content": standalone_question},
-            ],
-            temperature=0.0,
-            max_tokens=20,
-        )
+    response = _call_nemoguard(
+        model=settings.nemoguard_topic_model,
+        messages=[
+            {"role": "system", "content": TOPIC_POLICY_PROMPT},
+            {"role": "user", "content": standalone_question},
+        ],
+        max_tokens=20,
+        role="topic_gate",
+    )
     raw = response.choices[0].message.content or ""
     logger.info("topic gate raw response: %r", raw)
     verdict = _parse_binary_verdict(raw, true_word="on-topic", false_word="off-topic")

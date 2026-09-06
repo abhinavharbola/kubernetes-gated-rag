@@ -62,29 +62,36 @@ CUSTOM_CSS = """
    This is a Kubernetes Q&A tool built around admission-style gating: every
    question passes through checks before it's allowed to reach generation,
    the same way the API server runs admission webhooks on a request before
-   it's persisted. The trace panel below is deliberately shaped like
-   `kubectl describe`'s Conditions table (TYPE / STATUS / MESSAGE, True or
-   False) rather than an invented metaphor, since that's the vocabulary
-   this tool's own audience already reads every day. Dark control-plane
-   console palette; monospace is reserved for real data (paths, scores,
-   provider names, latency), not for decorative labels. */
+   it's persisted. The trace panel is shaped like `kubectl describe`'s
+   Conditions table (TYPE / STATUS / MESSAGE, True or False) rather than an
+   invented metaphor, since that's the vocabulary this tool's own audience
+   already reads every day.
+
+   Light palette, deliberately not the cream/parchment default and not a
+   plain white SaaS-card look: a cool, slightly blue-tinted gray canvas
+   with white panels raised on top of it, so depth comes from the
+   canvas/panel contrast plus a soft shadow rather than from borders alone.
+   Monospace is reserved for real data (paths, scores, provider names,
+   latency), not for decorative labels. */
 :root {
-    --bg: #0E1013;
-    --panel: #161920;
-    --panel-raised: #1C2028;
-    --border: rgba(255, 255, 255, 0.08);
-    --border-strong: rgba(255, 255, 255, 0.18);
-    --text: #E8EAED;
-    --text-muted: #9BA2AD;
-    --text-faint: #5C636E;
-    --blue: #5B8DEF;
-    --blue-soft: rgba(91, 141, 239, 0.12);
-    --green: #4FB477;
-    --green-soft: rgba(79, 180, 119, 0.13);
-    --amber: #D9A44A;
-    --amber-soft: rgba(217, 164, 74, 0.13);
-    --red: #E0605A;
-    --red-soft: rgba(224, 96, 90, 0.13);
+    --bg: #EBEEF3;
+    --panel: #FFFFFF;
+    --panel-raised: #F6F8FB;
+    --border: rgba(17, 24, 39, 0.09);
+    --border-strong: rgba(17, 24, 39, 0.16);
+    --text: #12151C;
+    --text-muted: #5B6472;
+    --text-faint: #8A93A3;
+    --blue: #2E56D9;
+    --blue-soft: rgba(46, 86, 217, 0.08);
+    --green: #157F45;
+    --green-soft: rgba(21, 127, 69, 0.10);
+    --amber: #A8650A;
+    --amber-soft: rgba(168, 101, 10, 0.10);
+    --red: #C22E2E;
+    --red-soft: rgba(194, 46, 46, 0.09);
+    --shadow-sm: 0 1px 2px rgba(17, 24, 39, 0.04), 0 1px 1px rgba(17, 24, 39, 0.03);
+    --shadow-md: 0 4px 14px rgba(17, 24, 39, 0.07), 0 1px 2px rgba(17, 24, 39, 0.05);
     --font-display: "Space Grotesk", "Segoe UI", sans-serif;
     --font-sans: "IBM Plex Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
     --font-mono: "IBM Plex Mono", "Fira Code", ui-monospace, monospace;
@@ -103,53 +110,75 @@ code, .mono { font-family: var(--font-mono); }
 [data-testid="stBottomBlockContainer"] {
     background: var(--bg) !important;
 }
+/* the chat-input bar spans the full viewport width by default; constrain
+   and center the actual input box to match the content column so it reads
+   as one deliberate composition instead of an edge-to-edge form field. */
+[data-testid="stBottomBlockContainer"] { display: flex !important; justify-content: center !important; }
 [data-testid="stChatInput"] {
-    background: var(--panel-raised) !important;
+    background: var(--panel) !important;
     border: 1px solid var(--border-strong) !important;
-    border-radius: 6px !important;
+    border-radius: 10px !important;
+    box-shadow: var(--shadow-md) !important;
+    max-width: 760px !important;
 }
 [data-testid="stChatInput"] textarea { color: var(--text) !important; }
+[data-testid="stChatInput"] textarea::placeholder { color: var(--text-faint) !important; }
 .stButton button {
-    border-radius: 5px !important;
+    border-radius: 8px !important;
     border: 1px solid var(--border-strong) !important;
     color: var(--text) !important;
-    background: var(--panel-raised) !important;
+    background: var(--panel) !important;
+    box-shadow: var(--shadow-sm) !important;
+    transition: box-shadow 0.15s ease, border-color 0.15s ease, transform 0.15s ease !important;
 }
 .stButton button:hover {
     border-color: var(--blue) !important;
     color: var(--blue) !important;
+    box-shadow: var(--shadow-md) !important;
+    transform: translateY(-1px) !important;
 }
 .stMarkdown, .stApp p, .stApp li { color: var(--text); }
 
 /* the "usable width" of centered layout is capped by Streamlit's own
-   block-container max-width (~730px); widen it so the header, diagram, and
-   example grid all have room to breathe instead of wrapping constantly.
-   padding-top must clear stHeader's own height (a fixed bar painted over
-   the top of the scrollable content, same bg color as the page above). */
+   block-container max-width (~730px); widen it so the diagram and example
+   grid have room to breathe instead of wrapping constantly. padding-top
+   must clear stHeader's own height (a fixed bar painted over the top of
+   the scrollable content, same bg color as the page above). */
 .block-container, [data-testid="stMainBlockContainer"] {
     max-width: 980px !important;
     padding-top: 3.5rem !important;
 }
 
 /* --- masthead ---
-   Left-aligned, one hairline rule, no eyebrow chrome above it: the title
-   and one line under it already say what this is, so nothing needed to
-   sit above it and announce that. */
+   Centered, narrower than the full content column so it reads as a
+   deliberate hero rather than a stretched banner; the wordmark ties the
+   title back to the admission-gate idea (a small gate shape, not a
+   literal Kubernetes logo) instead of sitting there as pure decoration. */
 .app-header {
-    padding: 0 0 1.1rem 0; margin-bottom: 1.4rem;
-    border-bottom: 1px solid var(--border);
+    display: flex; flex-direction: column; align-items: center; text-align: center;
+    max-width: 640px; margin: 0 auto 1.6rem auto;
+    padding: 0 0 1.6rem 0; border-bottom: 1px solid var(--border);
+}
+.app-header .wordmark {
+    width: 40px; height: 40px; margin-bottom: 0.9rem;
+    display: flex; align-items: center; justify-content: center;
 }
 .app-header .title-block h1 {
-    margin: 0; font-family: var(--font-display); font-size: 2.15rem;
+    margin: 0; font-family: var(--font-display); font-size: 2.3rem;
     font-weight: 700; letter-spacing: -0.01em; color: var(--text); line-height: 1.2;
 }
 .app-header .title-block .tagline {
-    color: var(--text-muted); font-size: 0.98rem; margin: 0.6rem 0 0 0;
-    max-width: 640px; line-height: 1.55;
+    color: var(--text-muted); font-size: 1rem; margin: 0.7rem auto 0 auto;
+    max-width: 460px; line-height: 1.6;
 }
 
 /* --- welcome / onboarding --- */
-.st-key-welcome_block { max-width: 900px; margin: 0 auto 0.4rem auto; }
+.st-key-welcome_block { max-width: 780px; margin: 0 auto 0.4rem auto; }
+.st-key-welcome_block [data-testid="stExpander"] {
+    border: 1px solid var(--border) !important; border-radius: 10px !important;
+    box-shadow: var(--shadow-sm) !important; background: var(--panel) !important;
+    overflow: hidden;
+}
 
 /* --- pipeline trace (live, per-turn) ---
    Shaped like `kubectl describe`'s Conditions table: TYPE / STATUS /
@@ -157,7 +186,8 @@ code, .mono { font-family: var(--font-mono); }
    audience already reads every day when debugging a cluster. */
 .cond-table {
     margin: 0.8rem 0 0.3rem 0; border: 1px solid var(--border);
-    border-radius: 6px; overflow: hidden; background: var(--panel);
+    border-radius: 8px; overflow: hidden; background: var(--panel);
+    box-shadow: var(--shadow-sm);
 }
 .cond-header, .cond-row {
     display: grid; grid-template-columns: 100px 70px 1fr;
@@ -193,13 +223,13 @@ code, .mono { font-family: var(--font-mono); }
 }
 .pipeline-node {
     position: relative; display: flex; flex-direction: column; gap: 0.22rem;
-    padding: 0.65rem 0.75rem 0.6rem 0.75rem; border-radius: 6px; width: 118px; flex-shrink: 0;
-    background: var(--panel); border: 1px solid var(--border);
+    padding: 0.65rem 0.75rem 0.6rem 0.75rem; border-radius: 8px; width: 118px; flex-shrink: 0;
+    background: var(--panel); border: 1px solid var(--border); box-shadow: var(--shadow-sm);
     border-top: 2px solid var(--blue);
 }
 .pipeline-node .pipeline-node-badge {
     position: absolute; top: -9px; right: -9px; width: 18px; height: 18px; border-radius: 50%;
-    background: var(--blue); color: var(--bg); font-family: var(--font-mono); font-size: 0.62rem;
+    background: var(--blue); color: #FFFFFF; font-family: var(--font-mono); font-size: 0.62rem;
     font-weight: 600; display: flex; align-items: center; justify-content: center;
 }
 .pipeline-node .pipeline-node-title {
@@ -238,10 +268,14 @@ code, .mono { font-family: var(--font-mono); }
     line-height: 1.35;
     padding: 0.9rem 1.1rem !important;
 }
-.welcome-caption { color: var(--text-faint); font-size: 0.82rem; margin: 0.2rem 0 1.1rem 0; }
+.welcome-caption {
+    color: var(--text-muted); font-size: 0.88rem; margin: 0.2rem 0 1.1rem 0; text-align: center;
+}
 
 /* --- sidebar: cluster status panel --- */
-[data-testid="stSidebar"] { border-right: 1px solid var(--border); background: var(--panel); }
+[data-testid="stSidebar"] {
+    border-right: 1px solid var(--border); background: var(--panel);
+}
 [data-testid="stSidebar"] .stMarkdown, [data-testid="stSidebar"] p { color: var(--text); }
 .section-label {
     font-family: var(--font-sans); font-size: 0.76rem; font-weight: 600;
@@ -269,8 +303,8 @@ code, .mono { font-family: var(--font-mono); }
 
 .error-note {
     font-family: var(--font-mono); font-size: 0.76rem; color: var(--red);
-    background: var(--red-soft); border: 1px solid rgba(224, 96, 90, 0.28);
-    border-radius: 5px; padding: 0.5rem 0.7rem; margin-top: 0.5rem;
+    background: var(--red-soft); border: 1px solid rgba(194, 46, 46, 0.22);
+    border-radius: 6px; padding: 0.5rem 0.7rem; margin-top: 0.5rem;
 }
 </style>
 """
@@ -353,6 +387,13 @@ if not prompt and st.session_state.pending_prompt:
 st.markdown(
     """
     <div class="app-header">
+        <div class="wordmark">
+            <svg viewBox="0 0 40 40" width="40" height="40" fill="none" xmlns="http://www.w3.org/2000/svg">
+                <rect x="3" y="3" width="34" height="34" rx="9" stroke="#2E56D9" stroke-width="2.5"/>
+                <path d="M13 20.5L18 25.5L27.5 15" stroke="#2E56D9" stroke-width="2.5"
+                      stroke-linecap="round" stroke-linejoin="round"/>
+            </svg>
+        </div>
         <div class="title-block">
             <h1>Kubernetes Q&amp;A</h1>
             <div class="tagline">Grounded Kubernetes answers from your own docs. Safety-checked,

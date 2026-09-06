@@ -1,5 +1,6 @@
 import json
 import logging
+import re
 from concurrent.futures import ThreadPoolExecutor
 
 from langchain_groq import ChatGroq
@@ -9,7 +10,7 @@ from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_excep
 from src.guardrails.colang_rules import COLANG_CONTENT, JAILBREAK_INDICATORS, YAML_CONTENT
 from src.config import settings
 from src.providers.clients import nim_client
-from src.providers.llm import RETRYABLE
+from src.providers.llm import RETRYABLE, generate_planner
 from src.tracing import provider_call_span
 
 logger = logging.getLogger(__name__)
@@ -146,12 +147,20 @@ def _call_nemoguard(model: str, messages: list[dict], max_tokens: int, role: str
 
 
 def _parse_binary_verdict(raw: str, true_word: str, false_word: str) -> bool | None:
-    # checks only the FIRST token of the response, not "does this word
-    # appear anywhere" — a substring-anywhere check misfires if the model
-    # adds any preamble at all, e.g. "this is safe, not unsafe" contains
-    # "unsafe" as a literal substring despite the actual verdict being
-    # safe. We asked for exactly one word; treat only that first word as
-    # the verdict, ignore whatever the model says around it.
+    # Checks the first token and, if that alone isn't the bare verdict, the
+    # last non-empty line, never an "does this word appear anywhere"
+    # substring search, since that misfires on any preamble at all, e.g.
+    # "this is safe, not unsafe" contains "unsafe" as a literal substring
+    # despite the actual verdict being safe. NeMoGuard's purpose-tuned classifiers
+    # answer with just the verdict word, so the first token alone always
+    # resolves it for them, and for a terse response the first token and
+    # last line are the same thing anyway, so this doesn't change their
+    # behavior. It matters for the fallback classifier (see
+    # _fallback_topic_check): a general instruction-following model is
+    # more likely to reason before landing on an answer, so the verdict is
+    # more likely to be the last thing it says than the first, this is
+    # still a whole-line match, not a substring search, just checked in
+    # one more place.
     stripped = raw.strip()
     if not stripped:
         return None
@@ -159,6 +168,11 @@ def _parse_binary_verdict(raw: str, true_word: str, false_word: str) -> bool | N
     if first_token == false_word:
         return False
     if first_token == true_word:
+        return True
+    last_line = stripped.splitlines()[-1].strip().strip(".,!?\"'").lower()
+    if last_line == false_word:
+        return False
+    if last_line == true_word:
         return True
     return None
 
@@ -205,6 +219,38 @@ def _colang_jailbreak_check(raw_message: str) -> bool:
     return any(indicator in content for indicator in JAILBREAK_INDICATORS)
 
 
+def _parse_safety_json(raw: str) -> bool | None:
+    # Tries the response as-is first (NeMoGuard returns pure JSON with
+    # nothing else around it, so this succeeds immediately on the primary
+    # path). Falls back to pulling out the first {...} block only if that
+    # fails, since a general instruction-following model (the fallback
+    # classifier, see _fallback_safety_check) is more likely to reason
+    # before or around the JSON than NeMoGuard's tuned output is.
+    stripped = raw.strip()
+    try:
+        parsed = json.loads(stripped)
+    except Exception:
+        match = re.search(r"\{.*\}", stripped, re.DOTALL)
+        if not match:
+            logger.warning("safety classifier returned unparseable output: %r", raw)
+            return None
+        try:
+            parsed = json.loads(match.group(0))
+        except Exception:
+            logger.warning("safety classifier returned unparseable output: %r", raw)
+            return None
+    try:
+        verdict = str(parsed["User Safety"]).strip().lower()
+    except Exception:
+        logger.warning("safety classifier JSON missing 'User Safety' key: %r", raw)
+        return None
+    if verdict == "safe":
+        return True
+    if verdict == "unsafe":
+        return False
+    return None
+
+
 def _direct_safety_check(raw_message: str) -> bool | None:
     # NeMoGuard content-safety, called directly against nim_client — no
     # failover chain, this model only exists on NIM. Returns None (not an
@@ -221,17 +267,57 @@ def _direct_safety_check(raw_message: str) -> bool | None:
         role="safety_gate",
     )
     raw = response.choices[0].message.content or ""
+    return _parse_safety_json(raw)
+
+
+def _fallback_safety_check(raw_message: str) -> bool | None:
+    # Used only when the dedicated NeMoGuard content-safety model itself
+    # errors after _call_nemoguard's retries are exhausted (an NVIDIA-side
+    # outage, not a verdict) — see _fallback_topic_check's docstring below
+    # for the full reasoning, this is the same pattern applied to the
+    # safety check. generate_planner's chain (NIM gpt-oss -> Groq gpt-oss)
+    # doesn't touch the NeMoGuard deployment at all, so an outage there
+    # doesn't take this down too. A general instruction-following model
+    # wasn't calibrated against NeMoGuard's specific S1-S23 taxonomy the
+    # way NeMoGuard itself was, so this is a genuinely lower-confidence
+    # fallback, not a drop-in equivalent, but a lower-confidence safety
+    # check is still better than refusing every message during an outage
+    # that has nothing to do with whether the message is actually unsafe.
+    prompt = _SAFETY_TASK + f"<BEGIN CONVERSATION>\nuser: {raw_message}\n<END CONVERSATION>\n" + _SAFETY_RESPONSE_FORMAT
     try:
-        parsed = json.loads(raw.strip())
-        verdict = str(parsed["User Safety"]).strip().lower()
-    except Exception:
-        logger.warning("NeMoGuard content-safety returned unparseable output: %r", raw)
+        # max_tokens well above the primary check's 200: NeMoGuard was
+        # tuned to answer with just the JSON object, a general model is
+        # more likely to reason before or around it, and a response
+        # truncated before it ever reaches the JSON is unparseable no
+        # matter how good _parse_safety_json's extraction gets.
+        result = generate_planner([{"role": "user", "content": prompt}], temperature=0.0, max_tokens=400)
+    except Exception as error:
+        logger.warning("safety gate fallback classifier also failed: %s", error)
         return None
-    if verdict == "safe":
-        return True
-    if verdict == "unsafe":
-        return False
-    return None
+    verdict = _parse_safety_json(result.content)
+    if verdict is None:
+        logger.warning("safety gate fallback classifier raw response: %r", result.content)
+    return verdict
+
+
+def _safety_classifier_verdict(raw_message: str) -> bool | None:
+    # Tries the dedicated NeMoGuard content-safety model first, it's
+    # calibrated against the specific S1-S23 taxonomy this prompt uses, the
+    # fallback below isn't. Falls back to _fallback_safety_check whenever
+    # the primary attempt didn't produce a usable verdict, whether that's
+    # because _call_nemoguard's retries were exhausted (an NVIDIA-side
+    # outage) or because it returned something unparseable, both are cases
+    # where treating "no usable answer" as "fail closed" would refuse the
+    # message for a reason unrelated to whether it's actually unsafe.
+    try:
+        verdict = _direct_safety_check(raw_message)
+    except Exception as error:
+        logger.warning("NeMoGuard content-safety call failed after retries (%s), trying fallback classifier", error)
+        return _fallback_safety_check(raw_message)
+    if verdict is not None:
+        return verdict
+    logger.warning("safety classifier gave unparseable verdict, trying fallback classifier")
+    return _fallback_safety_check(raw_message)
 
 
 def check_safety(raw_message: str) -> bool:
@@ -250,15 +336,57 @@ def check_safety(raw_message: str) -> bool:
     # bounded by whichever of the two calls is slower, not their sum.
     with ThreadPoolExecutor(max_workers=2) as executor:
         colang_future = executor.submit(_colang_jailbreak_check, raw_message)
-        classifier_future = executor.submit(_direct_safety_check, raw_message)
+        classifier_future = executor.submit(_safety_classifier_verdict, raw_message)
         jailbreak_detected = colang_future.result()
         verdict = classifier_future.result()
 
     if jailbreak_detected:
         return False
     if verdict is None:
-        logger.warning("safety classifier gave unparseable verdict, failing closed")
+        logger.warning("both safety classifiers gave no usable verdict, failing closed")
         return False
+    return verdict
+
+
+def _fallback_topic_check(standalone_question: str) -> bool | None:
+    # Used only when the dedicated NeMoGuard topic-control model itself
+    # errors after _call_nemoguard's retries are exhausted — an NVIDIA-side
+    # outage on that specific hosted model, not this classifier having
+    # judged the question off-topic. Failing every question closed for the
+    # duration of an unrelated infra outage makes the whole app unusable,
+    # so this falls back to the same generate_planner chain (NIM gpt-oss ->
+    # Groq gpt-oss) that fronted this exact judgment before NeMoGuard
+    # existed (see the module docstring above check_topic). It's not
+    # NeMoGuard's purpose-tuned calibration, a general instruction-
+    # following model reading the same policy prompt is a genuinely
+    # lower-confidence topic judgment, but it's a real judgment rather than
+    # a blanket refusal, and it only ever runs when the primary classifier
+    # is already down.
+    # Extra instruction appended only here, not in TOPIC_POLICY_PROMPT
+    # itself: NeMoGuard was tuned to answer with just the verdict word
+    # without needing to be told twice, a general model benefits from the
+    # explicit reminder not to reason out loud first.
+    fallback_instruction = (
+        "\n\nRespond with only the single word \"on-topic\" or \"off-topic\" and nothing else."
+    )
+    try:
+        # max_tokens well above the primary check's 20: a response that
+        # gets truncated mid-reasoning never reaches a verdict at all, no
+        # matter how the parser looks for one.
+        result = generate_planner(
+            [
+                {"role": "system", "content": TOPIC_POLICY_PROMPT + fallback_instruction},
+                {"role": "user", "content": standalone_question},
+            ],
+            temperature=0.0,
+            max_tokens=300,
+        )
+    except Exception as error:
+        logger.warning("topic gate fallback classifier also failed: %s", error)
+        return None
+    verdict = _parse_binary_verdict(result.content, true_word="on-topic", false_word="off-topic")
+    if verdict is None:
+        logger.warning("topic gate fallback classifier raw response: %r", result.content)
     return verdict
 
 
@@ -272,23 +400,34 @@ def check_topic(standalone_question: str) -> bool:
     # through Colang's general-response flow, and got answered directly
     # instead of refused. NeMoGuard's topic-control model is purpose-tuned
     # for exactly this open-ended judgment, called directly against
-    # nim_client (no failover chain — see module docstring above).
-    response = _call_nemoguard(
-        model=settings.nemoguard_topic_model,
-        messages=[
-            {"role": "system", "content": TOPIC_POLICY_PROMPT},
-            {"role": "user", "content": standalone_question},
-        ],
-        max_tokens=20,
-        role="topic_gate",
-    )
-    raw = response.choices[0].message.content or ""
-    logger.info("topic gate raw response: %r", raw)
-    verdict = _parse_binary_verdict(raw, true_word="on-topic", false_word="off-topic")
-    if verdict is None:
-        logger.warning("topic gate got unparseable verdict %r, failing closed", raw)
+    # nim_client (no failover chain — see module docstring above); if that
+    # call itself fails (not a verdict, an actual outage), check_topic
+    # falls back to _fallback_topic_check rather than treating an NVIDIA
+    # infra crash as a genuine off-topic classification.
+    try:
+        response = _call_nemoguard(
+            model=settings.nemoguard_topic_model,
+            messages=[
+                {"role": "system", "content": TOPIC_POLICY_PROMPT},
+                {"role": "user", "content": standalone_question},
+            ],
+            max_tokens=20,
+            role="topic_gate",
+        )
+        raw = response.choices[0].message.content or ""
+        logger.info("topic gate raw response: %r", raw)
+        verdict = _parse_binary_verdict(raw, true_word="on-topic", false_word="off-topic")
+        if verdict is not None:
+            return verdict
+        logger.warning("topic gate got unparseable verdict %r, trying fallback classifier", raw)
+    except Exception as error:
+        logger.warning("topic gate's NeMoGuard call failed after retries (%s), trying fallback classifier", error)
+
+    fallback_verdict = _fallback_topic_check(standalone_question)
+    if fallback_verdict is None:
+        logger.warning("topic gate fallback classifier also gave no usable verdict, failing closed")
         return False
-    return verdict
+    return fallback_verdict
 
 
 def safety_gate(raw_message: str) -> tuple[bool, str | None]:

@@ -151,17 +151,11 @@ code, .mono { font-family: var(--font-mono); }
 
 /* --- masthead ---
    Centered, narrower than the full content column so it reads as a
-   deliberate hero rather than a stretched banner; the wordmark ties the
-   title back to the admission-gate idea (a small gate shape, not a
-   literal Kubernetes logo) instead of sitting there as pure decoration. */
+   deliberate hero rather than a stretched banner. */
 .app-header {
     display: flex; flex-direction: column; align-items: center; text-align: center;
     max-width: 640px; margin: 0 auto 1.6rem auto;
     padding: 0 0 1.6rem 0; border-bottom: 1px solid var(--border);
-}
-.app-header .wordmark {
-    width: 40px; height: 40px; margin-bottom: 0.9rem;
-    display: flex; align-items: center; justify-content: center;
 }
 .app-header .title-block h1 {
     margin: 0; font-family: var(--font-display); font-size: 2.3rem;
@@ -387,13 +381,6 @@ if not prompt and st.session_state.pending_prompt:
 st.markdown(
     """
     <div class="app-header">
-        <div class="wordmark">
-            <svg viewBox="0 0 40 40" width="40" height="40" fill="none" xmlns="http://www.w3.org/2000/svg">
-                <rect x="3" y="3" width="34" height="34" rx="9" stroke="#2E56D9" stroke-width="2.5"/>
-                <path d="M13 20.5L18 25.5L27.5 15" stroke="#2E56D9" stroke-width="2.5"
-                      stroke-linecap="round" stroke-linejoin="round"/>
-            </svg>
-        </div>
         <div class="title-block">
             <h1>Kubernetes Q&amp;A</h1>
             <div class="tagline">Grounded Kubernetes answers from your own docs. Safety-checked,

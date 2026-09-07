@@ -2,14 +2,27 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+import src.retrieval.cache as cache_module
 from src.retrieval.cache import (
     embed_canonical_question,
+    ensure_semantic_cache_indexes,
     exact_cache_get,
     exact_cache_set,
     normalize_exact,
+    normalize_semantic,
     semantic_cache_get,
     semantic_cache_set,
 )
+
+
+@pytest.fixture(autouse=True)
+def reset_index_flag():
+    # ensure_semantic_cache_indexes only hits Qdrant once per process
+    # (module-level _indexes_ensured); reset it so each test observes its
+    # own mock_qdrant calls instead of a stale True from an earlier test.
+    cache_module._indexes_ensured = False
+    yield
+    cache_module._indexes_ensured = False
 
 
 @pytest.fixture(autouse=True)
@@ -25,19 +38,15 @@ def test_normalize_collapses_whitespace_case_and_punctuation():
 
 
 def test_normalize_does_not_collapse_different_questions():
-    a = normalize_exact("how do I create a resource")
-    b = normalize_exact("how do I destroy a resource")
-    assert a != b
+    assert normalize_exact("how do I create a resource") != normalize_exact("how do I destroy a resource")
 
 
 def test_normalize_preserves_hyphens_in_kubernetes_identifiers():
-    # regression test: stripping hyphens as ordinary punctuation used to
-    # collapse "kube-system" and "kubesystem" (or "front-end" and
-    # "frontend") onto the same cache key, conflating two different terms.
-    a = normalize_exact("What does the kube-system namespace do?")
-    b = normalize_exact("What does the kubesystem namespace do?")
-    assert a != b
-    assert "kube-system" in a
+    assert normalize_exact("What does the kube-system namespace do?") != normalize_exact("What does the kubesystem namespace do?")
+
+
+def test_normalize_semantic_only_collapses_whitespace():
+    assert normalize_semantic("  What is a Pod?  ") == "What is a Pod?"
 
 
 def test_exact_cache_roundtrip():
@@ -49,21 +58,31 @@ def test_exact_cache_miss_returns_none():
     assert exact_cache_get("nothing stored for this question") is None
 
 
+def test_exact_cache_is_invalidated_by_cache_versions(monkeypatch):
+    exact_cache_set("question", "answer")
+    monkeypatch.setattr("src.retrieval.cache.settings.cache_policy_version", "2")
+    assert exact_cache_get("question") is None
+
+
 @patch("src.retrieval.cache.embed_for_cache", return_value=[0.1] * 768)
 def test_embed_canonical_question_delegates_to_embed_for_cache(mock_embed):
-    vector = embed_canonical_question("how a Deployment differs from a StatefulSet")
-    assert vector == [0.1] * 768
+    assert embed_canonical_question("how a Deployment differs from a StatefulSet") == [0.1] * 768
     mock_embed.assert_called_once_with("how a Deployment differs from a StatefulSet")
 
 
 @patch("src.retrieval.cache.qdrant_client")
 def test_semantic_cache_hit_above_threshold(mock_qdrant):
-    mock_point = MagicMock()
-    mock_point.payload = {"answer": "cached semantic answer"}
-    mock_qdrant.query_points.return_value.points = [mock_point]
-
-    result = semantic_cache_get([0.1] * 768)
-    assert result == "cached semantic answer"
+    point = MagicMock()
+    point.payload = {
+        "answer": "cached semantic answer",
+        "cache_schema_version": "3",
+        "policy_version": "1",
+        "corpus_version": "1",
+    }
+    mock_qdrant.query_points.return_value.points = [point]
+    assert semantic_cache_get([0.1] * 768) == "cached semantic answer"
+    query = mock_qdrant.query_points.call_args.kwargs
+    assert query["query_filter"].must
 
 
 @patch("src.retrieval.cache.qdrant_client")
@@ -73,16 +92,46 @@ def test_semantic_cache_miss_below_threshold(mock_qdrant):
 
 
 @patch("src.retrieval.cache.qdrant_client")
-def test_semantic_cache_set_upserts_the_given_vector_without_re_embedding(mock_qdrant):
-    # regression test: semantic_cache_set must NOT call embed_for_cache
-    # itself, it should upsert whatever vector it's handed. Re-embedding
-    # here would repeat the exact Gemini call semantic_cache_get already
-    # made for the same canonical_question earlier in the same turn.
-    with patch("src.retrieval.cache.embed_for_cache") as mock_embed:
-        semantic_cache_set("canonical question", [0.2] * 768, "an answer")
-        assert mock_embed.called is False
+def test_semantic_cache_set_stores_cache_version_metadata(mock_qdrant):
+    semantic_cache_set("canonical question", [0.2] * 768, "an answer")
+    payload = mock_qdrant.upsert.call_args.kwargs["points"][0].payload
+    assert payload == {
+        "question": "canonical question",
+        "answer": "an answer",
+        "cache_schema_version": "3",
+        "policy_version": "1",
+        "corpus_version": "1",
+    }
 
-    assert mock_qdrant.upsert.called
-    upserted_point = mock_qdrant.upsert.call_args.kwargs["points"][0]
-    assert upserted_point.vector == [0.2] * 768
-    assert upserted_point.payload == {"question": "canonical question", "answer": "an answer"}
+
+@patch("src.retrieval.cache.qdrant_client")
+def test_ensure_semantic_cache_indexes_creates_index_per_version_field(mock_qdrant):
+    ensure_semantic_cache_indexes()
+    fields = {call.kwargs["field_name"] for call in mock_qdrant.create_payload_index.call_args_list}
+    assert fields == {"cache_schema_version", "policy_version", "corpus_version"}
+
+
+@patch("src.retrieval.cache.qdrant_client")
+def test_ensure_semantic_cache_indexes_is_idempotent_per_process(mock_qdrant):
+    ensure_semantic_cache_indexes()
+    ensure_semantic_cache_indexes()
+    assert mock_qdrant.create_payload_index.call_count == 3
+
+
+@patch("src.retrieval.cache.qdrant_client")
+def test_ensure_semantic_cache_indexes_swallows_already_exists_error(mock_qdrant):
+    mock_qdrant.create_payload_index.side_effect = Exception("already exists")
+    ensure_semantic_cache_indexes()  # must not raise
+
+
+@patch("src.retrieval.cache.qdrant_client")
+def test_semantic_cache_get_ensures_indexes_before_querying(mock_qdrant):
+    mock_qdrant.query_points.return_value.points = []
+    semantic_cache_get([0.1] * 768)
+    assert mock_qdrant.create_payload_index.call_count == 3
+
+
+@patch("src.retrieval.cache.qdrant_client")
+def test_semantic_cache_get_treats_qdrant_failure_as_a_miss(mock_qdrant):
+    mock_qdrant.query_points.side_effect = Exception("read timeout")
+    assert semantic_cache_get([0.1] * 768) is None

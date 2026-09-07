@@ -1,6 +1,8 @@
+import hashlib
 import logging
 import re
 
+import diskcache
 import numpy as np
 from google.genai import types
 from google.genai.errors import ClientError
@@ -10,15 +12,9 @@ from src.providers.clients import gemini_client
 from src.config import settings
 
 logger = logging.getLogger(__name__)
-
-# Gemini's embed_content endpoint accepts a batch of texts in a single
-# request, not just one. Looping one-call-per-text would cost N network
-# round-trips and N slices of a free-tier RPM budget instead of
-# ceil(N / EMBED_BATCH_SIZE). 100 is comfortably under Gemini's per-request
-# batch limit; lower it if that limit changes.
 EMBED_BATCH_SIZE = 100
-
 RETRY_DELAY_RE = re.compile(r"([\d.]+)\s*s")
+_embedding_cache = diskcache.Cache(".cache/embeddings")
 
 
 def _is_rate_limit_error(error: BaseException) -> bool:
@@ -26,10 +22,6 @@ def _is_rate_limit_error(error: BaseException) -> bool:
 
 
 def _extract_retry_delay_seconds(error: ClientError, default: float = 30.0) -> float:
-    # the API tells us exactly how long to wait (google.rpc.RetryInfo.retryDelay,
-    # e.g. "31s") — respecting that beats guessing with a fixed backoff schedule,
-    # too short and we just hit the same 429 again, too long and we wait
-    # longer than necessary.
     try:
         details = error.details.get("error", {}).get("details", [])
         for detail in details:
@@ -46,7 +38,7 @@ def _rate_limit_wait(retry_state) -> float:
     error = retry_state.outcome.exception()
     delay = _extract_retry_delay_seconds(error)
     logger.warning("Gemini embed_content rate limited, waiting %.0fs before retry", delay)
-    return delay + 1.0  # small buffer past the server's own estimate
+    return delay + 1.0
 
 
 @retry(
@@ -75,26 +67,44 @@ def _normalize(vector: list[float]) -> list[float]:
     return (array / norm).tolist()
 
 
+def _cache_key(text: str, task_type: str) -> str:
+    digest = hashlib.sha256(text.strip().encode("utf-8")).hexdigest()
+    return (
+        f"{settings.cache_schema_version}:embedding:{settings.gemini_embedding_model}:"
+        f"{settings.embedding_dim}:{task_type}:{digest}"
+    )
+
+
 def embed_texts(texts: list[str], task_type: str) -> list[list[float]]:
-    """task_type: RETRIEVAL_DOCUMENT for ingestion, RETRIEVAL_QUERY for queries,
-    SEMANTIC_SIMILARITY for cache lookups."""
     if not texts:
         return []
     for i, text in enumerate(texts):
         if not text or not text.strip():
-            # Gemini's embed_content rejects an empty string with an opaque
-            # "EmbedContentRequest.content contains an empty Part" 400,
-            # several frames deep inside a tenacity retry stack. Failing
-            # here instead, right next to whatever produced the empty
-            # text, makes the actual bug traceable instead of just the
-            # symptom.
             raise ValueError(f"embed_texts received an empty string at index {i} (task_type={task_type})")
 
-    vectors: list[list[float]] = []
-    for start in range(0, len(texts), EMBED_BATCH_SIZE):
-        batch = texts[start : start + EMBED_BATCH_SIZE]
-        vectors.extend(_embed_batch(batch, task_type))
-    return vectors
+    vectors: list[list[float] | None] = [None] * len(texts)
+    misses: list[tuple[int, str]] = []
+    for i, text in enumerate(texts):
+        cached = _embedding_cache.get(_cache_key(text, task_type))
+        if cached is None:
+            misses.append((i, text))
+        else:
+            vectors[i] = cached
+
+    for start in range(0, len(misses), EMBED_BATCH_SIZE):
+        batch_pairs = misses[start : start + EMBED_BATCH_SIZE]
+        batch_vectors = _embed_batch([text for _, text in batch_pairs], task_type)
+        if len(batch_vectors) != len(batch_pairs):
+            raise RuntimeError(f"Gemini returned {len(batch_vectors)} embeddings for {len(batch_pairs)} inputs")
+        for (index, text), vector in zip(batch_pairs, batch_vectors):
+            vectors[index] = vector
+            _embedding_cache.set(
+                _cache_key(text, task_type),
+                vector,
+                expire=settings.embedding_cache_ttl_seconds,
+            )
+
+    return [vector for vector in vectors if vector is not None]
 
 
 def embed_query(text: str) -> list[float]:

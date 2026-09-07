@@ -23,7 +23,6 @@ import streamlit as st
 from src.providers.clients import qdrant_client
 from src.config import settings
 from src.graph import run_turn
-from src.guardrails import preload as preload_guardrails
 from src.retrieval.rerank import preload as preload_rerank
 
 logger = logging.getLogger(__name__)
@@ -31,21 +30,10 @@ logger = logging.getLogger(__name__)
 st.set_page_config(page_title="Kubernetes RAG", page_icon="◧", layout="centered")
 
 
-@st.cache_resource(show_spinner="Warming up safety and rerank models (one-time, first load only)…")
+@st.cache_resource(show_spinner="Warming up the local reranker (one-time, first load only)…")
 def _warm_up_models() -> bool:
-    # NeMo Guardrails' Colang flow matcher and FlashRank's cross-encoder are
-    # both lazily built on first use by default (see their preload()
-    # docstrings in src/guardrails/gates.py and src/retrieval/rerank.py),
-    # deliberately so, since a process that never runs a real turn (tests,
-    # ingest.py) shouldn't pay for either. This app always needs both, so
-    # force them to build now, during page load with its own spinner,
-    # rather than silently inside the first user question's latency.
-    # st.cache_resource makes this run exactly once per server process,
-    # shared across every session, not once per rerun.
-    preload_guardrails()
     preload_rerank()
     return True
-
 
 _warm_up_models()
 
@@ -350,9 +338,9 @@ PROVIDERS = [
 ]
 
 PIPELINE_STAGES = [
+    {"label": "Cache", "desc": "fast exact + semantic lookup"},
     {"label": "Safety", "desc": "blocks unsafe content"},
     {"label": "Topic", "desc": "blocks off-topic questions"},
-    {"label": "Cache", "desc": "exact + semantic lookup"},
     {"label": "Retrieve", "desc": "dense vector search"},
     {"label": "Rerank", "desc": "cross-encoder relevance gate"},
     {"label": "Generate", "desc": "grounded answer"},
@@ -450,17 +438,17 @@ with st.sidebar:
 # ---------- pipeline trace ----------
 
 def build_trace_conditions(details: dict) -> list[dict]:
-    """Mirrors the actual LangGraph routing in src/graph.py, so what's shown
-    here is the real path this specific turn took, not a generic summary.
-    Each stage is either True (passed), False (blocked/failed), or None
-    (skipped without blocking, e.g. a cache miss). build_trace_nodes below
-    maps this onto the fixed 6-stage sequence for the diagram."""
     if details.get("error"):
         return [{"type": "Pipeline", "status": False, "message": "error"}]
 
-    conditions = []
     blocked_stage = details.get("blocked_stage")
+    cache_layer = details.get("cache_layer")
+    cache_checked = details.get("exact_cache_checked", False)
 
+    if cache_layer == "exact":
+        return [{"type": "Cache", "status": True, "message": "exact hit"}]
+
+    conditions = []
     if blocked_stage == "safety":
         conditions.append({"type": "Safety", "status": False, "message": "blocked"})
         return conditions
@@ -471,15 +459,13 @@ def build_trace_conditions(details: dict) -> list[dict]:
         return conditions
     conditions.append({"type": "Topic", "status": True, "message": "on-topic"})
 
-    cache_layer = details.get("cache_layer")
-    if cache_layer:
-        conditions.append({"type": "Cache", "status": True, "message": f"{cache_layer} hit"})
+    if cache_layer == "semantic":
+        conditions.append({"type": "Cache", "status": True, "message": "semantic hit"})
         return conditions
-    conditions.append({"type": "Cache", "status": None, "message": "miss"})
+    conditions.append({"type": "Cache", "status": None, "message": "miss" if cache_checked else "lookup"})
 
     candidates_count = details.get("candidates_count", 0)
     conditions.append({"type": "Retrieve", "status": True, "message": f"{candidates_count} found"})
-
     reranked_count = details.get("reranked_count", 0)
     if reranked_count == 0:
         conditions.append({"type": "Rerank", "status": False, "message": "0 survived"})
@@ -491,41 +477,19 @@ def build_trace_conditions(details: dict) -> list[dict]:
     if provider:
         message = f"{provider} ({model})" if model else provider
         conditions.append({"type": "Generate", "status": True, "message": message})
-
     return conditions
 
 
 def build_trace_nodes(details: dict) -> list[dict]:
-    """Maps build_trace_conditions' real per-turn outcome onto the fixed
-    6-stage order PIPELINE_STAGES uses for the static "How this works"
-    diagram, so the live trace uses the same node-and-arrow visual
-    language, but only for stages that actually ran: the list stops at
-    whichever stage blocked the request or resolved it (a cache hit), it
-    doesn't pad the rest of the sequence out with placeholder cards for
-    stages the request never reached, since there's nothing informative in
-    a placeholder for something that simply didn't happen. Each returned
-    stage is 'pass' (green) or 'fail' (red, always the last node, since a
-    failing stage stops the request there), except Cache, which can also
-    be 'skip' (amber: a miss that isn't a failure, the request just
-    continues to Retrieve)."""
     conditions = build_trace_conditions(details)
-    condition_by_type = {condition["type"]: condition for condition in conditions}
     nodes = []
-    for stage in PIPELINE_STAGES:
-        condition = condition_by_type.get(stage["label"])
-        if condition is None:
-            break
-        if condition["status"] is False:
-            nodes.append({"label": stage["label"], "status": "fail", "message": condition["message"]})
-            break
-        if condition["status"] is None:
-            nodes.append({"label": stage["label"], "status": "skip", "message": condition["message"]})
-            continue
-        nodes.append({"label": stage["label"], "status": "pass", "message": condition["message"]})
-        if stage["label"] == "Cache" and "hit" in condition["message"]:
-            # a cache hit resolves the whole turn right there, nothing
-            # after it ran, so the diagram ends here too
-            break
+    for condition in conditions:
+        status = condition["status"]
+        nodes.append({
+            "label": condition["type"],
+            "status": "fail" if status is False else "skip" if status is None else "pass",
+            "message": condition["message"],
+        })
     return nodes
 
 
@@ -661,6 +625,7 @@ if prompt:
             details = {
                 "blocked_stage": result.get("blocked_stage"),
                 "cache_layer": result.get("cache_layer"),
+                "exact_cache_checked": result.get("exact_cache_checked"),
                 "provider": result.get("provider"),
                 "model": result.get("model"),
                 "candidates_count": len(result.get("candidates") or []),

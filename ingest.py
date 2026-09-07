@@ -14,6 +14,7 @@ from src.config import settings
 from src.retrieval.embeddings import embed_texts
 from src.ingestion.filters import is_relevant
 from src.ingestion.parsers import PARSERS, parse_file
+from src.retrieval.cache import ensure_semantic_cache_indexes
 from src.tracing import node_span
 
 logger = logging.getLogger(__name__)
@@ -83,6 +84,11 @@ def ensure_collection(wipe: bool = False) -> None:
             collection_name=settings.qdrant_cache_collection,
             vectors_config=VectorParams(size=settings.embedding_dim, distance=Distance.COSINE),
         )
+    # payload index for cache_schema_version/policy_version/corpus_version,
+    # required for the version filter in src/retrieval/cache.py's
+    # semantic_cache_get/set. Idempotent, safe whether the collection was
+    # just created above or already existed from a previous run.
+    ensure_semantic_cache_indexes()
 
 
 def _wipe_exact_cache() -> None:

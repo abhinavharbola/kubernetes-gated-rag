@@ -1,5 +1,6 @@
 import logging
 import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import TypedDict
 
 from langgraph.graph import StateGraph, START, END
@@ -8,6 +9,7 @@ from src.retrieval.cache import (
     embed_canonical_question,
     exact_cache_get,
     exact_cache_set,
+    normalize_semantic,
     semantic_cache_get,
     semantic_cache_set,
 )
@@ -25,15 +27,13 @@ NO_CONTEXT_MESSAGE = (
     "a specific resource, provider, or module."
 )
 
-# shared with eval/run_eval.py's _generate_answer, which needs to score
-# generation quality against the exact prompt production actually uses —
-# duplicating this string there would let the eval harness silently drift
-# out of sync with what live traffic is graded against.
 ANSWER_SYSTEM_PROMPT = (
     "Answer the Kubernetes question using ONLY the provided context. "
     "If the context doesn't fully cover the question, say what's missing "
     "rather than guessing."
 )
+
+_cache_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="cache-writer")
 
 
 class GraphState(TypedDict, total=False):
@@ -49,14 +49,41 @@ class GraphState(TypedDict, total=False):
     provider: str | None
     model: str | None
     cache_layer: str | None
+    exact_cache_checked: bool
     candidates: list[dict]
     reranked: list[dict]
     latency_seconds: float | None
 
 
+def _log_background_failure(future) -> None:
+    try:
+        future.result()
+    except Exception:
+        logger.exception("background cache write failed")
+
+
+def _submit_cache_write(fn, *args, **kwargs) -> None:
+    future = _cache_executor.submit(fn, *args, **kwargs)
+    future.add_done_callback(_log_background_failure)
+
+
+def exact_cache_node(state: GraphState) -> GraphState:
+    with node_span("exact_cache_check"):
+        if state.get("chat_history"):
+            return {"exact_cache_checked": False}
+        cached = exact_cache_get(state["raw_message"])
+        log_cache_decision("exact", hit=cached is not None)
+        if cached is not None:
+            return {
+                "answer": cached,
+                "cache_layer": "exact",
+                "exact_cache_checked": True,
+                "standalone_question": state["raw_message"],
+            }
+        return {"exact_cache_checked": True, "standalone_question": state["raw_message"]}
+
+
 def safety_gate_node(state: GraphState) -> GraphState:
-    # runs on the raw message, before the rewrite step, so a jailbreak attempt
-    # is rejected before it costs a planner call.
     with node_span("safety_gate"):
         allowed, reason = safety_gate(state["raw_message"])
         return {"allowed": allowed, "refusal_reason": reason, "blocked_stage": None if allowed else "safety"}
@@ -64,9 +91,7 @@ def safety_gate_node(state: GraphState) -> GraphState:
 
 def rewrite_with_history_node(state: GraphState) -> GraphState:
     with node_span("rewrite_with_history"):
-        if not state.get("chat_history"):
-            return {"standalone_question": state["raw_message"]}
-        history_text = "\n".join(f"{m['role']}: {m['content']}" for m in state["chat_history"])
+        history_text = "\n".join(f"{m['role']}: {m['content']}" for m in state.get("chat_history", []))
         result = generate_planner(
             [
                 {
@@ -74,88 +99,45 @@ def rewrite_with_history_node(state: GraphState) -> GraphState:
                     "content": "Rewrite the user's latest message as a standalone question. "
                     "Only use chat history to resolve pronouns, ellipsis, or implicit references "
                     "the latest message depends on. If the latest message is already self-contained, "
-                    "return it unchanged or with only minor grammatical cleanup: do not broaden it with "
-                    "topics, details, or scope from earlier turns that this message didn't ask about. "
-                    "If the latest message introduces a subject unrelated to the conversation so far, "
-                    "treat it as self-contained and do not merge it with earlier context to make it read "
-                    "as more related than it is, the downstream topic check needs to see the question as "
-                    "actually asked, not a version reframed to look more on-topic. Preserve intent "
-                    "exactly. Return only the rewritten question.",
+                    "return it unchanged or with only minor grammatical cleanup. Preserve intent exactly. "
+                    "Return only the rewritten question.",
                 },
                 {"role": "user", "content": f"History:\n{history_text}\n\nLatest: {state['raw_message']}"},
-            ]
+            ],
+            timeout_seconds=settings.planner_timeout_seconds,
         )
-        standalone = result.content.strip()
-        if not standalone:
-            logger.warning(
-                "rewrite_with_history got an empty response from %s (%s), falling back to raw_message",
-                result.provider,
-                result.model,
-            )
-            standalone = state["raw_message"]
+        standalone = result.content.strip() or state["raw_message"]
         return {"standalone_question": standalone}
 
 
+def late_exact_cache_node(state: GraphState) -> GraphState:
+    with node_span("late_exact_cache_check"):
+        if not state.get("chat_history"):
+            return {}
+        cached = exact_cache_get(state["standalone_question"])
+        log_cache_decision("exact", hit=cached is not None)
+        if cached is not None:
+            return {"answer": cached, "cache_layer": "exact", "exact_cache_checked": True}
+        return {"exact_cache_checked": True}
+
+
 def topic_gate_node(state: GraphState) -> GraphState:
-    # runs on the rewritten standalone question, so context-dependent follow-ups
-    # aren't misjudged as off-topic.
     with node_span("topic_gate"):
         allowed, reason = topic_gate(state["standalone_question"])
         return {"allowed": allowed, "refusal_reason": reason, "blocked_stage": None if allowed else "topic"}
 
 
-def exact_cache_node(state: GraphState) -> GraphState:
-    with node_span("exact_cache_check"):
-        cached = exact_cache_get(state["standalone_question"])
-        log_cache_decision("exact", hit=cached is not None)
-        if cached:
-            return {"answer": cached, "cache_layer": "exact"}
-        return {}
-
-
 def canonicalize_node(state: GraphState) -> GraphState:
     with node_span("canonicalize_question"):
-        result = generate_planner(
-            [
-                {
-                    "role": "system",
-                    "content": "Normalize the phrasing of this Kubernetes question into a consistent "
-                    "canonical form, so that different phrasings asking the same thing (e.g. 'what is X', "
-                    "'tell me about X', 'explain X') produce the same canonical question. Preserve the "
-                    "specific topic and scope exactly as asked, do not add or remove details, and do not "
-                    "collapse distinct actions (create/destroy/update/read) into each other. Return only "
-                    "the normalized question.",
-                },
-                {"role": "user", "content": state["standalone_question"]},
-            ]
-        )
-        canonical = result.content.strip()
-        if not canonical:
-            # small/fast planner models occasionally return an empty
-            # completion for an otherwise well-formed request. There's
-            # nothing to normalize in that case — fall back to the
-            # standalone question rather than letting an empty string
-            # reach embed_canonical_question, which Gemini's embed_content
-            # rejects outright with an opaque 400 (empty Part) error deep
-            # in a retry stack, not this call site.
-            logger.warning(
-                "canonicalize_question got an empty response from %s (%s), falling back to standalone_question",
-                result.provider,
-                result.model,
-            )
-            canonical = state["standalone_question"]
-        return {"canonical_question": canonical}
+        return {"canonical_question": normalize_semantic(state["standalone_question"])}
 
 
 def semantic_cache_node(state: GraphState) -> GraphState:
     with node_span("semantic_cache_check"):
-        # computed once here and carried in state; write_caches_node reuses
-        # this same vector on a miss instead of re-embedding the identical
-        # canonical_question text a second time.
         vector = embed_canonical_question(state["canonical_question"])
         cached = semantic_cache_get(vector)
         log_cache_decision("semantic", hit=cached is not None)
-        if cached:
+        if cached is not None:
             return {"answer": cached, "cache_layer": "semantic", "canonical_question_vector": vector}
         return {"canonical_question_vector": vector}
 
@@ -186,21 +168,20 @@ def generate_node(state: GraphState) -> GraphState:
 
 def write_caches_node(state: GraphState) -> GraphState:
     with node_span("write_caches"):
-        exact_cache_set(state["standalone_question"], state["answer"])
-        # reuses the vector computed in semantic_cache_node rather than
-        # calling embed_canonical_question again for the same text.
-        semantic_cache_set(state["canonical_question"], state["canonical_question_vector"], state["answer"])
+        _submit_cache_write(exact_cache_set, state["standalone_question"], state["answer"])
+        _submit_cache_write(
+            semantic_cache_set,
+            state["canonical_question"],
+            state["canonical_question_vector"],
+            state["answer"],
+        )
         return {}
 
 
 def cache_no_context_node(state: GraphState) -> GraphState:
-    # zero reranked survivors means there's no grounded documentation for
-    # this question right now. That's cached too (exact-match only, with a
-    # TTL rather than forever) so a repeated identical question doesn't
-    # re-pay embedding + retrieval + rerank for an answer that won't change
-    # until the corpus does, while still expiring if the corpus is updated.
     with node_span("cache_no_context"):
-        exact_cache_set(
+        _submit_cache_write(
+            exact_cache_set,
             state["standalone_question"],
             NO_CONTEXT_MESSAGE,
             expire=settings.no_context_cache_ttl_seconds,
@@ -208,16 +189,24 @@ def cache_no_context_node(state: GraphState) -> GraphState:
         return {"answer": NO_CONTEXT_MESSAGE}
 
 
+def route_after_exact_cache(state: GraphState) -> str:
+    return END if state.get("cache_layer") == "exact" else "safety_gate"
+
+
 def route_after_safety_gate(state: GraphState) -> str:
-    return "rewrite_with_history" if state["allowed"] else END
+    if not state["allowed"]:
+        return END
+    return "rewrite_with_history" if state.get("chat_history") else "topic_gate"
+
+
+def route_after_late_exact_cache(state: GraphState) -> str:
+    return END if state.get("cache_layer") == "exact" else "canonicalize_question"
 
 
 def route_after_topic_gate(state: GraphState) -> str:
-    return "exact_cache_check" if state["allowed"] else END
-
-
-def route_after_exact_cache(state: GraphState) -> str:
-    return END if state.get("cache_layer") == "exact" else "canonicalize_question"
+    if not state["allowed"]:
+        return END
+    return "late_exact_cache_check" if state.get("chat_history") else "canonicalize_question"
 
 
 def route_after_semantic_cache(state: GraphState) -> str:
@@ -230,11 +219,11 @@ def route_after_rerank(state: GraphState) -> str:
 
 def build_graph():
     graph = StateGraph(GraphState)
-
+    graph.add_node("exact_cache_check", exact_cache_node)
     graph.add_node("safety_gate", safety_gate_node)
     graph.add_node("rewrite_with_history", rewrite_with_history_node)
+    graph.add_node("late_exact_cache_check", late_exact_cache_node)
     graph.add_node("topic_gate", topic_gate_node)
-    graph.add_node("exact_cache_check", exact_cache_node)
     graph.add_node("canonicalize_question", canonicalize_node)
     graph.add_node("semantic_cache_check", semantic_cache_node)
     graph.add_node("retrieve", retrieve_node)
@@ -243,23 +232,22 @@ def build_graph():
     graph.add_node("write_caches", write_caches_node)
     graph.add_node("cache_no_context", cache_no_context_node)
 
-    graph.add_edge(START, "safety_gate")
+    graph.add_edge(START, "exact_cache_check")
+    graph.add_conditional_edges("exact_cache_check", route_after_exact_cache)
     graph.add_conditional_edges("safety_gate", route_after_safety_gate)
     graph.add_edge("rewrite_with_history", "topic_gate")
     graph.add_conditional_edges("topic_gate", route_after_topic_gate)
-    graph.add_conditional_edges("exact_cache_check", route_after_exact_cache)
+    graph.add_conditional_edges("late_exact_cache_check", route_after_late_exact_cache)
     graph.add_edge("canonicalize_question", "semantic_cache_check")
     graph.add_conditional_edges("semantic_cache_check", route_after_semantic_cache)
-    graph.add_conditional_edges("rerank_and_gate", route_after_rerank)
     graph.add_edge("retrieve", "rerank_and_gate")
+    graph.add_conditional_edges("rerank_and_gate", route_after_rerank)
     graph.add_edge("generate", "write_caches")
     graph.add_edge("write_caches", END)
     graph.add_edge("cache_no_context", END)
-
     return graph.compile()
 
 
-# compiled once at import time, safe to reuse across every Streamlit rerun.
 compiled_graph = build_graph()
 
 

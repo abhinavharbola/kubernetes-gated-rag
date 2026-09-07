@@ -62,10 +62,11 @@ CUSTOM_CSS = """
    This is a Kubernetes Q&A tool built around admission-style gating: every
    question passes through checks before it's allowed to reach generation,
    the same way the API server runs admission webhooks on a request before
-   it's persisted. The trace panel is shaped like `kubectl describe`'s
-   Conditions table (TYPE / STATUS / MESSAGE, True or False) rather than an
-   invented metaphor, since that's the vocabulary this tool's own audience
-   already reads every day.
+   it's persisted. The live trace panel mirrors the same node-and-arrow
+   pipeline diagram used in "How this works", just colored by what
+   actually happened on this specific turn instead of a static overview,
+   so a person only has to learn one visual language for the pipeline,
+   not two.
 
    Light palette, deliberately not the cream/parchment default and not a
    plain white SaaS-card look: a cool, slightly blue-tinted gray canvas
@@ -451,9 +452,9 @@ with st.sidebar:
 def build_trace_conditions(details: dict) -> list[dict]:
     """Mirrors the actual LangGraph routing in src/graph.py, so what's shown
     here is the real path this specific turn took, not a generic summary.
-    Shaped like `kubectl describe`'s Conditions table: each stage is either
-    True (passed), False (blocked/failed), or unknown (skipped, e.g. a
-    cache miss, the equivalent of a condition that hasn't been evaluated)."""
+    Each stage is either True (passed), False (blocked/failed), or None
+    (skipped without blocking, e.g. a cache miss). build_trace_nodes below
+    maps this onto the fixed 6-stage sequence for the diagram."""
     if details.get("error"):
         return [{"type": "Pipeline", "status": False, "message": "error"}]
 

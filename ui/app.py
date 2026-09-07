@@ -56,7 +56,7 @@ PIPELINE_ERROR_MESSAGE = (
 
 CUSTOM_CSS = """
 <style>
-@import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500;600&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Sora:wght@500;600;700&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500;600&display=swap');
 
 /* --- Design system ---
    This is a Kubernetes Q&A tool built around admission-style gating: every
@@ -68,32 +68,32 @@ CUSTOM_CSS = """
    so a person only has to learn one visual language for the pipeline,
    not two.
 
-   Light palette, deliberately not the cream/parchment default and not a
-   plain white SaaS-card look: a cool, slightly blue-tinted gray canvas
-   with white panels raised on top of it, so depth comes from the
-   canvas/panel contrast plus a soft shadow rather than from borders alone.
-   Monospace is reserved for real data (paths, scores, provider names,
-   latency), not for decorative labels. */
+   Light palette, but a clearly gray-blue canvas rather than a near-white
+   one, panels are a soft off-white raised on top of it, not pure #FFF
+   either, so the page reads as a considered light workspace rather than
+   "everything is white". Monospace is reserved for real data (paths,
+   scores, provider names, latency), not for decorative labels. */
 :root {
-    --bg: #EBEEF3;
-    --panel: #FFFFFF;
-    --panel-raised: #F6F8FB;
-    --border: rgba(17, 24, 39, 0.09);
-    --border-strong: rgba(17, 24, 39, 0.16);
+    --bg: #D9DEE7;
+    --panel: #F9FAFC;
+    --panel-raised: #EFF2F6;
+    --border: rgba(17, 24, 39, 0.11);
+    --border-strong: rgba(17, 24, 39, 0.20);
     --text: #12151C;
-    --text-muted: #5B6472;
-    --text-faint: #8A93A3;
+    --text-muted: #565F70;
+    --text-faint: #838C9D;
     --blue: #2E56D9;
-    --blue-soft: rgba(46, 86, 217, 0.08);
+    --blue-soft: rgba(46, 86, 217, 0.09);
     --green: #157F45;
-    --green-soft: rgba(21, 127, 69, 0.10);
+    --green-soft: rgba(21, 127, 69, 0.11);
     --amber: #A8650A;
-    --amber-soft: rgba(168, 101, 10, 0.10);
+    --amber-soft: rgba(168, 101, 10, 0.11);
     --red: #C22E2E;
-    --red-soft: rgba(194, 46, 46, 0.09);
-    --shadow-sm: 0 1px 2px rgba(17, 24, 39, 0.04), 0 1px 1px rgba(17, 24, 39, 0.03);
-    --shadow-md: 0 4px 14px rgba(17, 24, 39, 0.07), 0 1px 2px rgba(17, 24, 39, 0.05);
-    --font-display: "Space Grotesk", "Segoe UI", sans-serif;
+    --red-soft: rgba(194, 46, 46, 0.10);
+    --shadow-sm: 0 1px 2px rgba(17, 24, 39, 0.06), 0 1px 1px rgba(17, 24, 39, 0.04);
+    --shadow-md: 0 4px 14px rgba(17, 24, 39, 0.10), 0 1px 2px rgba(17, 24, 39, 0.06);
+    --content-width: 820px;
+    --font-display: "Sora", "Segoe UI", sans-serif;
     --font-sans: "IBM Plex Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
     --font-mono: "IBM Plex Mono", "Fira Code", ui-monospace, monospace;
 }
@@ -120,7 +120,7 @@ code, .mono { font-family: var(--font-mono); }
     border: 1px solid var(--border-strong) !important;
     border-radius: 10px !important;
     box-shadow: var(--shadow-md) !important;
-    max-width: 760px !important;
+    max-width: var(--content-width) !important;
 }
 [data-testid="stChatInput"] textarea { color: var(--text) !important; }
 [data-testid="stChatInput"] textarea::placeholder { color: var(--text-faint) !important; }
@@ -141,21 +141,22 @@ code, .mono { font-family: var(--font-mono); }
 .stMarkdown, .stApp p, .stApp li { color: var(--text); }
 
 /* the "usable width" of centered layout is capped by Streamlit's own
-   block-container max-width (~730px); widen it so the diagram and example
-   grid have room to breathe instead of wrapping constantly. padding-top
-   must clear stHeader's own height (a fixed bar painted over the top of
-   the scrollable content, same bg color as the page above). */
+   block-container max-width (~730px); this is the one place the content
+   column's width is set — everything else (header, welcome block, chat
+   input) matches var(--content-width) instead of picking its own number,
+   so nothing in the main column reads as narrower or wider than anything
+   else. padding-top must clear stHeader's own height (a fixed bar painted
+   over the top of the scrollable content, same bg color as the page
+   above). */
 .block-container, [data-testid="stMainBlockContainer"] {
-    max-width: 980px !important;
+    max-width: var(--content-width) !important;
     padding-top: 3.5rem !important;
 }
 
-/* --- masthead ---
-   Centered, narrower than the full content column so it reads as a
-   deliberate hero rather than a stretched banner. */
+/* --- masthead --- */
 .app-header {
     display: flex; flex-direction: column; align-items: center; text-align: center;
-    max-width: 640px; margin: 0 auto 1.6rem auto;
+    margin: 0 auto 1.6rem auto;
     padding: 0 0 1.6rem 0; border-bottom: 1px solid var(--border);
 }
 .app-header .title-block h1 {
@@ -163,12 +164,11 @@ code, .mono { font-family: var(--font-mono); }
     font-weight: 700; letter-spacing: -0.01em; color: var(--text); line-height: 1.2;
 }
 .app-header .title-block .tagline {
-    color: var(--text-muted); font-size: 1rem; margin: 0.7rem auto 0 auto;
-    max-width: 460px; line-height: 1.6;
+    color: var(--text-muted); font-size: 1rem; margin: 0.7rem 0 0 0; line-height: 1.6;
 }
 
 /* --- welcome / onboarding --- */
-.st-key-welcome_block { max-width: 780px; margin: 0 auto 0.4rem auto; }
+.st-key-welcome_block { margin: 0 auto 0.4rem auto; }
 .st-key-welcome_block [data-testid="stExpander"] {
     border: 1px solid var(--border) !important; border-radius: 10px !important;
     box-shadow: var(--shadow-sm) !important; background: var(--panel) !important;
@@ -496,62 +496,62 @@ def build_trace_conditions(details: dict) -> list[dict]:
 
 
 def build_trace_nodes(details: dict) -> list[dict]:
-    """Maps build_trace_conditions' real per-turn outcome onto the same
-    fixed 6-stage sequence PIPELINE_STAGES uses for the static "How this
-    works" diagram, so the live trace renders as the same node-and-arrow
-    shape rather than a different visual language for what's conceptually
-    the same pipeline. Each stage is 'pass' (green), 'fail' (red, and the
-    request stopped there, everything after is 'unreached'), 'skip'
-    (amber, a non-blocking miss the request continued past, currently only
-    a cache miss), or 'unreached' (gray, either blocked at an earlier
-    stage or the turn was already resolved by a cache hit before this
-    stage ever ran)."""
+    """Maps build_trace_conditions' real per-turn outcome onto the fixed
+    6-stage order PIPELINE_STAGES uses for the static "How this works"
+    diagram, so the live trace uses the same node-and-arrow visual
+    language, but only for stages that actually ran: the list stops at
+    whichever stage blocked the request or resolved it (a cache hit), it
+    doesn't pad the rest of the sequence out with placeholder cards for
+    stages the request never reached, since there's nothing informative in
+    a placeholder for something that simply didn't happen. Each returned
+    stage is 'pass' (green) or 'fail' (red, always the last node, since a
+    failing stage stops the request there), except Cache, which can also
+    be 'skip' (amber: a miss that isn't a failure, the request just
+    continues to Retrieve)."""
     conditions = build_trace_conditions(details)
     condition_by_type = {condition["type"]: condition for condition in conditions}
     nodes = []
-    reachable = True
     for stage in PIPELINE_STAGES:
         condition = condition_by_type.get(stage["label"])
-        if condition is None or not reachable:
-            nodes.append({"label": stage["label"], "status": "unreached", "message": "not reached"})
-            continue
+        if condition is None:
+            break
         if condition["status"] is False:
             nodes.append({"label": stage["label"], "status": "fail", "message": condition["message"]})
-            reachable = False
-        elif condition["status"] is None:
+            break
+        if condition["status"] is None:
             nodes.append({"label": stage["label"], "status": "skip", "message": condition["message"]})
-        else:
-            nodes.append({"label": stage["label"], "status": "pass", "message": condition["message"]})
-            if stage["label"] == "Cache" and "hit" in condition["message"]:
-                # a cache hit resolves the whole turn right there, nothing
-                # after it ran, but that's a resolution, not a failure
-                reachable = False
+            continue
+        nodes.append({"label": stage["label"], "status": "pass", "message": condition["message"]})
+        if stage["label"] == "Cache" and "hit" in condition["message"]:
+            # a cache hit resolves the whole turn right there, nothing
+            # after it ran, so the diagram ends here too
+            break
     return nodes
 
 
 def render_trace(details: dict) -> None:
     nodes = build_trace_nodes(details)
-    badge_icon = {"pass": "&#10003;", "fail": "&#10005;", "skip": "~", "unreached": "&#9675;"}
-    node_html = ""
-    for i, node in enumerate(nodes):
-        node_html += (
-            f'<div class="trace-node status-{node["status"]}">'
-            f'<span class="trace-node-badge">{badge_icon[node["status"]]}</span>'
-            f'<span class="trace-node-title">{node["label"]}</span>'
-            f'<span class="trace-node-message">{node["message"]}</span>'
-            f"</div>"
+    if nodes:
+        badge_icon = {"pass": "&#10003;", "fail": "&#10005;", "skip": "~"}
+        node_html = ""
+        for i, node in enumerate(nodes):
+            node_html += (
+                f'<div class="trace-node status-{node["status"]}">'
+                f'<span class="trace-node-badge">{badge_icon[node["status"]]}</span>'
+                f'<span class="trace-node-title">{node["label"]}</span>'
+                f'<span class="trace-node-message">{node["message"]}</span>'
+                f"</div>"
+            )
+            if i < len(nodes) - 1:
+                node_html += '<div class="trace-arrow-live">&#8594;</div>'
+
+        latency = details.get("latency_seconds")
+        footer_html = f'<div class="trace-footer">{latency:.2f}s total</div>' if latency is not None else ""
+
+        st.markdown(
+            f'<div class="trace-diagram-wrap"><div class="trace-diagram">{node_html}</div></div>{footer_html}',
+            unsafe_allow_html=True,
         )
-        if i < len(nodes) - 1:
-            arrow_class = "trace-arrow-live unreached" if nodes[i + 1]["status"] == "unreached" else "trace-arrow-live"
-            node_html += f'<div class="{arrow_class}">&#8594;</div>'
-
-    latency = details.get("latency_seconds")
-    footer_html = f'<div class="trace-footer">{latency:.2f}s total</div>' if latency is not None else ""
-
-    st.markdown(
-        f'<div class="trace-diagram-wrap"><div class="trace-diagram">{node_html}</div></div>{footer_html}',
-        unsafe_allow_html=True,
-    )
 
     if details.get("error"):
         st.markdown(f'<div class="error-note">{PIPELINE_ERROR_MESSAGE}</div>', unsafe_allow_html=True)

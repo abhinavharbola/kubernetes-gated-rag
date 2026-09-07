@@ -36,6 +36,16 @@ class Settings(BaseSettings):
     # live on the hosted API as of this writing, and Meta's own model card
     # lists "query and prompt rewriting" as an intended use case, which
     # covers everything this chain is actually used for here.
+    # meta/llama-3.2-3b-instruct was also later retired from NVIDIA's
+    # hosted API catalog (same fate as meta/llama-3.1-8b-instruct before
+    # it). nvidia/nemotron-3-super-120b-a12b confirmed working via a real
+    # trace log ("served by nim (nvidia/nemotron-3-super-120b-a12b)")
+    # rather than another guess at a model string, it's NVIDIA's own
+    # model, not a third-party one they might deprecate on the same kind
+    # of schedule. It's a larger, reasoning-capable model rather than a
+    # small terse one, which is exactly why _parse_binary_verdict and
+    # _parse_safety_json were made more lenient elsewhere in this file,
+    # see their docstrings.
     nim_planner_model: str = "nvidia/nemotron-3-super-120b-a12b"
     groq_planner_model: str = "openai/gpt-oss-20b"
 
@@ -45,12 +55,27 @@ class Settings(BaseSettings):
     gemini_eval_judge_model: str = "gemini-3.5-flash"
 
     # safety/topic gates: purpose-built NeMoGuard classifiers, called
-    # directly against nim_client (see src/guardrails/gates.py), not routed
-    # through generate_planner's failover chain — NeMoGuard only exists on
-    # NIM, so there's nothing to fail over to; an error here fails closed
-    # like every other gate check.
+    # directly against nim_client (see src/guardrails/gates.py). NeMoGuard
+    # only exists on NIM, so a failed call retries and then falls back to
+    # generate_planner's chain rather than failing closed immediately, see
+    # _call_nemoguard's docstring in gates.py for why.
     nemoguard_topic_model: str = "nvidia/llama-3.1-nemoguard-8b-topic-control"
     nemoguard_safety_model: str = "nvidia/llama-3.1-nemoguard-8b-content-safety"
+
+    # When True, skip straight to the generate_planner fallback classifier
+    # instead of first attempting (and retrying 3x against) the NeMoGuard
+    # models above. Default False: NeMoGuard's purpose-tuned classifiers
+    # are the better judgment when they're healthy, so the normal path
+    # should still try them first. Flip this on only as a stopgap during a
+    # sustained NVIDIA-side outage on those specific hosted models (the
+    # symptom: every turn's log shows "topic gate's NeMoGuard call failed
+    # after retries" before it recovers via the fallback), paying ~9s of
+    # guaranteed-to-fail retries on every single turn while that endpoint
+    # is down is pure waste. Flip it back off once NVIDIA's instance
+    # recovers, since it means running on a lower-confidence classifier
+    # (see _fallback_topic_check's and _fallback_safety_check's docstrings
+    # in gates.py) for no reason once the primary is healthy again.
+    guardrail_skip_nemoguard: bool = False
 
     gemini_embedding_model: str = "gemini-embedding-001"
     embedding_dim: int = 768

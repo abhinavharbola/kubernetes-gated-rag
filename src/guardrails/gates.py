@@ -309,6 +309,9 @@ def _safety_classifier_verdict(raw_message: str) -> bool | None:
     # outage) or because it returned something unparseable, both are cases
     # where treating "no usable answer" as "fail closed" would refuse the
     # message for a reason unrelated to whether it's actually unsafe.
+    if settings.guardrail_skip_nemoguard:
+        logger.info("guardrail_skip_nemoguard is set, going straight to fallback classifier")
+        return _fallback_safety_check(raw_message)
     try:
         verdict = _direct_safety_check(raw_message)
     except Exception as error:
@@ -400,10 +403,16 @@ def check_topic(standalone_question: str) -> bool:
     # through Colang's general-response flow, and got answered directly
     # instead of refused. NeMoGuard's topic-control model is purpose-tuned
     # for exactly this open-ended judgment, called directly against
-    # nim_client (no failover chain — see module docstring above); if that
-    # call itself fails (not a verdict, an actual outage), check_topic
-    # falls back to _fallback_topic_check rather than treating an NVIDIA
-    # infra crash as a genuine off-topic classification.
+    # nim_client; if that call itself fails (not a verdict, an actual
+    # outage), check_topic falls back to _fallback_topic_check rather than
+    # treating an NVIDIA infra crash as a genuine off-topic classification.
+    if settings.guardrail_skip_nemoguard:
+        logger.info("guardrail_skip_nemoguard is set, going straight to fallback classifier")
+        fallback_verdict = _fallback_topic_check(standalone_question)
+        if fallback_verdict is None:
+            logger.warning("topic gate fallback classifier gave no usable verdict, failing closed")
+            return False
+        return fallback_verdict
     try:
         response = _call_nemoguard(
             model=settings.nemoguard_topic_model,

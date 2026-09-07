@@ -69,7 +69,7 @@ flowchart TD
 | Role | Model | Provider(s) | Notes |
 |---|---|---|---|
 | Main generation | `openai/gpt-oss-120b` (both Groq links, NIM) | Groq (account A) &rarr; Groq (account B) &rarr; NVIDIA NIM | retry-then-failover per link, transient errors only; the two Groq links are the same model on separate accounts, so a per-key rate cap doesn't immediately cost a hop to NIM's higher latency, NIM is still there for a genuine Groq-platform outage |
-| Planner (rewrite, canonicalize, ingestion relevance) | `meta/llama-3.2-3b-instruct` (NIM), `openai/gpt-oss-20b` (Groq) | NVIDIA NIM &rarr; Groq | reversed order from main generation on purpose; kept off the main generation model's rate budget entirely |
+| Planner (rewrite, canonicalize, ingestion relevance, guardrail fallback) | `nvidia/nemotron-3-super-120b-a12b` (NIM), `openai/gpt-oss-20b` (Groq) | NVIDIA NIM &rarr; Groq | reversed order from main generation on purpose; kept off the main generation model's rate budget entirely |
 | Safety / topic classification | NeMoGuard content-safety, NeMoGuard topic-control | NVIDIA NIM only, no fallback (fails closed) | called directly, not through the planner chain, see Guardrails |
 | Jailbreak detection | Colang few-shot flow | Groq-backed, no fallback (fails closed) | pattern matching suits jailbreak-shaped attempts specifically, runs concurrently with the NeMoGuard safety check above |
 | Embeddings | `gemini-embedding-001`, truncated to 768 dims | Google Gemini, no fallback | GA, free tier, 768 dims keeps Qdrant storage well under free-tier limits |

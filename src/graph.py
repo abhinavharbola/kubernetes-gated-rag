@@ -92,20 +92,33 @@ def safety_gate_node(state: GraphState) -> GraphState:
 def rewrite_with_history_node(state: GraphState) -> GraphState:
     with node_span("rewrite_with_history"):
         history_text = "\n".join(f"{m['role']}: {m['content']}" for m in state.get("chat_history", []))
-        result = generate_planner(
-            [
-                {
-                    "role": "system",
-                    "content": "Rewrite the user's latest message as a standalone question. "
-                    "Only use chat history to resolve pronouns, ellipsis, or implicit references "
-                    "the latest message depends on. If the latest message is already self-contained, "
-                    "return it unchanged or with only minor grammatical cleanup. Preserve intent exactly. "
-                    "Return only the rewritten question.",
-                },
-                {"role": "user", "content": f"History:\n{history_text}\n\nLatest: {state['raw_message']}"},
-            ],
-            timeout_seconds=settings.planner_timeout_seconds,
-        )
+        try:
+            result = generate_planner(
+                [
+                    {
+                        "role": "system",
+                        "content": "Rewrite the user's latest message as a standalone question. "
+                        "Only use chat history to resolve pronouns, ellipsis, or implicit references "
+                        "the latest message depends on. If the latest message is already self-contained, "
+                        "return it unchanged or with only minor grammatical cleanup. Preserve intent exactly. "
+                        "Return only the rewritten question.",
+                    },
+                    {"role": "user", "content": f"History:\n{history_text}\n\nLatest: {state['raw_message']}"},
+                ],
+                timeout_seconds=settings.planner_timeout_seconds,
+            )
+        except Exception as error:
+            # Every provider in the planner chain is down. Losing the whole
+            # turn here isn't necessary — treating the raw message as
+            # already self-contained is exactly what the prompt above tells
+            # a healthy rewrite call to do anyway when nothing needs
+            # resolving, so it's a safe degrade, not a wrong answer, for the
+            # (common) case where the latest message didn't actually need
+            # history to understand. It's only wrong for messages that
+            # genuinely depend on unresolved pronouns/ellipsis, which is a
+            # narrower failure than crashing every turn during an outage.
+            logger.warning("rewrite_with_history failed, using raw message as-is: %s", error)
+            return {"standalone_question": state["raw_message"]}
         standalone = result.content.strip() or state["raw_message"]
         return {"standalone_question": standalone}
 
@@ -134,7 +147,16 @@ def canonicalize_node(state: GraphState) -> GraphState:
 
 def semantic_cache_node(state: GraphState) -> GraphState:
     with node_span("semantic_cache_check"):
-        vector = embed_canonical_question(state["canonical_question"])
+        # Gemini's embed call had no failure handling here — unlike
+        # retrieve()'s identical call in search.py, this one crashed the
+        # whole turn (caught only by ui/app.py's generic top-level handler)
+        # instead of degrading to a cache miss the way every other read on
+        # this path now does.
+        try:
+            vector = embed_canonical_question(state["canonical_question"])
+        except Exception as error:
+            logger.error("semantic cache embedding failed, treating as a miss: %s", error)
+            return {"canonical_question_vector": None}
         cached = semantic_cache_get(vector)
         log_cache_decision("semantic", hit=cached is not None)
         if cached is not None:
@@ -169,12 +191,17 @@ def generate_node(state: GraphState) -> GraphState:
 def write_caches_node(state: GraphState) -> GraphState:
     with node_span("write_caches"):
         _submit_cache_write(exact_cache_set, state["standalone_question"], state["answer"])
-        _submit_cache_write(
-            semantic_cache_set,
-            state["canonical_question"],
-            state["canonical_question_vector"],
-            state["answer"],
-        )
+        # vector is None when semantic_cache_node's embedding call failed —
+        # nothing to key a semantic-cache point on, and Qdrant upsert needs
+        # a real vector, so skip it rather than writing garbage. The exact
+        # cache write above still happens either way.
+        if state.get("canonical_question_vector") is not None:
+            _submit_cache_write(
+                semantic_cache_set,
+                state["canonical_question"],
+                state["canonical_question_vector"],
+                state["answer"],
+            )
         return {}
 
 

@@ -3,12 +3,24 @@ from dataclasses import dataclass
 
 from openai import OpenAI, APITimeoutError, APIConnectionError, InternalServerError, RateLimitError
 
+from src.providers.circuit_breaker import CircuitBreaker
 from src.providers.clients import nim_client, groq_client, groq_client_secondary
 from src.config import settings
 from src.tracing import provider_call_span
 
 logger = logging.getLogger(__name__)
 RETRYABLE = (APITimeoutError, RateLimitError, APIConnectionError, InternalServerError)
+
+# One breaker per provider name, shared across generate_main's and
+# generate_planner's chains (both hit "nim", one hop apart) — a provider
+# outage discovered by either chain is remembered for both, rather than
+# each independently re-paying the full timeout to rediscover it. Separate
+# from gates.py's guardrail breakers, which only cover the two dedicated
+# NeMoGuard classifier calls, not the general chat-completion providers.
+_provider_breakers = {
+    name: CircuitBreaker(settings.provider_circuit_failure_threshold, settings.provider_circuit_recovery_seconds)
+    for name in ("nim", "groq", "groq-secondary")
+}
 
 
 @dataclass
@@ -70,15 +82,30 @@ def _openai_link(
 
 
 def _run_chain(chain: list[dict]) -> CompletionResult:
+    last_error: Exception | None = None
     for i, link in enumerate(chain):
+        is_last = i == len(chain) - 1
+        breaker = _provider_breakers.get(link["name"])
+        # Skip a link whose breaker is open without even attempting the
+        # call — but never skip the last remaining link, or a chain whose
+        # every provider is currently marked down would fail instantly with
+        # no real attempt at all, which is worse than trying once.
+        if breaker is not None and not is_last and not breaker.allow():
+            logger.warning("%s circuit open, skipping straight to %s", link["name"], chain[i + 1]["name"])
+            continue
         try:
             content = link["call"]()
             logger.info("served by %s (%s)", link["name"], link["model"])
+            if breaker is not None:
+                breaker.record_success()
             return CompletionResult(content=content, provider=link["name"], model=link["model"])
         except Exception as error:
+            last_error = error
             if not link["is_transient"](error):
                 raise
-            if i == len(chain) - 1:
+            if breaker is not None:
+                breaker.record_failure()
+            if is_last:
                 names = " -> ".join(step["name"] for step in chain)
                 raise RuntimeError(f"all providers in chain ({names}) failed: {error}") from error
             logger.warning(
@@ -87,6 +114,11 @@ def _run_chain(chain: list[dict]) -> CompletionResult:
                 chain[i + 1]["name"],
                 error,
             )
+    # every link was skipped via an open breaker except (by construction)
+    # the last one, which either returned above or raised above — this is
+    # unreachable, but guards against a future edit changing that invariant.
+    if last_error is not None:
+        raise RuntimeError("provider chain exhausted") from last_error
     raise RuntimeError("provider chain was empty")
 
 

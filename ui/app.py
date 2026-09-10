@@ -8,13 +8,10 @@ from pathlib import Path
 # happened to be launched from.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-# NeMo Guardrails and httpx both log at INFO by default, including the full
-# Colang phase-by-phase prompt/response trace for every gate check. That's
-# not a separate or leaked conversation, it's this app's own safety_gate()
-# doing its job, but it's not meant for a normal terminal, only useful when
-# actually debugging the gate itself. Quiet by default; flip back to INFO
-# locally if you need to see what a gate call is actually doing.
-logging.getLogger("nemoguardrails").setLevel(logging.WARNING)
+# httpx/httpcore log at INFO by default, which means every guardrail and
+# provider HTTP call gets a verbose per-request line in a normal terminal.
+# Quiet by default; flip back to INFO locally if you need to see what a
+# provider call is actually doing.
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
@@ -32,7 +29,17 @@ st.set_page_config(page_title="Kubernetes RAG", page_icon="◧", layout="centere
 
 @st.cache_resource(show_spinner="Warming up the local reranker (one-time, first load only)…")
 def _warm_up_models() -> bool:
-    preload_rerank()
+    # unguarded, this crashed the whole app at startup (before any UI
+    # renders) on a model-download hiccup — no network on first run, disk
+    # full, a stale/corrupted local cache. rerank_and_gate() already
+    # handles a ranker failure gracefully per-request (fails closed), so a
+    # failed warmup just means the first real rerank call pays the
+    # (already-handled) load cost lazily instead of failing the whole app
+    # before the user ever sees a chat box.
+    try:
+        preload_rerank()
+    except Exception:
+        logger.exception("reranker warmup failed, will retry lazily on first use")
     return True
 
 _warm_up_models()

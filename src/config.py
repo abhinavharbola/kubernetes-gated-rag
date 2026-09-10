@@ -21,7 +21,16 @@ class Settings(BaseSettings):
 
     nemoguard_topic_model: str = "nvidia/llama-3.1-nemoguard-8b-topic-control"
     nemoguard_safety_model: str = "nvidia/llama-3.1-nemoguard-8b-content-safety"
-    guardrail_skip_nemoguard: bool = False
+    guardrail_skip_nemoguard_safety: bool = False
+    # NeMoGuard topic-control has been the one reliably crashing (a
+    # recurring server-side TensorRT-LLM/CUDA error on NVIDIA's hosted
+    # endpoint, not something a client-side retry or timeout fixes).
+    # Default true: use the existing fallback classifier (Groq, via
+    # TOPIC_POLICY_PROMPT) as topic's primary path instead of paying for a
+    # call to a model that's reliably failing. Flip to false to give
+    # NeMoGuard topic-control another try once NVIDIA's instance is
+    # confirmed healthy again.
+    guardrail_skip_nemoguard_topic: bool = True
     guardrail_timeout_seconds: float = 3.0
     guardrail_circuit_failure_threshold: int = 2
     guardrail_circuit_recovery_seconds: float = 30.0
@@ -56,6 +65,17 @@ class Settings(BaseSettings):
     # every other provider client here — a slow embed_content call could
     # hang for however long the underlying SDK/transport defaults to.
     embedding_timeout_seconds: float = 10.0
+
+    # Circuit breaker for the shared provider chain in src/providers/llm.py
+    # (nim/groq/groq-secondary), separate from guardrail_circuit_* above,
+    # which only covers the two NeMoGuard classifier calls. Without this,
+    # an unhealthy NIM meant every independent generate_planner/generate_main
+    # call in a turn re-paid the full planner/generation timeout discovering
+    # the same outage from scratch — e.g. rewrite_with_history and the topic
+    # gate's fallback classifier both hitting a dead NIM for 4s each, in the
+    # same turn, with no memory of the first failure.
+    provider_circuit_failure_threshold: int = 2
+    provider_circuit_recovery_seconds: float = 20.0
 
     cache_schema_version: str = "3"
     cache_policy_version: str = "2"

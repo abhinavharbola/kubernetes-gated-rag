@@ -1,6 +1,7 @@
 import json
 from unittest.mock import MagicMock, patch
 
+from src.config import settings
 from src.guardrails import safety_gate, topic_gate
 from src.guardrails.colang_rules import deterministic_jailbreak_check
 from src.guardrails.gates import reset_circuit_breakers
@@ -82,16 +83,21 @@ def test_safety_gate_fails_closed_when_primary_and_fallback_error(mock_nim, mock
 
 @patch("src.guardrails.gates.nim_client")
 def test_topic_gate_allows_on_topic_question(mock_nim):
-    mock_nim.chat.completions.create.return_value = _mock_topic_response("on-topic")
-    allowed, reason = topic_gate("how do I destroy a Deployment?")
+    # guardrail_skip_nemoguard_topic defaults True (NeMoGuard topic-control
+    # is the model that's been crashing) — this test exercises the primary
+    # NeMoGuard path explicitly, not the default.
+    with patch.object(settings, "guardrail_skip_nemoguard_topic", False):
+        mock_nim.chat.completions.create.return_value = _mock_topic_response("on-topic")
+        allowed, reason = topic_gate("how do I destroy a Deployment?")
     assert allowed is True
     assert reason is None
 
 
 @patch("src.guardrails.gates.nim_client")
 def test_topic_gate_blocks_off_topic_question(mock_nim):
-    mock_nim.chat.completions.create.return_value = _mock_topic_response("off-topic")
-    allowed, reason = topic_gate("what's the weather today?")
+    with patch.object(settings, "guardrail_skip_nemoguard_topic", False):
+        mock_nim.chat.completions.create.return_value = _mock_topic_response("off-topic")
+        allowed, reason = topic_gate("what's the weather today?")
     assert allowed is False
     assert reason is not None
 
@@ -107,12 +113,28 @@ def test_topic_gate_allows_small_talk_without_remote_call():
 @patch("src.guardrails.gates.generate_planner")
 @patch("src.guardrails.gates.nim_client")
 def test_topic_gate_uses_fallback_when_primary_errors(mock_nim, mock_planner):
-    mock_nim.chat.completions.create.side_effect = RuntimeError("provider down")
-    mock_planner.return_value = CompletionResult(content="on-topic", provider="nim", model="x")
+    with patch.object(settings, "guardrail_skip_nemoguard_topic", False):
+        mock_nim.chat.completions.create.side_effect = RuntimeError("provider down")
+        mock_planner.return_value = CompletionResult(content="on-topic", provider="nim", model="x")
+        allowed, reason = topic_gate("how do I destroy a Deployment?")
+    assert allowed is True
+    assert reason is None
+    mock_planner.assert_called_once()
+
+
+@patch("src.guardrails.gates.generate_planner")
+@patch("src.guardrails.gates.nim_client")
+def test_topic_gate_skips_nemoguard_by_default(mock_nim, mock_planner):
+    # guardrail_skip_nemoguard_topic's actual default (True): topic gate
+    # should go straight to the Groq-backed fallback classifier and never
+    # touch nim_client at all, since NeMoGuard topic-control is the model
+    # that's been reliably crashing.
+    mock_planner.return_value = CompletionResult(content="on-topic", provider="groq", model="x")
     allowed, reason = topic_gate("how do I destroy a Deployment?")
     assert allowed is True
     assert reason is None
     mock_planner.assert_called_once()
+    mock_nim.chat.completions.create.assert_not_called()
 
 
 @patch("src.guardrails.gates.nim_client")

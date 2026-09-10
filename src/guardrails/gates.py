@@ -1,11 +1,10 @@
 import json
 import logging
 import re
-import threading
-import time
 
 from src.guardrails.colang_rules import deterministic_jailbreak_check
 from src.config import settings
+from src.providers.circuit_breaker import CircuitBreaker
 from src.providers.clients import nim_client
 from src.providers.llm import generate_planner
 from src.tracing import provider_call_span
@@ -82,39 +81,9 @@ _SAFETY_RESPONSE_FORMAT = (
 )
 
 
-class _CircuitBreaker:
-    def __init__(self, failure_threshold: int, recovery_seconds: float):
-        self.failure_threshold = failure_threshold
-        self.recovery_seconds = recovery_seconds
-        self.failures = 0
-        self.opened_at = 0.0
-        self._lock = threading.Lock()
-
-    def allow(self) -> bool:
-        with self._lock:
-            if self.opened_at == 0.0:
-                return True
-            if time.monotonic() - self.opened_at >= self.recovery_seconds:
-                self.opened_at = 0.0
-                self.failures = 0
-                return True
-            return False
-
-    def record_success(self) -> None:
-        with self._lock:
-            self.failures = 0
-            self.opened_at = 0.0
-
-    def record_failure(self) -> None:
-        with self._lock:
-            self.failures += 1
-            if self.failures >= self.failure_threshold:
-                self.opened_at = time.monotonic()
-
-
 _breakers = {
-    "safety": _CircuitBreaker(settings.guardrail_circuit_failure_threshold, settings.guardrail_circuit_recovery_seconds),
-    "topic": _CircuitBreaker(settings.guardrail_circuit_failure_threshold, settings.guardrail_circuit_recovery_seconds),
+    "safety": CircuitBreaker(settings.guardrail_circuit_failure_threshold, settings.guardrail_circuit_recovery_seconds),
+    "topic": CircuitBreaker(settings.guardrail_circuit_failure_threshold, settings.guardrail_circuit_recovery_seconds),
 }
 
 
@@ -200,7 +169,7 @@ def _fallback_safety_check(raw_message: str) -> bool | None:
 
 
 def _safety_classifier_verdict(raw_message: str) -> bool | None:
-    if settings.guardrail_skip_nemoguard:
+    if settings.guardrail_skip_nemoguard_safety:
         return _fallback_safety_check(raw_message)
     breaker = _breakers["safety"]
     if not breaker.allow():
@@ -267,7 +236,7 @@ def _is_small_talk(standalone_question: str) -> bool:
 def check_topic(standalone_question: str) -> bool:
     if _is_small_talk(standalone_question):
         return True
-    if settings.guardrail_skip_nemoguard:
+    if settings.guardrail_skip_nemoguard_topic:
         verdict = _fallback_topic_check(standalone_question)
         return verdict if verdict is not None else False
     breaker = _breakers["topic"]

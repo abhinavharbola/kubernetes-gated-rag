@@ -10,7 +10,7 @@ flowchart TD
     ExactCache -->|hit| ReturnExact([Return cached answer])
     ExactCache -->|miss| Safety["Safety Gate\ndeterministic jailbreak + NeMoGuard"]
     Safety -->|blocked| RefusalUnsafe([Refusal: unsafe / jailbreak])
-    Safety -->|allowed, no history| Topic["Topic Gate\nNeMoGuard topic-control"]
+    Safety -->|allowed, no history| Topic["Topic Gate\nplanner classifier (Groq) by default"]
     Safety -->|allowed, with history| Rewrite["Rewrite with History\nplanner chain"]
     Rewrite --> Topic
     Topic -->|blocked| RefusalOffTopic([Refusal: off-topic])
@@ -34,7 +34,9 @@ The important latency change is deliberate: a first-turn exact-cache hit does no
 
 Safety remains fail-closed. Known jailbreak-shaped requests are rejected locally with deterministic patterns, avoiding a second remote model call. All other requests go through NeMoGuard content-safety. The NeMoGuard call has a short timeout and an automatic circuit breaker; when its circuit is open or the call fails, the planner chain is used as a lower-confidence fallback. If neither path produces a usable verdict, the request is blocked.
 
-Topic classification remains NeMoGuard-based because open-ended topic detection is not a good fit for a small keyword list. Common greetings and thanks are allowed locally, avoiding a remote round-trip for obvious small talk. Topic failures also use a short-timeout planner fallback and fail closed when no usable verdict is available.
+Topic classification defaults to the planner-chain classifier (Groq, via `TOPIC_POLICY_PROMPT`) rather than NeMoGuard topic-control (`GUARDRAIL_SKIP_NEMOGUARD_TOPIC=true` by default): NVIDIA's hosted NeMoGuard topic-control endpoint has been unreliable in practice — a recurring server-side TensorRT-LLM/CUDA error, not something a client-side timeout or retry fixes — so the fallback classifier that was originally built for outages is now the primary path, and the dedicated model is opt-in (`GUARDRAIL_SKIP_NEMOGUARD_TOPIC=false`) for whenever NVIDIA's instance is confirmed healthy. Common greetings and thanks are allowed locally, avoiding a remote round-trip for obvious small talk. Topic failures fail closed when no usable verdict is available from either path.
+
+Safety classification still defaults to NeMoGuard content-safety (`GUARDRAIL_SKIP_NEMOGUARD_SAFETY=false`) since it's been reliable; the same skip switch and circuit breaker exist for it if that changes.
 
 FlashRank failure is fail-closed by default. A retrieval result that has not passed the rerank gate is not silently forwarded to generation.
 

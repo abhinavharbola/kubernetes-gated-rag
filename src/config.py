@@ -11,7 +11,20 @@ class Settings(BaseSettings):
     qdrant_url: str
     qdrant_api_key: str
     logfire_token: str | None = None
+    # Off by default: turn_span() logs only a length + hash of the user
+    # message when this is False, so raw user input (which may contain PII,
+    # per the safety taxonomy's own S9 category) isn't shipped to Logfire.
+    # Set True only for local debugging with a private/local Logfire sink.
+    tracing_log_raw_messages: bool = False
 
+    # Deliberately the same open-weights model string across all three
+    # links of generate_main's chain: the failover this project needs is
+    # provider/account diversity (Groq primary account, Groq secondary
+    # account, NVIDIA NIM), not model diversity — the goal is "keep
+    # answering if one hosted endpoint is down or rate-limited", not "try a
+    # different model". If you intend these to actually be different
+    # models, set them explicitly via env vars; leaving them identical here
+    # is intentional, not a copy-paste leftover.
     groq_main_model: str = "openai/gpt-oss-120b"
     groq_main_model_secondary: str = "openai/gpt-oss-120b"
     nim_main_model: str = "openai/gpt-oss-120b"
@@ -83,3 +96,6 @@ class Settings(BaseSettings):
 
 
 settings = Settings()
+
+
+

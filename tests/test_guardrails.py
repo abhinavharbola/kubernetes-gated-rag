@@ -2,7 +2,7 @@ import json
 from unittest.mock import MagicMock, patch
 
 from src.config import settings
-from src.guardrails import safety_gate, topic_gate
+from src.guardrails import response_safety_gate, safety_gate, topic_gate
 from src.guardrails.colang_rules import deterministic_jailbreak_check
 from src.guardrails.gates import reset_circuit_breakers
 from src.providers.llm import CompletionResult
@@ -142,3 +142,51 @@ def test_safety_call_uses_short_timeout(mock_nim):
     mock_nim.chat.completions.create.return_value = _mock_safety_response("safe")
     safety_gate("how do I create a Pod?")
     assert mock_nim.chat.completions.create.call_args.kwargs["timeout"] == 3.0
+
+
+def _mock_response_safety_response(verdict: str) -> MagicMock:
+    response = MagicMock()
+    response.choices[0].message.content = json.dumps({"Response Safety": verdict})
+    return response
+
+
+@patch("src.guardrails.gates.nim_client")
+def test_response_safety_gate_allows_safe_answer(mock_nim):
+    mock_nim.chat.completions.create.return_value = _mock_response_safety_response("safe")
+    allowed, reason = response_safety_gate("how do I write a pod manifest?", "here is a pod manifest...")
+    assert allowed is True
+    assert reason is None
+
+
+@patch("src.guardrails.gates.nim_client")
+def test_response_safety_gate_blocks_unsafe_answer(mock_nim):
+    # Exercises the "Response Safety" field of the classifier output, which
+    # the prompt/schema always defined but nothing previously ever asked
+    # for — only the incoming question was checked, never the generated
+    # answer.
+    mock_nim.chat.completions.create.return_value = _mock_response_safety_response("unsafe")
+    allowed, reason = response_safety_gate("how do I write a pod manifest?", "here's how to build a weapon...")
+    assert allowed is False
+    assert reason is not None
+
+
+@patch("src.guardrails.gates.nim_client")
+def test_response_safety_gate_sends_both_user_and_agent_turns(mock_nim):
+    mock_nim.chat.completions.create.return_value = _mock_response_safety_response("safe")
+    response_safety_gate("what is a Pod?", "A Pod is the smallest deployable unit.")
+    prompt = mock_nim.chat.completions.create.call_args.kwargs["messages"][0]["content"]
+    assert "user: what is a Pod?" in prompt
+    assert "response: agent: A Pod is the smallest deployable unit." in prompt
+
+
+@patch("src.guardrails.gates.generate_planner")
+@patch("src.guardrails.gates.nim_client")
+def test_response_safety_gate_fails_closed_when_primary_and_fallback_error(mock_nim, mock_planner):
+    mock_nim.chat.completions.create.side_effect = RuntimeError("provider down")
+    mock_planner.side_effect = RuntimeError("fallback down")
+    allowed, reason = response_safety_gate("question", "answer")
+    assert allowed is False
+    assert reason is not None
+
+
+

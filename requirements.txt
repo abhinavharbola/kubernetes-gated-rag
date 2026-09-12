@@ -22,3 +22,6 @@ pytest
 openai
 python-docx
 python-pptx
+
+
+

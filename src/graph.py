@@ -1,3 +1,4 @@
+import atexit
 import logging
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -5,6 +6,7 @@ from typing import TypedDict
 
 from langgraph.graph import StateGraph, START, END
 
+from src.guardrails.colang_rules import deterministic_jailbreak_check
 from src.retrieval.cache import (
     embed_canonical_question,
     exact_cache_get,
@@ -14,10 +16,10 @@ from src.retrieval.cache import (
     semantic_cache_set,
 )
 from src.config import settings
-from src.guardrails import safety_gate, topic_gate
+from src.guardrails import response_safety_gate, safety_gate, topic_gate
 from src.providers.llm import generate_main, generate_planner
-from src.retrieval.rerank import rerank_and_gate
-from src.retrieval.search import retrieve
+from src.retrieval.rerank import RerankUnavailableError, rerank_and_gate
+from src.retrieval.search import RetrievalUnavailableError, retrieve
 from src.tracing import node_span, log_cache_decision, turn_span
 
 logger = logging.getLogger(__name__)
@@ -27,6 +29,11 @@ NO_CONTEXT_MESSAGE = (
     "a specific resource, provider, or module."
 )
 
+SERVICE_UNAVAILABLE_MESSAGE = (
+    "I'm having trouble reaching the retrieval service right now. Please try "
+    "again in a moment."
+)
+
 ANSWER_SYSTEM_PROMPT = (
     "Answer the Kubernetes question using ONLY the provided context. "
     "If the context doesn't fully cover the question, say what's missing "
@@ -34,6 +41,14 @@ ANSWER_SYSTEM_PROMPT = (
 )
 
 _cache_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="cache-writer")
+
+# Without this, background exact/semantic cache writes still in flight at
+# process exit (or a Streamlit rerun tearing down the interpreter) are
+# silently dropped rather than completing — a generated answer would be
+# thrown away instead of cached, with no error surfaced anywhere. wait=True
+# bounds process exit on whatever's left in the queue, which in practice is
+# a few fast disk/Qdrant writes, not an open-ended hang.
+atexit.register(_cache_executor.shutdown, wait=True)
 
 
 class GraphState(TypedDict, total=False):
@@ -52,6 +67,8 @@ class GraphState(TypedDict, total=False):
     exact_cache_checked: bool
     candidates: list[dict]
     reranked: list[dict]
+    retrieval_unavailable: bool
+    service_unavailable: bool
     latency_seconds: float | None
 
 
@@ -70,6 +87,16 @@ def _submit_cache_write(fn, *args, **kwargs) -> None:
 def exact_cache_node(state: GraphState) -> GraphState:
     with node_span("exact_cache_check"):
         if state.get("chat_history"):
+            return {"exact_cache_checked": False}
+        # The deterministic jailbreak check is free (local regex, no network
+        # call) and cheap enough to run even on the fast cache-hit path.
+        # Running it here closes a real gap: without it, a message matching
+        # a known jailbreak shape that happens to normalize to a previously
+        # cached, previously-approved question would skip both the safety
+        # and topic gates entirely on a cache hit. Skipping straight to the
+        # normal gated path (which performs this same check first) is
+        # cheap insurance against exactly that.
+        if deterministic_jailbreak_check(state["raw_message"]):
             return {"exact_cache_checked": False}
         cached = exact_cache_get(state["raw_message"])
         log_cache_decision("exact", hit=cached is not None)
@@ -127,6 +154,8 @@ def late_exact_cache_node(state: GraphState) -> GraphState:
     with node_span("late_exact_cache_check"):
         if not state.get("chat_history"):
             return {}
+        if deterministic_jailbreak_check(state["standalone_question"]):
+            return {"exact_cache_checked": False}
         cached = exact_cache_get(state["standalone_question"])
         log_cache_decision("exact", hit=cached is not None)
         if cached is not None:
@@ -147,11 +176,9 @@ def canonicalize_node(state: GraphState) -> GraphState:
 
 def semantic_cache_node(state: GraphState) -> GraphState:
     with node_span("semantic_cache_check"):
-        # Gemini's embed call had no failure handling here — unlike
-        # retrieve()'s identical call in search.py, this one crashed the
-        # whole turn (caught only by ui/app.py's generic top-level handler)
-        # instead of degrading to a cache miss the way every other read on
-        # this path now does.
+        # A failed embedding call degrades to a cache miss rather than
+        # crashing the turn — the graph falls through to retrieval either
+        # way, same as a genuine miss.
         try:
             vector = embed_canonical_question(state["canonical_question"])
         except Exception as error:
@@ -166,13 +193,23 @@ def semantic_cache_node(state: GraphState) -> GraphState:
 
 def retrieve_node(state: GraphState) -> GraphState:
     with node_span("retrieve"):
-        candidates = retrieve(state["canonical_question"])
+        try:
+            candidates = retrieve(state["canonical_question"])
+        except RetrievalUnavailableError as error:
+            logger.error("retrieval unavailable this turn, not caching: %s", error)
+            return {"candidates": [], "retrieval_unavailable": True}
         return {"candidates": candidates}
 
 
 def rerank_node(state: GraphState) -> GraphState:
     with node_span("rerank_and_gate"):
-        survivors = rerank_and_gate(state["canonical_question"], state.get("candidates", []))
+        if state.get("retrieval_unavailable"):
+            return {"reranked": [], "service_unavailable": True}
+        try:
+            survivors = rerank_and_gate(state["canonical_question"], state.get("candidates", []))
+        except RerankUnavailableError as error:
+            logger.error("rerank service unavailable this turn, not caching: %s", error)
+            return {"reranked": [], "service_unavailable": True}
         return {"reranked": survivors}
 
 
@@ -186,6 +223,20 @@ def generate_node(state: GraphState) -> GraphState:
             ]
         )
         return {"answer": result.content, "provider": result.provider, "model": result.model}
+
+
+def response_safety_gate_node(state: GraphState) -> GraphState:
+    with node_span("response_safety_gate"):
+        allowed, reason = response_safety_gate(state["standalone_question"], state["answer"])
+        if not allowed:
+            return {
+                "allowed": False,
+                "refusal_reason": reason,
+                "blocked_stage": "response_safety",
+                "answer": reason,
+                "cache_layer": None,
+            }
+        return {}
 
 
 def write_caches_node(state: GraphState) -> GraphState:
@@ -216,6 +267,14 @@ def cache_no_context_node(state: GraphState) -> GraphState:
         return {"answer": NO_CONTEXT_MESSAGE}
 
 
+def service_unavailable_node(state: GraphState) -> GraphState:
+    with node_span("service_unavailable"):
+        # Deliberately not cached in any layer: this reflects the state of
+        # the retrieval/rerank infrastructure at this moment, not a fact
+        # about the question, and must not outlive the outage that caused it.
+        return {"answer": SERVICE_UNAVAILABLE_MESSAGE, "cache_layer": None}
+
+
 def route_after_exact_cache(state: GraphState) -> str:
     return END if state.get("cache_layer") == "exact" else "safety_gate"
 
@@ -241,7 +300,15 @@ def route_after_semantic_cache(state: GraphState) -> str:
 
 
 def route_after_rerank(state: GraphState) -> str:
-    return "generate" if state["reranked"] else "cache_no_context"
+    if state["reranked"]:
+        return "generate"
+    if state.get("service_unavailable"):
+        return "service_unavailable"
+    return "cache_no_context"
+
+
+def route_after_response_safety_gate(state: GraphState) -> str:
+    return END if not state.get("allowed", True) else "write_caches"
 
 
 def build_graph():
@@ -256,8 +323,10 @@ def build_graph():
     graph.add_node("retrieve", retrieve_node)
     graph.add_node("rerank_and_gate", rerank_node)
     graph.add_node("generate", generate_node)
+    graph.add_node("response_safety_gate", response_safety_gate_node)
     graph.add_node("write_caches", write_caches_node)
     graph.add_node("cache_no_context", cache_no_context_node)
+    graph.add_node("service_unavailable", service_unavailable_node)
 
     graph.add_edge(START, "exact_cache_check")
     graph.add_conditional_edges("exact_cache_check", route_after_exact_cache)
@@ -269,9 +338,11 @@ def build_graph():
     graph.add_conditional_edges("semantic_cache_check", route_after_semantic_cache)
     graph.add_edge("retrieve", "rerank_and_gate")
     graph.add_conditional_edges("rerank_and_gate", route_after_rerank)
-    graph.add_edge("generate", "write_caches")
+    graph.add_edge("generate", "response_safety_gate")
+    graph.add_conditional_edges("response_safety_gate", route_after_response_safety_gate)
     graph.add_edge("write_caches", END)
     graph.add_edge("cache_no_context", END)
+    graph.add_edge("service_unavailable", END)
     return graph.compile()
 
 

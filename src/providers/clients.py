@@ -40,3 +40,6 @@ qdrant_client = QdrantClient(
     api_key=settings.qdrant_api_key,
     timeout=settings.qdrant_timeout_seconds,
 )
+
+
+

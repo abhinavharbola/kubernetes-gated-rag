@@ -9,7 +9,19 @@ from src.config import settings
 from src.tracing import provider_call_span
 
 logger = logging.getLogger(__name__)
-RETRYABLE = (APITimeoutError, RateLimitError, APIConnectionError, InternalServerError)
+
+
+class EmptyCompletionError(RuntimeError):
+    """Raised when a provider returns a completion with no content. Subclasses
+    RuntimeError so any old call site catching RuntimeError still works, but
+    is listed in RETRYABLE below so _run_chain treats it as failover-worthy
+    instead of raising immediately: an empty completion (clipped by a content
+    filter, a hosted-model hiccup, etc.) is exactly the kind of single-provider
+    flakiness the chain exists to route around, not a sign the whole request
+    is malformed the way a 400 is."""
+
+
+RETRYABLE = (APITimeoutError, RateLimitError, APIConnectionError, InternalServerError, EmptyCompletionError)
 
 # One breaker per provider name, shared across generate_main's and
 # generate_planner's chains (both hit "nim", one hop apart) — a provider
@@ -50,7 +62,7 @@ def _call_openai(
         )
         content = response.choices[0].message.content
         if content is None:
-            raise RuntimeError(f"{provider_name} returned an empty completion")
+            raise EmptyCompletionError(f"{provider_name} returned an empty completion")
         return content
 
 
@@ -153,3 +165,6 @@ def generate_planner(
         _openai_link(groq_client, settings.groq_planner_model, "groq", messages, temperature, max_tokens, "planner", timeout),
     ]
     return _run_chain(chain)
+
+
+

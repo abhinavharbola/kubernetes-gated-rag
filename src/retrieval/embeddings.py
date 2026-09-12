@@ -104,7 +104,18 @@ def embed_texts(texts: list[str], task_type: str) -> list[list[float]]:
                 expire=settings.embedding_cache_ttl_seconds,
             )
 
-    return [vector for vector in vectors if vector is not None]
+    # By this point every slot should be filled, from either the cache or a
+    # batch call above. Silently filtering out any remaining None would turn
+    # a real bug (a batch that didn't cover every input, an index mismatch)
+    # into a shorter-than-expected list, which then surfaces as a confusing
+    # IndexError at the caller (embed_query/embed_document index into [0])
+    # instead of a clear error pointing at the actual cause.
+    missing = [i for i, vector in enumerate(vectors) if vector is None]
+    if missing:
+        raise RuntimeError(
+            f"embedding pipeline failed to populate vectors for indices {missing} (task_type={task_type})"
+        )
+    return vectors
 
 
 def embed_query(text: str) -> list[float]:
@@ -117,3 +128,6 @@ def embed_document(text: str) -> list[float]:
 
 def embed_for_cache(text: str) -> list[float]:
     return embed_texts([text], task_type="SEMANTIC_SIMILARITY")[0]
+
+
+

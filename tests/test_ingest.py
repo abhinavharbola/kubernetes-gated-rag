@@ -1,6 +1,7 @@
+import hashlib
 from unittest.mock import MagicMock, patch
 
-from ingest import ensure_collection
+from ingest import _write_corpus_version, ensure_collection, ingest_directory
 from src.config import settings
 
 
@@ -69,3 +70,70 @@ def test_wipe_is_a_noop_for_the_exact_cache_when_wipe_is_false(mock_qdrant):
     with patch("ingest._wipe_exact_cache") as mock_wipe_exact_cache:
         ensure_collection(wipe=False)
         assert mock_wipe_exact_cache.called is False
+
+
+def test_write_corpus_version_writes_the_marker_file(tmp_path):
+    marker = tmp_path / "nested" / "corpus_version"
+    with patch("ingest.CORPUS_VERSION_MARKER", marker):
+        _write_corpus_version("abc123")
+    assert marker.read_text() == "abc123"
+
+
+@patch("ingest._upsert_batch")
+@patch("ingest.embed_texts", return_value=[[0.1] * 768])
+@patch("ingest.is_relevant", return_value=True)
+@patch("ingest.chunk_document")
+@patch("ingest.parse_file")
+def test_ingest_directory_updates_hasher_for_ingested_files_only(
+    mock_parse_file, mock_chunk_document, mock_is_relevant, mock_embed, mock_upsert, tmp_path
+):
+    (tmp_path / "a.md").write_text("relevant content")
+    mock_parse_file.return_value = "relevant content"
+    mock_chunk_document.return_value = [{"text": "relevant content", "metadata": {}}]
+
+    hasher = hashlib.sha256()
+    ingest_directory(tmp_path, corpus_hasher=hasher)
+
+    assert hasher.hexdigest() != hashlib.sha256().hexdigest()
+
+
+@patch("ingest._upsert_batch")
+@patch("ingest.embed_texts")
+@patch("ingest.is_relevant", return_value=False)
+@patch("ingest.chunk_document")
+@patch("ingest.parse_file", return_value="off topic content")
+def test_ingest_directory_does_not_hash_rejected_files(
+    mock_parse_file, mock_chunk_document, mock_is_relevant, mock_embed, mock_upsert, tmp_path
+):
+    (tmp_path / "a.md").write_text("off topic content")
+
+    hasher = hashlib.sha256()
+    ingest_directory(tmp_path, corpus_hasher=hasher)
+
+    # a rejected file contributes nothing to the corpus, so it must not
+    # change the fingerprint either -- only content that actually became
+    # part of the corpus should be able to invalidate old cache entries.
+    assert hasher.hexdigest() == hashlib.sha256().hexdigest()
+    mock_embed.assert_not_called()
+
+
+@patch("ingest._upsert_batch")
+@patch("ingest.embed_texts", return_value=[[0.1] * 768])
+@patch("ingest.is_relevant", return_value=True)
+@patch("ingest.chunk_document")
+@patch("ingest.parse_file", return_value="same content")
+def test_ingest_directory_fingerprint_is_deterministic_across_runs(
+    mock_parse_file, mock_chunk_document, mock_is_relevant, mock_embed, mock_upsert, tmp_path
+):
+    (tmp_path / "a.md").write_text("same content")
+    mock_chunk_document.return_value = [{"text": "same content", "metadata": {}}]
+
+    first = hashlib.sha256()
+    ingest_directory(tmp_path, corpus_hasher=first)
+    second = hashlib.sha256()
+    ingest_directory(tmp_path, corpus_hasher=second)
+
+    assert first.hexdigest() == second.hexdigest()
+
+
+

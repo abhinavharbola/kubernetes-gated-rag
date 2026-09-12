@@ -351,6 +351,7 @@ PIPELINE_STAGES = [
     {"label": "Retrieve", "desc": "dense vector search"},
     {"label": "Rerank", "desc": "cross-encoder relevance gate"},
     {"label": "Generate", "desc": "grounded answer"},
+    {"label": "Response Safety", "desc": "checks the generated answer too"},
 ]
 
 
@@ -471,6 +472,10 @@ def build_trace_conditions(details: dict) -> list[dict]:
         return conditions
     conditions.append({"type": "Cache", "status": None, "message": "miss" if cache_checked else "lookup"})
 
+    if details.get("service_unavailable"):
+        conditions.append({"type": "Retrieve", "status": False, "message": "service unavailable"})
+        return conditions
+
     candidates_count = details.get("candidates_count", 0)
     conditions.append({"type": "Retrieve", "status": True, "message": f"{candidates_count} found"})
     reranked_count = details.get("reranked_count", 0)
@@ -484,6 +489,9 @@ def build_trace_conditions(details: dict) -> list[dict]:
     if provider:
         message = f"{provider} ({model})" if model else provider
         conditions.append({"type": "Generate", "status": True, "message": message})
+
+    if blocked_stage == "response_safety":
+        conditions.append({"type": "Response Safety", "status": False, "message": "blocked"})
     return conditions
 
 
@@ -637,6 +645,7 @@ if prompt:
                 "model": result.get("model"),
                 "candidates_count": len(result.get("candidates") or []),
                 "reranked_count": len(result.get("reranked") or []),
+                "service_unavailable": result.get("service_unavailable", False),
                 "sources": result.get("reranked") if not result.get("cache_layer") else None,
                 "latency_seconds": result.get("latency_seconds"),
             }
@@ -645,3 +654,6 @@ if prompt:
 
     st.session_state.history.append({"role": "assistant", "content": answer, "details": details})
     get_corpus_stats.clear()
+
+
+

@@ -1,5 +1,6 @@
 import hashlib
 import logging
+import pathlib
 import re
 import string
 import threading
@@ -15,7 +16,18 @@ from src.retrieval.embeddings import embed_for_cache
 logger = logging.getLogger(__name__)
 
 _exact_cache = diskcache.Cache(".cache/exact")
-_PUNCT_TABLE = str.maketrans("", "", string.punctuation.replace("-", ""))
+
+# Punctuation that's purely cosmetic in a typed question (trailing "?",
+# stray quotes, parentheses) is safe to strip for exact-match normalization.
+# Characters that carry real meaning in Kubernetes syntax -- "-" in
+# resource/flag names, "/" in API groups like apps/v1, "." in dotted paths
+# like pod.spec.containers, ":" in label/selector syntax -- are deliberately
+# NOT stripped. Stripping them previously collapsed distinct questions
+# ("apps/v1" vs "apps v1", "pod.spec.containers" vs "pod spec containers")
+# onto the same cache key, returning a cached answer for a different
+# question than the one actually asked.
+_STRIP_CHARS = "?!,;'\"()[]{}"
+_PUNCT_TABLE = str.maketrans("", "", _STRIP_CHARS)
 
 # Qdrant requires an explicit payload index before a field can be used in a
 # query filter ("Index required but not found") — filtering on these three
@@ -27,6 +39,28 @@ _VERSION_FIELDS = ("cache_schema_version", "policy_version", "corpus_version")
 _indexes_ensured = False
 _index_lock = threading.Lock()
 
+# Written by ingest.py after a successful ingestion run, containing a hash
+# of the actual ingested content. Cache keys read this (falling back to the
+# static settings.corpus_version when it doesn't exist yet, e.g. before the
+# first ingest) instead of settings.corpus_version directly, so an
+# incremental re-ingest that changes the corpus -- without a --wipe or a
+# manually-edited .env -- still changes the effective corpus_version and
+# invalidates stale cache entries automatically. See ingest.py's
+# _write_corpus_version.
+_CORPUS_VERSION_MARKER = pathlib.Path(".cache/corpus_version")
+
+
+def _current_corpus_version() -> str:
+    try:
+        value = _CORPUS_VERSION_MARKER.read_text().strip()
+    except OSError:
+        return settings.corpus_version
+    return value or settings.corpus_version
+
+
+def _is_already_exists_error(error: Exception) -> bool:
+    return "already exist" in str(error).lower()
+
 
 def ensure_semantic_cache_indexes() -> None:
     global _indexes_ensured
@@ -35,6 +69,7 @@ def ensure_semantic_cache_indexes() -> None:
     with _index_lock:
         if _indexes_ensured:
             return
+        all_succeeded = True
         for field in _VERSION_FIELDS:
             try:
                 qdrant_client.create_payload_index(
@@ -43,11 +78,24 @@ def ensure_semantic_cache_indexes() -> None:
                     field_schema=PayloadSchemaType.KEYWORD,
                 )
             except Exception as error:
-                # Already exists, or the collection doesn't exist yet: both
-                # fine to swallow here. A genuine connectivity problem
-                # surfaces again on the very next real Qdrant call anyway.
-                logger.debug("payload index ensure for %s: %s", field, error)
-        _indexes_ensured = True
+                if _is_already_exists_error(error):
+                    logger.debug("payload index for %s already exists", field)
+                    continue
+                # A genuine failure (collection doesn't exist yet, a
+                # connectivity blip during startup, etc.) must NOT latch
+                # _indexes_ensured to True: that would permanently skip
+                # index creation for the rest of this process's life, even
+                # after the collection is created later (e.g. by a
+                # subsequent ingest.py run), silently degrading the
+                # semantic cache to an always-miss for the remainder of the
+                # process. Leaving the flag False means the next call
+                # retries.
+                all_succeeded = False
+                logger.warning(
+                    "payload index ensure for %s failed, will retry on next call: %s", field, error
+                )
+        if all_succeeded:
+            _indexes_ensured = True
 
 
 def normalize_exact(question: str) -> str:
@@ -63,7 +111,7 @@ def _exact_key(question: str) -> str:
     digest = hashlib.sha256(normalize_exact(question).encode("utf-8")).hexdigest()
     return (
         f"{settings.cache_schema_version}:exact:{settings.cache_policy_version}:"
-        f"{settings.corpus_version}:{digest}"
+        f"{_current_corpus_version()}:{digest}"
     )
 
 
@@ -89,7 +137,7 @@ def _semantic_filter() -> Filter:
         must=[
             FieldCondition(key="cache_schema_version", match=MatchValue(value=settings.cache_schema_version)),
             FieldCondition(key="policy_version", match=MatchValue(value=settings.cache_policy_version)),
-            FieldCondition(key="corpus_version", match=MatchValue(value=settings.corpus_version)),
+            FieldCondition(key="corpus_version", match=MatchValue(value=_current_corpus_version())),
         ]
     )
 
@@ -130,7 +178,7 @@ def semantic_cache_set(canonical_question: str, canonical_question_vector: list[
                     "answer": answer,
                     "cache_schema_version": settings.cache_schema_version,
                     "policy_version": settings.cache_policy_version,
-                    "corpus_version": settings.corpus_version,
+                    "corpus_version": _current_corpus_version(),
                 },
             )
         ],

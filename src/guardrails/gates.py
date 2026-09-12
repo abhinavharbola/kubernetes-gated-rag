@@ -109,21 +109,27 @@ def _parse_binary_verdict(raw: str, true_word: str, false_word: str) -> bool | N
     return None
 
 
-def _parse_safety_json(raw: str) -> bool | None:
+def _extract_json_object(raw: str) -> dict | None:
     stripped = raw.strip()
     try:
-        parsed = json.loads(stripped)
+        return json.loads(stripped)
     except Exception:
-        match = re.search(r"\{.*\}", stripped, re.DOTALL)
-        if not match:
-            logger.warning("safety classifier returned unparseable output: %r", raw)
-            return None
-        try:
-            parsed = json.loads(match.group(0))
-        except Exception:
-            logger.warning("safety classifier returned unparseable output: %r", raw)
-            return None
-    verdict = str(parsed.get("User Safety", "")).strip().lower()
+        pass
+    match = re.search(r"\{.*\}", stripped, re.DOTALL)
+    if not match:
+        return None
+    try:
+        return json.loads(match.group(0))
+    except Exception:
+        return None
+
+
+def _parse_safety_field(raw: str, field: str) -> bool | None:
+    parsed = _extract_json_object(raw)
+    if parsed is None:
+        logger.warning("safety classifier returned unparseable output: %r", raw)
+        return None
+    verdict = str(parsed.get(field, "")).strip().lower()
     if verdict == "safe":
         return True
     if verdict == "unsafe":
@@ -142,19 +148,31 @@ def _call_nemoguard(model: str, messages: list[dict], max_tokens: int, role: str
         )
 
 
-def _direct_safety_check(raw_message: str) -> bool | None:
-    prompt = _SAFETY_TASK + f"<BEGIN CONVERSATION>\nuser: {raw_message}\n<END CONVERSATION>\n" + _SAFETY_RESPONSE_FORMAT
-    response = _call_nemoguard(
-        settings.nemoguard_safety_model,
-        [{"role": "user", "content": prompt}],
-        200,
-        "safety_gate",
-    )
-    return _parse_safety_json(response.choices[0].message.content or "")
+def _build_conversation(user_message: str, response_message: str | None) -> str:
+    lines = [f"user: {user_message}"]
+    if response_message is not None:
+        lines.append(f"response: agent: {response_message}")
+    return "\n".join(lines) + "\n"
 
 
-def _fallback_safety_check(raw_message: str) -> bool | None:
-    prompt = _SAFETY_TASK + f"<BEGIN CONVERSATION>\nuser: {raw_message}\n<END CONVERSATION>\n" + _SAFETY_RESPONSE_FORMAT
+def _safety_prompt(user_message: str, response_message: str | None) -> str:
+    conversation = _build_conversation(user_message, response_message)
+    return _SAFETY_TASK + f"<BEGIN CONVERSATION>\n{conversation}<END CONVERSATION>\n" + _SAFETY_RESPONSE_FORMAT
+
+
+def _safety_field_for(response_message: str | None) -> str:
+    return "User Safety" if response_message is None else "Response Safety"
+
+
+def _direct_safety_check(user_message: str, response_message: str | None = None) -> bool | None:
+    prompt = _safety_prompt(user_message, response_message)
+    role = "safety_gate" if response_message is None else "response_safety_gate"
+    response = _call_nemoguard(settings.nemoguard_safety_model, [{"role": "user", "content": prompt}], 200, role)
+    return _parse_safety_field(response.choices[0].message.content or "", _safety_field_for(response_message))
+
+
+def _fallback_safety_check(user_message: str, response_message: str | None = None) -> bool | None:
+    prompt = _safety_prompt(user_message, response_message)
     try:
         result = generate_planner(
             [{"role": "user", "content": prompt}],
@@ -165,25 +183,25 @@ def _fallback_safety_check(raw_message: str) -> bool | None:
     except Exception as error:
         logger.warning("safety fallback classifier failed: %s", error)
         return None
-    return _parse_safety_json(result.content)
+    return _parse_safety_field(result.content, _safety_field_for(response_message))
 
 
-def _safety_classifier_verdict(raw_message: str) -> bool | None:
+def _safety_classifier_verdict(user_message: str, response_message: str | None = None) -> bool | None:
     if settings.guardrail_skip_nemoguard_safety:
-        return _fallback_safety_check(raw_message)
+        return _fallback_safety_check(user_message, response_message)
     breaker = _breakers["safety"]
     if not breaker.allow():
         logger.warning("safety NeMoGuard circuit open, using fallback classifier")
-        return _fallback_safety_check(raw_message)
+        return _fallback_safety_check(user_message, response_message)
     try:
-        verdict = _direct_safety_check(raw_message)
+        verdict = _direct_safety_check(user_message, response_message)
     except Exception as error:
         breaker.record_failure()
         logger.warning("NeMoGuard safety call failed: %s", error)
-        return _fallback_safety_check(raw_message)
+        return _fallback_safety_check(user_message, response_message)
     if verdict is None:
         breaker.record_failure()
-        return _fallback_safety_check(raw_message)
+        return _fallback_safety_check(user_message, response_message)
     breaker.record_success()
     return verdict
 
@@ -194,6 +212,20 @@ def check_safety(raw_message: str) -> bool:
     verdict = _safety_classifier_verdict(raw_message)
     if verdict is None:
         logger.warning("safety classifier unavailable or unparseable, failing closed")
+        return False
+    return verdict
+
+
+def check_response_safety(user_message: str, response_message: str) -> bool:
+    # Mirrors check_safety but classifies the assistant's generated answer
+    # (grounded in retrieved context Claude doesn't fully control) rather
+    # than the incoming question. The safety prompt/schema above always
+    # supported a "Response Safety" verdict; this is the first caller that
+    # actually asks for it, so a bad or unexpectedly-unsafe generation no
+    # longer reaches the user or the cache unchecked.
+    verdict = _safety_classifier_verdict(user_message, response_message)
+    if verdict is None:
+        logger.warning("response safety classifier unavailable or unparseable, failing closed")
         return False
     return verdict
 
@@ -218,19 +250,34 @@ def _fallback_topic_check(standalone_question: str) -> bool | None:
     return _parse_binary_verdict(result.content, true_word="on-topic", false_word="off-topic")
 
 
+_SMALL_TALK_PHRASES = {
+    "hi",
+    "hii",
+    "hiya",
+    "hello",
+    "hey",
+    "hey there",
+    "yo",
+    "sup",
+    "good morning",
+    "good afternoon",
+    "good evening",
+    "thanks",
+    "thank you",
+    "thanks a lot",
+    "thank you very much",
+    "ok thanks",
+    "okay thanks",
+    "bye",
+    "goodbye",
+    "see you",
+    "cheers",
+}
+
+
 def _is_small_talk(standalone_question: str) -> bool:
-    normalized = re.sub(r"\s+", " ", standalone_question.strip().lower())
-    return normalized in {
-        "hi",
-        "hello",
-        "hey",
-        "good morning",
-        "good afternoon",
-        "thanks",
-        "thank you",
-        "bye",
-        "goodbye",
-    }
+    normalized = re.sub(r"\s+", " ", standalone_question.strip().lower()).rstrip("!.")
+    return normalized in _SMALL_TALK_PHRASES
 
 
 def check_topic(standalone_question: str) -> bool:
@@ -288,3 +335,13 @@ def topic_gate(standalone_question: str) -> tuple[bool, str | None]:
     except Exception as error:
         logger.error("topic gate failed, failing closed: %s", error)
         return False, OFF_TOPIC_REFUSAL
+
+
+def response_safety_gate(user_message: str, response_message: str) -> tuple[bool, str | None]:
+    try:
+        if not check_response_safety(user_message, response_message):
+            return False, UNSAFE_REFUSAL
+        return True, None
+    except Exception as error:
+        logger.error("response safety gate failed, failing closed: %s", error)
+        return False, UNSAFE_REFUSAL

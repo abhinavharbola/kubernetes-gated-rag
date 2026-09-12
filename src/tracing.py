@@ -1,3 +1,5 @@
+import hashlib
+
 import logfire
 
 from src.config import settings
@@ -17,7 +19,21 @@ logfire.configure(
 
 
 def turn_span(user_message: str):
-    return logfire.span("user_turn", user_message=user_message)
+    # The safety taxonomy this project checks input against explicitly
+    # includes PII/Privacy (S9) — shipping the raw, unredacted question to a
+    # third-party observability backend by default would be inconsistent
+    # with that. Length and a short hash are enough to correlate a span
+    # with a specific question locally (e.g. against exact-cache keys)
+    # without exporting its contents. Full raw content is still available
+    # for local debugging via settings.tracing_log_raw_messages, off by
+    # default.
+    attributes = {
+        "user_message_length": len(user_message),
+        "user_message_hash": hashlib.sha256(user_message.encode("utf-8")).hexdigest()[:12],
+    }
+    if settings.tracing_log_raw_messages:
+        attributes["user_message"] = user_message
+    return logfire.span("user_turn", **attributes)
 
 
 def node_span(name: str, **attributes):

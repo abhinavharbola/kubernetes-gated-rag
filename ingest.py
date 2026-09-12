@@ -1,4 +1,5 @@
 import argparse
+import hashlib
 import logging
 import time
 import uuid
@@ -41,6 +42,16 @@ INGEST_EMBED_DELAY_SECONDS = 1.0
 # each request quick and means a mid-file failure doesn't lose the points
 # that already made it in.
 UPSERT_BATCH_SIZE = 64
+
+# src/retrieval/cache.py reads this file to get the "effective" corpus
+# version for cache keys, falling back to settings.corpus_version when it
+# doesn't exist. That marker is written below, from a hash of every file
+# that actually made it into the corpus this run (path + content). Deriving
+# it from content rather than relying on a human to bump CORPUS_VERSION
+# means an incremental re-ingest (no --wipe, just adding/changing files)
+# still invalidates stale cached answers automatically, instead of them
+# silently surviving forever because nobody remembered to edit .env.
+CORPUS_VERSION_MARKER = Path(".cache/corpus_version")
 
 
 @retry(
@@ -103,11 +114,15 @@ def _wipe_exact_cache() -> None:
     logger.info("wiped %d entr%s from the local exact cache", count, "y" if count == 1 else "ies")
 
 
-def ingest_directory(directory: Path) -> dict:
+def ingest_directory(directory: Path, corpus_hasher: "hashlib._Hash | None" = None) -> dict:
     ingested = 0
     skipped_irrelevant = 0
 
-    for path in directory.rglob("*"):
+    # Sorted so the corpus fingerprint is deterministic across runs on the
+    # same content — rglob's own order depends on filesystem/OS details and
+    # would otherwise make corpus_hasher's digest vary between two ingests
+    # of identical files, defeating the point of fingerprinting.
+    for path in sorted(directory.rglob("*")):
         if not path.is_file() or path.suffix.lower() not in PARSERS:
             continue
 
@@ -143,7 +158,17 @@ def ingest_directory(directory: Path) -> dict:
                 _upsert_batch(points[batch_start : batch_start + UPSERT_BATCH_SIZE])
             ingested += len(points)
 
+            if corpus_hasher is not None:
+                corpus_hasher.update(str(path.relative_to(directory)).encode("utf-8"))
+                corpus_hasher.update(text.encode("utf-8"))
+
     return {"ingested": ingested, "skipped_irrelevant": skipped_irrelevant}
+
+
+def _write_corpus_version(fingerprint: str) -> None:
+    CORPUS_VERSION_MARKER.parent.mkdir(parents=True, exist_ok=True)
+    CORPUS_VERSION_MARKER.write_text(fingerprint)
+    logger.info("corpus fingerprint written: %s", fingerprint)
 
 
 def main() -> None:
@@ -159,8 +184,10 @@ def main() -> None:
     parser.add_argument(
         "--wipe",
         action="store_true",
-        help="delete and recreate the docs collection AND the semantic/exact caches first "
-        "(a corpus refresh without --wipe leaves stale cached answers pointing at old content)",
+        help="delete and recreate the docs collection AND the semantic/exact caches first. "
+        "Not required for cache correctness any more (the corpus fingerprint written to "
+        ".cache/corpus_version after every run already invalidates stale cached answers "
+        "automatically), it's for reclaiming space / starting from a clean collection.",
     )
     args = parser.parse_args()
 
@@ -168,9 +195,10 @@ def main() -> None:
 
     true_dir = args.data_dir / TRUE_DIR_NAME
     noisy_dir = args.data_dir / NOISY_DIR_NAME
+    corpus_hasher = hashlib.sha256()
 
     if true_dir.is_dir():
-        result = ingest_directory(true_dir)
+        result = ingest_directory(true_dir, corpus_hasher)
         print(
             f"ingested {result['ingested']} chunks from {true_dir}, "
             f"skipped {result['skipped_irrelevant']} document(s) as irrelevant"
@@ -179,7 +207,7 @@ def main() -> None:
         print(f"no {TRUE_DIR_NAME}/ found under {args.data_dir}, skipping")
 
     if noisy_dir.is_dir():
-        result = ingest_directory(noisy_dir)
+        result = ingest_directory(noisy_dir, corpus_hasher)
         print(
             f"ingested {result['ingested']} chunks from {noisy_dir}, "
             f"skipped {result['skipped_irrelevant']} document(s) as irrelevant "
@@ -188,6 +216,11 @@ def main() -> None:
     else:
         print(f"no {NOISY_DIR_NAME}/ found under {args.data_dir}, skipping")
 
+    _write_corpus_version(corpus_hasher.hexdigest()[:16])
+
 
 if __name__ == "__main__":
     main()
+
+
+

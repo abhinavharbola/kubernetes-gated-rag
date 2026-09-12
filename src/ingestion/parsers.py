@@ -53,3 +53,6 @@ def parse_file(path: Path) -> str:
     if parser is None:
         raise ValueError(f"no parser registered for extension: {path.suffix}")
     return parser(path)
+
+
+

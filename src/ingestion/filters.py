@@ -50,3 +50,6 @@ def is_relevant(document_text: str) -> bool:
 
     logger.warning("relevance classifier gave unparseable verdict %r, ingesting anyway", verdict)
     return True
+
+
+

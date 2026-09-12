@@ -73,6 +73,21 @@ def test_planner_uses_nim_then_groq(mock_nim, mock_groq):
     mock_groq.chat.completions.create.assert_not_called()
 
 
+@patch("src.providers.llm.nim_client")
+@patch("src.providers.llm.groq_client_secondary")
+@patch("src.providers.llm.groq_client")
+def test_empty_completion_fails_over_to_next_provider(mock_groq, mock_groq_secondary, mock_nim):
+    # Content=None used to raise a bare RuntimeError, which _run_chain's
+    # is_transient check didn't recognize as failover-worthy, killing the
+    # whole chain on the first provider's empty response instead of trying
+    # the next one.
+    mock_groq.chat.completions.create.return_value = _mock_completion(None)
+    mock_groq_secondary.chat.completions.create.return_value = _mock_completion("secondary answer")
+    result = generate_main([{"role": "user", "content": "hi"}])
+    assert result.provider == "groq-secondary"
+    assert result.content == "secondary answer"
+
+
 @patch("src.providers.llm.groq_client")
 @patch("src.providers.llm.nim_client")
 def test_non_transient_error_does_not_fail_over(mock_nim, mock_groq):
@@ -121,3 +136,6 @@ def test_open_breaker_never_skips_the_last_link(mock_nim, mock_groq):
     with pytest.raises(RuntimeError):
         generate_planner([{"role": "user", "content": "q4"}])
     assert mock_groq.chat.completions.create.call_count >= 2
+
+
+

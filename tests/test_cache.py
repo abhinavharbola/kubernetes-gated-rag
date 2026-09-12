@@ -33,6 +33,15 @@ def clear_exact_cache():
     _exact_cache.clear()
 
 
+@pytest.fixture(autouse=True)
+def isolate_corpus_version_marker(tmp_path, monkeypatch):
+    # _current_corpus_version() reads a real file path; point it at a tmp
+    # path per test so tests can't see a leftover marker from a real
+    # `python ingest.py` run in this checkout, and can't leave one behind
+    # for other tests either.
+    monkeypatch.setattr(cache_module, "_CORPUS_VERSION_MARKER", tmp_path / "corpus_version")
+
+
 def test_normalize_collapses_whitespace_case_and_punctuation():
     assert normalize_exact("  How Do I Create a Resource?  ") == "how do i create a resource"
 
@@ -43,6 +52,20 @@ def test_normalize_does_not_collapse_different_questions():
 
 def test_normalize_preserves_hyphens_in_kubernetes_identifiers():
     assert normalize_exact("What does the kube-system namespace do?") != normalize_exact("What does the kubesystem namespace do?")
+
+
+def test_normalize_preserves_slashes_in_api_groups():
+    # "apps/v1" and "apps v1" are different Kubernetes API syntax and must
+    # not collapse onto the same exact-cache key.
+    assert normalize_exact("what apiVersion is apps/v1?") != normalize_exact("what apiVersion is apps v1?")
+
+
+def test_normalize_preserves_dots_in_field_paths():
+    assert normalize_exact("what is pod.spec.containers?") != normalize_exact("what is pod spec containers?")
+
+
+def test_normalize_still_strips_cosmetic_punctuation():
+    assert normalize_exact('What is a Pod?') == normalize_exact("What is a Pod")
 
 
 def test_normalize_semantic_only_collapses_whitespace():
@@ -60,7 +83,7 @@ def test_exact_cache_miss_returns_none():
 
 def test_exact_cache_is_invalidated_by_cache_versions(monkeypatch):
     exact_cache_set("question", "answer")
-    monkeypatch.setattr("src.retrieval.cache.settings.cache_policy_version", "2")
+    monkeypatch.setattr("src.retrieval.cache.settings.cache_policy_version", "some-other-policy-version")
     assert exact_cache_get("question") is None
 
 
@@ -98,8 +121,8 @@ def test_semantic_cache_set_stores_cache_version_metadata(mock_qdrant):
     assert payload == {
         "question": "canonical question",
         "answer": "an answer",
-        "cache_schema_version": "3",
-        "policy_version": "1",
+        "cache_schema_version": cache_module.settings.cache_schema_version,
+        "policy_version": cache_module.settings.cache_policy_version,
         "corpus_version": "1",
     }
 
@@ -135,3 +158,47 @@ def test_semantic_cache_get_ensures_indexes_before_querying(mock_qdrant):
 def test_semantic_cache_get_treats_qdrant_failure_as_a_miss(mock_qdrant):
     mock_qdrant.query_points.side_effect = Exception("read timeout")
     assert semantic_cache_get([0.1] * 768) is None
+
+
+def test_current_corpus_version_falls_back_to_settings_when_marker_absent():
+    assert cache_module._current_corpus_version() == cache_module.settings.corpus_version
+
+
+def test_current_corpus_version_prefers_marker_file_when_present():
+    cache_module._CORPUS_VERSION_MARKER.write_text("abc123fingerprint")
+    assert cache_module._current_corpus_version() == "abc123fingerprint"
+
+
+def test_exact_key_changes_when_corpus_fingerprint_changes():
+    exact_cache_set("question", "answer from old corpus")
+    cache_module._CORPUS_VERSION_MARKER.write_text("new-fingerprint")
+    # a re-ingest that changes the corpus (without touching CACHE_POLICY_VERSION
+    # or CACHE_SCHEMA_VERSION) must invalidate the old entry on its own.
+    assert exact_cache_get("question") is None
+
+
+@patch("src.retrieval.cache.qdrant_client")
+def test_semantic_cache_set_uses_current_corpus_fingerprint(mock_qdrant):
+    cache_module._CORPUS_VERSION_MARKER.write_text("fingerprint-xyz")
+    semantic_cache_set("canonical question", [0.2] * 768, "an answer")
+    payload = mock_qdrant.upsert.call_args.kwargs["points"][0].payload
+    assert payload["corpus_version"] == "fingerprint-xyz"
+
+
+@patch("src.retrieval.cache.qdrant_client")
+def test_ensure_semantic_cache_indexes_does_not_latch_on_real_failure(mock_qdrant):
+    # A genuine failure (e.g. the collection doesn't exist yet because
+    # ingest.py hasn't run) must not permanently mark indexes as ensured —
+    # that would silently degrade the semantic cache to an always-miss for
+    # the rest of the process, with no way to recover short of a restart.
+    mock_qdrant.create_payload_index.side_effect = Exception("collection not found")
+    ensure_semantic_cache_indexes()
+    assert cache_module._indexes_ensured is False
+
+    mock_qdrant.create_payload_index.side_effect = None
+    ensure_semantic_cache_indexes()
+    assert cache_module._indexes_ensured is True
+    assert mock_qdrant.create_payload_index.call_count == 6
+
+
+

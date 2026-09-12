@@ -1,6 +1,8 @@
 from unittest.mock import patch
 
-from src.retrieval.rerank import rerank_and_gate
+import pytest
+
+from src.retrieval.rerank import RerankUnavailableError, rerank_and_gate
 
 
 def _candidate(text, manifest_kind=None, manifest_name=None):
@@ -25,11 +27,15 @@ def test_below_threshold_candidates_are_dropped(mock_ranker, mock_settings):
 
 @patch("src.retrieval.rerank.settings")
 @patch("src.retrieval.rerank._ranker")
-def test_ranker_failure_fails_closed_by_default(mock_ranker, mock_settings):
+def test_ranker_crash_raises_unavailable_by_default(mock_ranker, mock_settings):
+    # A FlashRank crash is an infrastructure failure, not a real "nothing is
+    # relevant" verdict. It must not be silently swallowed into [] and then
+    # cached by graph.py as a genuine "no grounded documentation" answer.
     mock_settings.rerank_score_threshold = 0.5
     mock_settings.rerank_fail_closed = True
     mock_ranker.rerank.side_effect = RuntimeError("ONNX load failed")
-    assert rerank_and_gate("question", [_candidate("chunk")]) == []
+    with pytest.raises(RerankUnavailableError):
+        rerank_and_gate("question", [_candidate("chunk")])
 
 
 @patch("src.retrieval.rerank.settings")

@@ -5,6 +5,19 @@ import pytest
 from src.retrieval.embeddings import embed_texts
 
 
+@pytest.fixture(autouse=True)
+def clear_embedding_cache():
+    # _embedding_cache is a real diskcache.Cache persisted at .cache/embeddings
+    # across process runs (not just across tests in one run) — without
+    # clearing it, a question cached by a previous test run makes this
+    # test's "first call populates the cache" assumption false on the next
+    # run in the same checkout, and _embed_batch is never actually called.
+    from src.retrieval.embeddings import _embedding_cache
+    _embedding_cache.clear()
+    yield
+    _embedding_cache.clear()
+
+
 def test_embed_texts_empty_list_returns_empty_list():
     assert embed_texts([], task_type="RETRIEVAL_QUERY") == []
 
@@ -31,3 +44,6 @@ def test_embed_texts_uses_persistent_cache_before_calling_gemini():
         second = embed_texts(["cached question"], task_type="RETRIEVAL_QUERY")
     assert first == second
     embed_batch.assert_called_once()
+
+
+

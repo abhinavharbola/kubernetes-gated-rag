@@ -15,3 +15,6 @@ JAILBREAK_PATTERNS = (
 
 def deterministic_jailbreak_check(raw_message: str) -> bool:
     return any(pattern.search(raw_message) for pattern in JAILBREAK_PATTERNS)
+
+
+

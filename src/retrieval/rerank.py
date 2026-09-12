@@ -8,6 +8,15 @@ logger = logging.getLogger(__name__)
 _ranker: Ranker | None = None
 
 
+class RerankUnavailableError(Exception):
+    """Raised when FlashRank itself failed to run (model load, ONNX runtime
+    error, etc.) and settings.rerank_fail_closed is True. This is distinct
+    from "the ranker ran fine and every candidate scored below the
+    threshold" — that's a real, cacheable "no grounded documentation"
+    outcome. A ranker crash is an infrastructure problem, and graph.py must
+    not cache it as if it were a genuine relevance verdict."""
+
+
 def _get_ranker() -> Ranker:
     global _ranker
     if _ranker is None:
@@ -30,9 +39,9 @@ def rerank_and_gate(question: str, candidates: list[dict]) -> list[dict]:
     try:
         reranked = _get_ranker().rerank(request)
     except Exception as error:
-        logger.error("FlashRank failed; failing closed: %s", error)
+        logger.error("FlashRank failed: %s", error)
         if settings.rerank_fail_closed:
-            return []
+            raise RerankUnavailableError(str(error)) from error
         return sorted(candidates, key=lambda c: c.get("retrieval_score", 0.0), reverse=True)
 
     scored = []

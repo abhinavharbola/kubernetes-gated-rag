@@ -56,22 +56,23 @@ CSS = """
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap');
 
 :root {
-    --bg: #FFFFFF;
-    --bg-sidebar: #F7F7F8;
+    --bg: #EEF0F3;
+    --bg-sidebar: #E4E7EC;
     --surface: #FFFFFF;
-    --surface-sunken: #F7F7F8;
-    --border: #E5E5E5;
-    --border-strong: #D8D8D8;
-    --text: #1A1A1A;
-    --text-muted: #6E6E6E;
-    --text-faint: #9C9C9C;
+    --surface-sunken: #F3F4F6;
+    --border: #D9DCE1;
+    --border-strong: #C6CAD1;
+    --text: #16181D;
+    --text-muted: #5B5F68;
+    --text-faint: #868B94;
     --accent: #2563EB;
     --accent-hover: #1D4ED8;
     --accent-soft: #EFF4FF;
-    --user-bubble: #F0F1F5;
+    --user-bubble: #E4E7EC;
     --ok: #15803D;
     --warn: #B45309;
     --bad: #DC2626;
+    --shadow-card: 0 1px 2px rgba(16, 20, 27, 0.06), 0 1px 1px rgba(16, 20, 27, 0.04);
     --font-ui: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
     --font-mono: "IBM Plex Mono", ui-monospace, "SFMono-Regular", monospace;
 }
@@ -84,7 +85,7 @@ code { font-family: var(--font-mono); }
 
 [data-testid="stSidebar"] {
     background: var(--bg-sidebar);
-    border-right: 1px solid var(--border);
+    border-right: 1px solid var(--border-strong);
 }
 [data-testid="stSidebar"] [data-testid="stMarkdownContainer"] p { color: var(--text-muted); }
 
@@ -133,14 +134,14 @@ code { font-family: var(--font-mono); }
 
 .empty-hero { padding: 12vh 0 0 0; text-align: center; }
 .empty-hero h1 { font-size: 1.7rem; font-weight: 600; color: var(--text); margin-bottom: 0.4rem; }
-.empty-hero p { color: var(--text-muted); font-size: 0.95rem; max-width: 40ch; margin: 0 auto 1.6rem auto; }
+.empty-hero p { color: var(--text-muted); font-size: 0.95rem; margin: 0 auto 1.6rem auto; }
 
 .st-key-suggestions { max-width: 40rem; margin: 0 auto; }
 .st-key-suggestions .stButton button {
     text-align: left; white-space: normal; height: auto; border-radius: 12px;
     border: 1px solid var(--border) !important; background: var(--surface) !important;
     color: var(--text) !important; font-size: 0.85rem !important; padding: 0.75rem 0.9rem !important;
-    box-shadow: none !important; font-weight: 400 !important;
+    box-shadow: var(--shadow-card) !important; font-weight: 400 !important;
 }
 .st-key-suggestions .stButton button:hover { border-color: var(--accent) !important; background: var(--accent-soft) !important; }
 
@@ -150,6 +151,7 @@ code { font-family: var(--font-mono); }
 }
 [data-testid="stChatMessage"]:has([data-testid="stChatMessageAvatarUser"]) [data-testid="stChatMessageContent"] {
     background: var(--user-bubble); border-radius: 18px; padding: 0.65rem 1rem; display: inline-block;
+    box-shadow: var(--shadow-card);
 }
 [data-testid="stChatMessage"]:has([data-testid="stChatMessageAvatarAssistant"]) {
     background: transparent; padding-bottom: 0.6rem;
@@ -159,9 +161,11 @@ code { font-family: var(--font-mono); }
     background: var(--accent) !important; width: 26px !important; height: 26px !important; font-size: 0.8rem !important;
 }
 
+[data-testid="stBottom"], [data-testid="stBottomBlockContainer"] { background: var(--bg) !important; }
+
 [data-testid="stChatInput"] {
     background: var(--surface) !important; border: 1px solid var(--border-strong) !important;
-    border-radius: 18px !important; box-shadow: 0 4px 16px rgba(0,0,0,0.06) !important;
+    border-radius: 18px !important; box-shadow: 0 4px 16px rgba(16, 20, 27, 0.1) !important;
 }
 [data-testid="stChatInput"] textarea { color: var(--text) !important; }
 [data-testid="stChatInputSubmitButton"] { background: var(--accent) !important; border-radius: 10px !important; }
@@ -169,7 +173,7 @@ code { font-family: var(--font-mono); }
 
 [data-testid="stExpander"] {
     border: 1px solid var(--border) !important; border-radius: 10px !important;
-    background: var(--surface-sunken) !important; box-shadow: none !important; margin-top: 0.3rem;
+    background: var(--surface) !important; box-shadow: var(--shadow-card) !important; margin-top: 0.3rem;
 }
 [data-testid="stExpander"] summary { font-size: 0.78rem !important; color: var(--text-muted) !important; }
 

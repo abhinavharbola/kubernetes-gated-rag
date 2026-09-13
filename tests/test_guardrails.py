@@ -3,7 +3,7 @@ from unittest.mock import MagicMock, patch
 
 from src.config import settings
 from src.guardrails import response_safety_gate, safety_gate, topic_gate
-from src.guardrails.colang_rules import deterministic_jailbreak_check
+from src.guardrails.jailbreak_patterns import deterministic_jailbreak_check
 from src.guardrails.gates import reset_circuit_breakers
 from src.providers.llm import CompletionResult
 
@@ -187,6 +187,9 @@ def test_response_safety_gate_fails_closed_when_primary_and_fallback_error(mock_
     allowed, reason = response_safety_gate("question", "answer")
     assert allowed is False
     assert reason is not None
+
+
+
 
 
 

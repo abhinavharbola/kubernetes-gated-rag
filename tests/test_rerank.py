@@ -45,3 +45,6 @@ def test_ranker_failure_can_use_availability_fallback_when_explicitly_enabled(mo
     mock_ranker.rerank.side_effect = RuntimeError("ONNX load failed")
     candidates = [{**_candidate("low"), "retrieval_score": 0.3}, {**_candidate("high"), "retrieval_score": 0.7}]
     assert [c["text"] for c in rerank_and_gate("question", candidates)] == ["high", "low"]
+
+
+

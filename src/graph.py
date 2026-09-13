@@ -6,7 +6,7 @@ from typing import TypedDict
 
 from langgraph.graph import StateGraph, START, END
 
-from src.guardrails.colang_rules import deterministic_jailbreak_check
+from src.guardrails.jailbreak_patterns import deterministic_jailbreak_check
 from src.retrieval.cache import (
     embed_canonical_question,
     exact_cache_get,
@@ -358,3 +358,6 @@ def run_turn(raw_message: str, chat_history: list[dict]) -> GraphState:
             final_state["answer"] = final_state["refusal_reason"]
     final_state["latency_seconds"] = time.perf_counter() - start
     return final_state
+
+
+

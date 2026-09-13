@@ -2,7 +2,7 @@ import json
 import logging
 import re
 
-from src.guardrails.colang_rules import deterministic_jailbreak_check
+from src.guardrails.jailbreak_patterns import deterministic_jailbreak_check
 from src.config import settings
 from src.providers.circuit_breaker import CircuitBreaker
 from src.providers.clients import nim_client
@@ -345,3 +345,6 @@ def response_safety_gate(user_message: str, response_message: str) -> tuple[bool
     except Exception as error:
         logger.error("response safety gate failed, failing closed: %s", error)
         return False, UNSAFE_REFUSAL
+
+
+

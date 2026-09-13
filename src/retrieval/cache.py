@@ -196,3 +196,6 @@ def semantic_cache_set(canonical_question: str, canonical_question_vector: list[
             )
         ],
     )
+
+
+

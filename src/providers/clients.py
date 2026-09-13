@@ -43,3 +43,6 @@ qdrant_client = QdrantClient(
 
 
 
+
+
+

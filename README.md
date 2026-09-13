@@ -60,7 +60,7 @@ Generated-answer cache writes happen in the background so Qdrant and disk I/O ar
 
 ## Provider latency budgets
 
-Generation defaults to a 15 second per-provider timeout. Planner operations default to 4 seconds. NeMoGuard calls default to 3 seconds. Provider links fail over immediately on transient errors instead of retrying the same provider before moving on. Qdrant uses a 2 second client timeout for the interactive path.
+Generation defaults to a 15 second per-provider timeout. Planner operations default to 4 seconds. NeMoGuard calls default to 3 seconds. Provider links fail over immediately on transient errors instead of retrying the same provider before moving on. Qdrant uses a 5 second client timeout for the interactive path (raised from an earlier 2 seconds, which was too tight for real hosted Qdrant Cloud latency and caused ReadTimeouts on healthy requests).
 
 These values are starting budgets, not universal truths. Generation quality and provider tail latency still depend on the deployed models and network path.
 
@@ -107,7 +107,7 @@ kubernetes-gated-rag/
 │   ├── graph.py
 │   ├── tracing.py
 │   ├── guardrails/
-│   │   ├── colang_rules.py
+│   │   ├── jailbreak_patterns.py
 │   │   └── gates.py
 │   ├── ingestion/
 │   │   ├── chunking.py
@@ -127,6 +127,9 @@ kubernetes-gated-rag/
 ├── requirements.txt
 └── .env.example
 ```
+
+
+
 
 
 

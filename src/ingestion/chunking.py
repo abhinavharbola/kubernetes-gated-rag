@@ -155,3 +155,6 @@ def chunk_document(text: str, base_metadata: dict) -> list[dict]:
             }
             chunks.append({"text": block["text"], "metadata": metadata})
     return chunks
+
+
+

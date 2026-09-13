@@ -50,3 +50,6 @@ def rerank_and_gate(question: str, candidates: list[dict]) -> list[dict]:
         scored.append({**candidate, "rerank_score": result["score"]})
     scored.sort(key=lambda c: c["rerank_score"], reverse=True)
     return [c for c in scored if c["rerank_score"] >= settings.rerank_score_threshold]
+
+
+

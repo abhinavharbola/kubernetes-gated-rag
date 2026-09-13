@@ -221,10 +221,18 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    ensure_collection(wipe=args.wipe)
-
     true_dir = args.data_dir / TRUE_DIR_NAME
     noisy_dir = args.data_dir / NOISY_DIR_NAME
+
+    if not true_dir.is_dir() and not noisy_dir.is_dir():
+        parser.error(
+            f"neither {TRUE_DIR_NAME}/ nor {NOISY_DIR_NAME}/ found under {args.data_dir}; "
+            "refusing to run, since writing a corpus fingerprint from zero ingested files "
+            "would invalidate every cached answer for the real corpus"
+        )
+
+    ensure_collection(wipe=args.wipe)
+
     corpus_hasher = hashlib.sha256()
     total_failed = 0
 
@@ -258,3 +266,6 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+

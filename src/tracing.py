@@ -46,3 +46,6 @@ def provider_call_span(provider: str, model: str, role: str):
 
 def log_cache_decision(layer: str, hit: bool):
     logfire.info("cache_decision", layer=layer, hit=hit)
+
+
+

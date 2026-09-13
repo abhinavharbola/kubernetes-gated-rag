@@ -18,6 +18,19 @@ SEPARATOR_LINE_RE = re.compile(r"^---[ \t]*\r?\n?", re.MULTILINE)
 FALLBACK_WINDOW_WORDS = 300
 FALLBACK_OVERLAP_WORDS = 50
 
+# Same cap as the prose fallback window, applied to manifest blocks too. A
+# manifest block used to be emitted as a single chunk no matter how large —
+# fine for a typical Pod/Deployment manifest, but a large CRD, a big
+# multi-container spec, or a ConfigMap embedding a whole config file could
+# run to several thousand words, embedded whole with no truncation guard.
+# Gemini's embedding endpoint has an input token ceiling; a chunk over it
+# either gets silently truncated server-side or rejected, and either way the
+# indexed vector no longer represents the full manifest. Reusing
+# _fallback_window keeps a manifest block's kind/name metadata attached to
+# every sub-chunk it's split into, so retrieval and the UI still show which
+# resource a hit came from.
+MANIFEST_MAX_WORDS = FALLBACK_WINDOW_WORDS
+
 
 def split_by_markdown_headers(text: str) -> list[dict]:
     matches = list(MARKDOWN_HEADER_RE.finditer(text))
@@ -89,7 +102,15 @@ def split_by_manifest_blocks(section_text: str) -> list[dict]:
 
         if block_text:
             kind, name = _parse_manifest_kind_and_name(block_text)
-            blocks.append({"text": block_text, "kind": kind, "name": name})
+            if len(block_text.split()) > MANIFEST_MAX_WORDS:
+                # too large for one embedding-safe chunk — window it like
+                # prose, but keep the parsed kind/name on every sub-chunk so
+                # a hit anywhere in the manifest still identifies which
+                # resource it came from.
+                for sub_chunk in _fallback_window(block_text):
+                    blocks.append({"text": sub_chunk["text"], "kind": kind, "name": name})
+            else:
+                blocks.append({"text": block_text, "kind": kind, "name": name})
         cursor = end
 
     # no trailing-leftover step after this loop: `end` for the last match is
@@ -134,6 +155,3 @@ def chunk_document(text: str, base_metadata: dict) -> list[dict]:
             }
             chunks.append({"text": block["text"], "metadata": metadata})
     return chunks
-
-
-

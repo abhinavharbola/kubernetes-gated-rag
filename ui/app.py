@@ -1,4 +1,5 @@
 import logging
+import random
 import sys
 from pathlib import Path
 
@@ -24,10 +25,10 @@ from src.retrieval.rerank import preload as preload_rerank
 
 logger = logging.getLogger(__name__)
 
-st.set_page_config(page_title="Kubernetes RAG", page_icon="◧", layout="centered")
+st.set_page_config(page_title="Kubernetes RAG", page_icon="◆", layout="centered")
 
 
-@st.cache_resource(show_spinner="Warming up the local reranker (one-time, first load only)…")
+@st.cache_resource(show_spinner="Loading the local reranker (first run only)…")
 def _warm_up_models() -> bool:
     # unguarded, this crashed the whole app at startup (before any UI
     # renders) on a model-download hiccup — no network on first run, disk
@@ -42,300 +43,230 @@ def _warm_up_models() -> bool:
         logger.exception("reranker warmup failed, will retry lazily on first use")
     return True
 
+
 _warm_up_models()
 
 PIPELINE_ERROR_MESSAGE = (
     "Something went wrong completing that request. This is usually a transient "
-    "provider issue, try again in a moment."
+    "provider issue — try again in a moment."
 )
+
+# ---------------------------------------------------------------------------
+# Design system
+#
+# Modeled on how production chat products are actually structured: no
+# boxed "app shell" card sitting on a different-colored canvas, just a flat
+# page — a plain white/near-white conversation pane, a faintly tinted
+# sidebar for separation, and a floating rounded input bar. User turns get
+# a soft tinted bubble; assistant turns are plain text, the way most
+# assistants render their own replies. One quiet accent color, one
+# typeface for UI text, a monospace face reserved strictly for values that
+# are actually data (trace segments, scores, stats).
+# ---------------------------------------------------------------------------
 
 CUSTOM_CSS = """
 <style>
-@import url('https://fonts.googleapis.com/css2?family=Sora:wght@500;600;700&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500;600&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap');
 
-/* --- Design system ---
-   This is a Kubernetes Q&A tool built around admission-style gating: every
-   question passes through checks before it's allowed to reach generation,
-   the same way the API server runs admission webhooks on a request before
-   it's persisted. The live trace panel mirrors the same node-and-arrow
-   pipeline diagram used in "How this works", just colored by what
-   actually happened on this specific turn instead of a static overview,
-   so a person only has to learn one visual language for the pipeline,
-   not two.
-
-   Light palette, but a clearly gray-blue canvas rather than a near-white
-   one, panels are a soft off-white raised on top of it, not pure #FFF
-   either, so the page reads as a considered light workspace rather than
-   "everything is white". Monospace is reserved for real data (paths,
-   scores, provider names, latency), not for decorative labels. */
 :root {
-    --bg: #D9DEE7;
-    --panel: #F9FAFC;
-    --panel-raised: #EFF2F6;
-    --border: rgba(17, 24, 39, 0.11);
-    --border-strong: rgba(17, 24, 39, 0.20);
-    --text: #12151C;
-    --text-muted: #565F70;
-    --text-faint: #838C9D;
-    --blue: #2E56D9;
-    --blue-soft: rgba(46, 86, 217, 0.09);
-    --green: #157F45;
-    --green-soft: rgba(21, 127, 69, 0.11);
-    --amber: #A8650A;
-    --amber-soft: rgba(168, 101, 10, 0.11);
-    --red: #C22E2E;
-    --red-soft: rgba(194, 46, 46, 0.10);
-    --shadow-sm: 0 1px 2px rgba(17, 24, 39, 0.06), 0 1px 1px rgba(17, 24, 39, 0.04);
-    --shadow-md: 0 4px 14px rgba(17, 24, 39, 0.10), 0 1px 2px rgba(17, 24, 39, 0.06);
-    --content-width: 820px;
-    --font-display: "Sora", "Segoe UI", sans-serif;
-    --font-sans: "IBM Plex Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-    --font-mono: "IBM Plex Mono", "Fira Code", ui-monospace, monospace;
+    --bg: #FCFCFB;
+    --bg-sidebar: #F4F4F2;
+    --surface: #FFFFFF;
+    --border: #E6E5E1;
+    --border-strong: #D6D5D0;
+    --text: #1C1C1A;
+    --text-muted: #68676F;
+    --text-faint: #9B9A95;
+    --accent: #3B4FA0;
+    --accent-hover: #303F84;
+    --accent-soft: #EEF0FA;
+    --user-bubble: #F0EEE7;
+    --ready: #1E7A4C;
+    --pending: #A16A08;
+    --failed: #C1342A;
+    --font-ui: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    --font-data: "IBM Plex Mono", ui-monospace, "SFMono-Regular", monospace;
 }
 
-.stApp { font-family: var(--font-sans); background: var(--bg); color: var(--text); }
-.stApp [data-testid="stChatMessage"] { gap: 0.6rem; }
-code, .mono { font-family: var(--font-mono); }
+.stApp { font-family: var(--font-ui); background: var(--bg); color: var(--text); font-size: 0.96rem; }
+.stMarkdown, .stApp p, .stApp li { color: var(--text); line-height: 1.65; }
+code, .mono { font-family: var(--font-data); }
 
-/* Streamlit paints its header bar and the bottom chat-input bar from
-   separate containers that don't inherit .stApp's background, theme.toml
-   now matches this palette too (belt and suspenders: the toml drives
-   Streamlit's own native widget colors, this covers anything it doesn't). */
-[data-testid="stHeader"],
-[data-testid="stBottom"],
-[data-testid="stBottomBlockContainer"] {
+[data-testid="stHeader"], [data-testid="stBottom"], [data-testid="stBottomBlockContainer"] {
     background: var(--bg) !important;
 }
-/* the chat-input bar spans the full viewport width by default; constrain
-   and center the actual input box to match the content column so it reads
-   as one deliberate composition instead of an edge-to-edge form field. */
 [data-testid="stBottomBlockContainer"] { display: flex !important; justify-content: center !important; }
 [data-testid="stChatInput"] {
-    background: var(--panel) !important;
+    background: var(--surface) !important;
     border: 1px solid var(--border-strong) !important;
-    border-radius: 10px !important;
-    box-shadow: var(--shadow-md) !important;
-    max-width: var(--content-width) !important;
+    border-radius: 16px !important;
+    max-width: 780px !important;
+    box-shadow: 0 2px 10px rgba(28, 28, 26, 0.06) !important;
 }
-[data-testid="stChatInput"] textarea { color: var(--text) !important; }
+[data-testid="stChatInput"] textarea { color: var(--text) !important; font-size: 0.95rem !important; }
 [data-testid="stChatInput"] textarea::placeholder { color: var(--text-faint) !important; }
+[data-testid="stChatInputSubmitButton"] { background: var(--accent) !important; border-radius: 10px !important; }
+[data-testid="stChatInputSubmitButton"]:hover { background: var(--accent-hover) !important; }
+[data-testid="stChatInputSubmitButton"] svg { color: #FFFFFF !important; fill: #FFFFFF !important; }
+
+.block-container, [data-testid="stMainBlockContainer"] {
+    max-width: 780px !important;
+    padding-top: 1.4rem !important;
+    padding-bottom: 7rem !important;
+}
+
 .stButton button {
     border-radius: 8px !important;
     border: 1px solid var(--border-strong) !important;
     color: var(--text) !important;
-    background: var(--panel) !important;
-    box-shadow: var(--shadow-sm) !important;
-    transition: box-shadow 0.15s ease, border-color 0.15s ease, transform 0.15s ease !important;
+    background: var(--surface) !important;
+    font-weight: 500 !important;
+    box-shadow: none !important;
+    transition: border-color 0.12s ease, background 0.12s ease !important;
 }
-.stButton button:hover {
-    border-color: var(--blue) !important;
-    color: var(--blue) !important;
-    box-shadow: var(--shadow-md) !important;
-    transform: translateY(-1px) !important;
-}
-.stMarkdown, .stApp p, .stApp li { color: var(--text); }
+.stButton button:hover { border-color: var(--accent) !important; color: var(--accent) !important; background: var(--accent-soft) !important; }
 
-/* the "usable width" of centered layout is capped by Streamlit's own
-   block-container max-width (~730px); this is the one place the content
-   column's width is set — everything else (header, welcome block, chat
-   input) matches var(--content-width) instead of picking its own number,
-   so nothing in the main column reads as narrower or wider than anything
-   else. padding-top must clear stHeader's own height (a fixed bar painted
-   over the top of the scrollable content, same bg color as the page
-   above). */
-.block-container, [data-testid="stMainBlockContainer"] {
-    max-width: var(--content-width) !important;
-    padding-top: 3.5rem !important;
+/* --- top bar --- */
+.topbar {
+    display: flex; align-items: center; justify-content: space-between;
+    padding-bottom: 0.9rem; margin-bottom: 0.6rem; border-bottom: 1px solid var(--border);
 }
+.topbar-brand { display: flex; align-items: center; gap: 0.55rem; }
+.topbar-avatar {
+    width: 26px; height: 26px; border-radius: 7px; background: var(--accent); color: #FFFFFF;
+    display: flex; align-items: center; justify-content: center;
+    font-family: var(--font-ui); font-size: 0.78rem; font-weight: 700;
+}
+.topbar-title { font-size: 0.95rem; font-weight: 600; color: var(--text); }
+.topbar-status { font-family: var(--font-data); font-size: 0.72rem; color: var(--text-faint); }
 
-/* --- masthead --- */
-.app-header {
-    display: flex; flex-direction: column; align-items: center; text-align: center;
-    margin: 0 auto 1.6rem auto;
-    padding: 0 0 1.6rem 0; border-bottom: 1px solid var(--border);
+/* --- architecture --- */
+[data-testid="stExpander"] { border: 1px solid var(--border) !important; border-radius: 12px !important; background: var(--surface) !important; box-shadow: none !important; }
+[data-testid="stExpander"] summary { font-size: 0.87rem !important; font-weight: 500 !important; }
+.arch-intro { color: var(--text-muted); font-size: 0.85rem; line-height: 1.6; margin: 0.2rem 0 1rem 0; }
+.arch-strip-wrap { overflow-x: auto; padding-bottom: 0.3rem; }
+.arch-strip { display: flex; align-items: stretch; gap: 0; width: max-content; }
+.arch-node {
+    width: 146px; flex-shrink: 0; background: var(--bg-sidebar); border: 1px solid var(--border);
+    border-radius: 10px; padding: 0.65rem 0.75rem; display: flex; flex-direction: column; gap: 0.3rem;
 }
-.app-header .title-block h1 {
-    margin: 0; font-family: var(--font-display); font-size: 2.3rem;
-    font-weight: 700; letter-spacing: -0.01em; color: var(--text); line-height: 1.2;
-}
-.app-header .title-block .tagline {
-    color: var(--text-muted); font-size: 1rem; margin: 0.7rem 0 0 0; line-height: 1.6;
-}
-
-/* --- welcome / onboarding --- */
-.st-key-welcome_block { margin: 0 auto 0.4rem auto; }
-.st-key-welcome_block [data-testid="stExpander"] {
-    border: 1px solid var(--border) !important; border-radius: 10px !important;
-    box-shadow: var(--shadow-sm) !important; background: var(--panel) !important;
-    overflow: hidden;
-}
-
-/* --- pipeline trace (live, per-turn) ---
-   Same node-and-arrow shape as the static "How this works" diagram below,
-   just colored by what actually happened on this turn instead of showing
-   the same neutral blue for every stage: green passed, red blocked (the
-   request stopped there, later nodes never ran), amber a non-blocking
-   miss the request continued past anyway (currently only a cache miss),
-   gray a stage the request never reached because an earlier one already
-   blocked or resolved the turn. */
-.trace-diagram-wrap { overflow-x: auto; padding: 0.2rem 0.1rem 0.5rem 0.1rem; margin-top: 0.6rem; }
-.trace-diagram {
-    display: flex; flex-wrap: nowrap; align-items: stretch;
-    gap: 0.5rem; width: max-content; min-width: 100%;
-}
-.trace-node {
-    position: relative; display: flex; flex-direction: column; gap: 0.22rem;
-    padding: 0.65rem 0.75rem 0.6rem 0.75rem; border-radius: 8px; width: 128px; flex-shrink: 0;
-    background: var(--panel); border: 1px solid var(--border); box-shadow: var(--shadow-sm);
-    border-top: 3px solid var(--border-strong);
-}
-.trace-node.status-pass { border-top-color: var(--green); }
-.trace-node.status-fail { border-top-color: var(--red); }
-.trace-node.status-skip { border-top-color: var(--amber); }
-.trace-node.status-unreached { border-top-color: var(--border-strong); opacity: 0.45; box-shadow: none; }
-.trace-node .trace-node-badge {
-    position: absolute; top: -10px; right: -10px; width: 19px; height: 19px; border-radius: 50%;
-    color: #FFFFFF; font-size: 0.66rem; font-weight: 700; line-height: 1;
+.arch-node .arch-num {
+    width: 18px; height: 18px; border-radius: 50%; background: var(--accent-soft); color: var(--accent);
+    font-family: var(--font-data); font-size: 0.64rem; font-weight: 600;
     display: flex; align-items: center; justify-content: center;
 }
-.trace-node.status-pass .trace-node-badge { background: var(--green); }
-.trace-node.status-fail .trace-node-badge { background: var(--red); }
-.trace-node.status-skip .trace-node-badge { background: var(--amber); }
-.trace-node.status-unreached .trace-node-badge { background: var(--text-faint); }
-.trace-node .trace-node-title {
-    font-family: var(--font-sans); font-size: 0.78rem; font-weight: 600; color: var(--text);
-}
-.trace-node .trace-node-message {
-    font-family: var(--font-mono); font-size: 0.68rem; line-height: 1.4; color: var(--text-muted);
-    overflow-wrap: break-word;
-}
-.trace-arrow-live {
-    display: flex; align-items: center; color: var(--text-faint); font-size: 1.1rem; flex-shrink: 0;
-}
-.trace-arrow-live.unreached { opacity: 0.35; }
-.trace-footer {
-    display: flex; justify-content: flex-end; margin: 0.35rem 0.1rem 0 0.1rem;
-    font-family: var(--font-mono); font-size: 0.72rem; color: var(--text-faint);
-}
+.arch-node .arch-title { font-size: 0.8rem; font-weight: 600; color: var(--text); }
+.arch-node .arch-desc { font-family: var(--font-data); font-size: 0.66rem; line-height: 1.45; color: var(--text-muted); }
+.arch-connector { display: flex; align-items: center; justify-content: center; width: 28px; flex-shrink: 0; color: var(--text-faint); font-size: 1.05rem; }
+.arch-note { font-family: var(--font-data); font-size: 0.72rem; color: var(--text-faint); margin-top: 0.8rem; line-height: 1.6; }
 
-/* --- pipeline diagram (static, explanatory, inside "How this works") ---
-   This one genuinely is a numbered sequence, a request moves through these
-   stages in order, so numbering here documents structure rather than
-   decorating it. */
-.pipeline-diagram-wrap { overflow-x: auto; padding: 0.2rem 0.1rem 0.5rem 0.1rem; }
-.pipeline-diagram {
-    display: flex; flex-wrap: nowrap; align-items: stretch;
-    gap: 0.5rem; margin: 0.6rem 0 0.2rem 0; width: max-content; min-width: 100%;
-}
-.pipeline-node {
-    position: relative; display: flex; flex-direction: column; gap: 0.22rem;
-    padding: 0.65rem 0.75rem 0.6rem 0.75rem; border-radius: 8px; width: 118px; flex-shrink: 0;
-    background: var(--panel); border: 1px solid var(--border); box-shadow: var(--shadow-sm);
-    border-top: 2px solid var(--blue);
-}
-.pipeline-node .pipeline-node-badge {
-    position: absolute; top: -9px; right: -9px; width: 18px; height: 18px; border-radius: 50%;
-    background: var(--blue); color: #FFFFFF; font-family: var(--font-mono); font-size: 0.62rem;
-    font-weight: 600; display: flex; align-items: center; justify-content: center;
-}
-.pipeline-node .pipeline-node-title {
-    font-family: var(--font-sans); font-size: 0.78rem; font-weight: 600; color: var(--text);
-}
-.pipeline-node .pipeline-node-desc {
-    font-size: 0.71rem; line-height: 1.4; color: var(--text-muted);
-}
-.pipeline-arrow {
-    display: flex; align-items: center; color: var(--text-faint); font-size: 1.1rem; flex-shrink: 0;
-}
+/* --- empty state: a quiet greeting, not a feature grid --- */
+.empty-state { padding: 2.2rem 0 1rem 0; text-align: center; }
+.empty-state h2 { font-size: 1.3rem; font-weight: 600; color: var(--text); margin: 0 0 0.4rem 0; }
+.empty-state p { color: var(--text-muted); font-size: 0.88rem; max-width: 46ch; margin: 0 auto; }
 
-/* --- sources: a manifest of what actually got retrieved and passed --- */
-.source-row {
-    display: grid; grid-template-columns: 1fr 90px 54px; align-items: center; gap: 0.6rem;
-    font-family: var(--font-mono); font-size: 0.78rem;
-    padding: 0.42rem 0; border-bottom: 1px solid var(--border);
+/* --- chat turns --- */
+[data-testid="stChatMessage"] { padding: 0.15rem 0; margin-bottom: 0.15rem; }
+[data-testid="stChatMessage"]:has([data-testid="stChatMessageAvatarUser"]) {
+    background: var(--user-bubble); border-radius: 16px; padding: 0.8rem 1.05rem; margin: 0.35rem 0;
 }
-.source-row:last-child { border-bottom: none; }
-.source-meta { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text); }
-.source-score-wrap { height: 5px; border-radius: 3px; background: var(--border); overflow: hidden; }
-.source-score-bar { height: 100%; background: var(--blue); }
-.source-row .score { color: var(--text-muted); text-align: right; }
+[data-testid="stChatMessage"]:has([data-testid="stChatMessageAvatarAssistant"]) {
+    background: transparent; padding: 0.5rem 0.1rem 0.9rem 0.1rem;
+}
+[data-testid="stChatMessageAvatarUser"], [data-testid="stChatMessageAvatarAssistant"] {
+    width: 26px !important; height: 26px !important; font-size: 0.85rem !important;
+}
+[data-testid="stChatMessageAvatarAssistant"] { background: var(--accent) !important; }
 
-/* --- welcome / onboarding: example question buttons --- */
-[class*="st-key-example_"] button {
-    text-align: left !important;
-    height: 96px !important;
-    width: 100% !important;
-    box-sizing: border-box !important;
-    display: flex !important;
-    align-items: center !important;
-    justify-content: flex-start !important;
-    white-space: normal !important;
-    overflow: hidden !important;
-    line-height: 1.35;
-    padding: 0.9rem 1.1rem !important;
+/* --- pipeline trace: a row of small status pills, not a boxed panel --- */
+.trace-row { display: flex; flex-wrap: wrap; gap: 0.4rem; margin: 0.55rem 0 0.1rem 0.1rem; }
+.trace-pill {
+    display: inline-flex; align-items: center; gap: 0.35rem; font-family: var(--font-data); font-size: 0.7rem;
+    padding: 0.24rem 0.6rem; border-radius: 999px; background: var(--surface); border: 1px solid var(--border);
+    color: var(--text-muted);
 }
-.welcome-caption {
-    color: var(--text-muted); font-size: 0.88rem; margin: 0.2rem 0 1.1rem 0; text-align: center;
-}
-
-/* --- sidebar: cluster status panel --- */
-[data-testid="stSidebar"] {
-    border-right: 1px solid var(--border); background: var(--panel);
-}
-[data-testid="stSidebar"] .stMarkdown, [data-testid="stSidebar"] p { color: var(--text); }
-.section-label {
-    font-family: var(--font-sans); font-size: 0.76rem; font-weight: 600;
-    color: var(--text-muted); margin: 0.2rem 0 0.5rem 0;
-    border-bottom: 1px solid var(--border); padding-bottom: 0.3rem;
-}
-[data-testid="stSidebar"] [data-testid="stMetricValue"] {
-    font-family: var(--font-mono); font-size: 1.15rem; color: var(--text);
-}
-[data-testid="stSidebar"] [data-testid="stMetricLabel"] { font-size: 0.66rem; color: var(--text-muted); }
-
-.provider-list { display: flex; flex-direction: column; gap: 0.6rem; }
-.provider-row { padding: 0.1rem 0; }
-.provider-row .provider-name-line {
-    font-family: var(--font-sans); font-size: 0.83rem; font-weight: 500; color: var(--text);
-    display: flex; align-items: center; gap: 0.55rem;
-}
-.provider-row .provider-role {
-    font-family: var(--font-mono); font-size: 0.68rem; color: var(--text-faint);
-    line-height: 1.4; margin-top: 0.15rem; padding-left: 1.15rem;
-}
-.status-dot-inline { width: 7px; height: 7px; border-radius: 50%; display: inline-block; flex-shrink: 0; }
-.status-dot-inline.up { background: var(--green); box-shadow: 0 0 4px var(--green-soft); }
-.status-dot-inline.down { background: var(--red); }
+.trace-pill .dot { width: 6px; height: 6px; border-radius: 50%; flex-shrink: 0; }
+.trace-pill.pass .dot { background: var(--ready); }
+.trace-pill.fail { border-color: var(--failed); color: var(--failed); }
+.trace-pill.fail .dot { background: var(--failed); }
+.trace-pill.skip .dot { background: var(--pending); }
+.trace-pill.neutral .dot { background: var(--accent); }
+.trace-latency { font-family: var(--font-data); font-size: 0.7rem; color: var(--text-faint); align-self: center; margin-left: 0.1rem; }
 
 .error-note {
-    font-family: var(--font-mono); font-size: 0.76rem; color: var(--red);
-    background: var(--red-soft); border: 1px solid rgba(194, 46, 46, 0.22);
-    border-radius: 6px; padding: 0.5rem 0.7rem; margin-top: 0.5rem;
+    font-family: var(--font-data); font-size: 0.78rem; color: var(--failed);
+    padding: 0.5rem 0.7rem; margin: 0.5rem 0 0 0.1rem; border-radius: 10px;
+    background: #FBEBE9; border: 1px solid #F1CFCB;
 }
+
+.source-row {
+    display: grid; grid-template-columns: 1fr 60px; align-items: center; gap: 0.6rem;
+    font-family: var(--font-data); font-size: 0.78rem; padding: 0.4rem 0; border-bottom: 1px solid var(--border);
+}
+.source-row:last-child { border-bottom: none; }
+.source-path { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text); }
+.source-score { color: var(--text-muted); text-align: right; }
+.source-score.na { color: var(--text-faint); }
+
+/* --- sidebar --- */
+[data-testid="stSidebar"] { background: var(--bg-sidebar); border-right: 1px solid var(--border); }
+[data-testid="stSidebar"] .stMarkdown, [data-testid="stSidebar"] p { color: var(--text); }
+.side-label {
+    font-family: var(--font-ui); font-size: 0.72rem; font-weight: 600; letter-spacing: 0.03em;
+    text-transform: uppercase; color: var(--text-faint); margin: 1.3rem 0 0.55rem 0;
+}
+.side-label:first-child { margin-top: 0.2rem; }
+.stat-row {
+    display: flex; justify-content: space-between; align-items: baseline;
+    padding: 0.24rem 0; font-size: 0.83rem; color: var(--text-muted);
+}
+.stat-row .stat-value { font-family: var(--font-data); color: var(--text); font-size: 0.83rem; }
+
+.provider-row { display: flex; justify-content: space-between; align-items: center; padding: 0.32rem 0; }
+.provider-row .provider-name { font-size: 0.82rem; color: var(--text); }
+.provider-row .provider-role { display: block; font-family: var(--font-data); font-size: 0.63rem; color: var(--text-faint); }
+.provider-status { display: flex; align-items: center; gap: 0.4rem; font-family: var(--font-data); font-size: 0.7rem; flex-shrink: 0; }
+.provider-status .dot { width: 6px; height: 6px; border-radius: 50%; }
+.provider-status.ok { color: var(--ready); }
+.provider-status.ok .dot { background: var(--ready); }
+.provider-status.missing { color: var(--failed); }
+.provider-status.missing .dot { background: var(--failed); }
 </style>
 """
 st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
 
 if "history" not in st.session_state:
     st.session_state.history = []
-if "pending_prompt" not in st.session_state:
-    st.session_state.pending_prompt = None
 
-EXAMPLE_QUESTIONS = [
+# A single example rendered into the input's placeholder, chosen once per
+# session rather than a grid of clickable cards — keeps the empty state to
+# a plain greeting, the way a chat product's landing turn actually looks,
+# while still surfacing what kind of question this tool is for.
+PLACEHOLDER_EXAMPLES = [
     "How do I pin a container to a specific image version?",
     "What's the difference between a Deployment and a StatefulSet?",
-    "How do I safely delete a single Pod without affecting the rest of my Deployment?",
+    "How do I safely delete a single Pod without affecting the rest of a Deployment?",
     "How do I give each StatefulSet replica its own persistent storage?",
 ]
+if "placeholder_example" not in st.session_state:
+    st.session_state.placeholder_example = random.choice(PLACEHOLDER_EXAMPLES)
 
+# Each "check" reports whether a provider is *configured* (an API key is
+# present), not whether it's currently reachable — labeled "configured" /
+# "missing key" below rather than an up/down status, so it doesn't claim a
+# live health check it never actually performs.
 PROVIDERS = [
-    {"label": "Groq", "role": "generation (account A)", "check": lambda: bool(settings.groq_api_key)},
+    {"label": "Groq (account A)", "role": "generation, chain link 1", "check": lambda: bool(settings.groq_api_key)},
     {
-        "label": "Groq",
-        "role": "generation (account B)",
+        "label": "Groq (account B)",
+        "role": "generation, chain link 2",
         "check": lambda: bool(settings.groq_api_key_secondary),
     },
-    {"label": "NIM", "role": "generation fallback, planner, NeMoGuard", "check": lambda: bool(settings.nvidia_nim_api_key)},
+    {
+        "label": "NIM",
+        "role": "generation fallback, planner, NeMoGuard",
+        "check": lambda: bool(settings.nvidia_nim_api_key),
+    },
     {"label": "Gemini", "role": "embeddings, eval judge", "check": lambda: bool(settings.gemini_api_key)},
     {
         "label": "Qdrant",
@@ -344,14 +275,19 @@ PROVIDERS = [
     },
 ]
 
-PIPELINE_STAGES = [
-    {"label": "Cache", "desc": "fast exact + semantic lookup"},
-    {"label": "Safety", "desc": "blocks unsafe content"},
-    {"label": "Topic", "desc": "blocks off-topic questions"},
-    {"label": "Retrieve", "desc": "dense vector search"},
-    {"label": "Rerank", "desc": "cross-encoder relevance gate"},
-    {"label": "Generate", "desc": "grounded answer"},
-    {"label": "Response Safety", "desc": "checks the generated answer too"},
+# The pipeline a request actually takes, in order — mirrors the flow in
+# src/graph.py's build_graph(). Kept short and declarative on purpose: this
+# is a diagram for a person to orient by, not a substitute for reading the
+# graph itself.
+ARCHITECTURE_STAGES = [
+    {"title": "Exact cache", "desc": "diskcache lookup on the normalized question"},
+    {"title": "Safety gate", "desc": "deterministic jailbreak check + NeMoGuard"},
+    {"title": "Topic gate", "desc": "planner classifier, Kubernetes-only"},
+    {"title": "Semantic cache", "desc": "Qdrant cosine match above threshold"},
+    {"title": "Retrieve", "desc": "Qdrant dense vector search, top K"},
+    {"title": "Rerank", "desc": "FlashRank cross-encoder, hard threshold"},
+    {"title": "Generate", "desc": "Groq \u2192 Groq (2nd acct) \u2192 NIM"},
+    {"title": "Response safety", "desc": "NeMoGuard checks the generated answer"},
 ]
 
 
@@ -383,154 +319,121 @@ def get_session_stats():
 # chat_input is called early, even though it visually renders pinned to the
 # bottom of the page regardless of call order (Streamlit's own behavior),
 # doing this before rendering history lets the history block below know
-# whether a new turn is about to be generated, so it can fade itself.
-prompt = st.chat_input("Ask a Kubernetes question")
-if not prompt and st.session_state.pending_prompt:
-    prompt = st.session_state.pending_prompt
-    st.session_state.pending_prompt = None
-
-# ---------- header ----------
-
-st.markdown(
-    """
-    <div class="app-header">
-        <div class="title-block">
-            <h1>Kubernetes Q&amp;A</h1>
-            <div class="tagline">Grounded Kubernetes answers from your own docs. Safety-checked,
-            relevance-gated, and cached for speed.</div>
-        </div>
-    </div>
-    """,
-    unsafe_allow_html=True,
-)
+# whether a new turn is about to be generated.
+prompt = st.chat_input(f'Ask a Kubernetes question — e.g. "{st.session_state.placeholder_example}"')
 
 # ---------- sidebar ----------
 
 with st.sidebar:
-    st.markdown('<div class="section-label">Corpus</div>', unsafe_allow_html=True)
-    doc_count, cache_count = get_corpus_stats()
-    corpus_col1, corpus_col2 = st.columns(2)
-    corpus_col1.metric("Chunks indexed", doc_count if doc_count is not None else "—")
-    corpus_col2.metric("Cached answers", cache_count if cache_count is not None else "—")
-
-    st.markdown('<div class="section-label" style="margin-top: 1rem;">This session</div>', unsafe_allow_html=True)
-    questions_asked, hit_rate, avg_latency = get_session_stats()
-    session_col1, session_col2, session_col3 = st.columns(3)
-    session_col1.metric("Asked", questions_asked)
-    session_col2.metric("Cache hit", hit_rate)
-    session_col3.metric("Avg time", avg_latency)
-
-    st.markdown('<div class="section-label" style="margin-top: 1rem;">Providers</div>', unsafe_allow_html=True)
-    provider_rows = "".join(
-        f'<div class="provider-row">'
-        f'<div class="provider-name-line">'
-        f'<span class="status-dot-inline {"up" if provider["check"]() else "down"}"></span>'
-        f'<span class="provider-name">{provider["label"]}</span>'
-        f"</div>"
-        f'<div class="provider-role">{provider["role"]}</div>'
-        f"</div>"
-        for provider in PROVIDERS
-    )
-    st.markdown(f'<div class="provider-list">{provider_rows}</div>', unsafe_allow_html=True)
-
-    st.markdown('<div class="section-label" style="margin-top: 1rem;">Display</div>', unsafe_allow_html=True)
-    show_trace = st.toggle("Show pipeline trace", value=False)
-
-    st.divider()
-    if st.button("Clear conversation", use_container_width=True):
+    if st.button("+  New conversation", use_container_width=True):
         st.session_state.history = []
+        st.session_state.placeholder_example = random.choice(PLACEHOLDER_EXAMPLES)
         get_corpus_stats.clear()
         st.rerun()
+
+    st.markdown('<div class="side-label">Corpus</div>', unsafe_allow_html=True)
+    doc_count, cache_count = get_corpus_stats()
+    st.markdown(
+        f'<div class="stat-row"><span>Chunks indexed</span>'
+        f'<span class="stat-value">{doc_count if doc_count is not None else "—"}</span></div>'
+        f'<div class="stat-row"><span>Cached answers</span>'
+        f'<span class="stat-value">{cache_count if cache_count is not None else "—"}</span></div>',
+        unsafe_allow_html=True,
+    )
+
+    st.markdown('<div class="side-label">This session</div>', unsafe_allow_html=True)
+    questions_asked, hit_rate, avg_latency = get_session_stats()
+    st.markdown(
+        f'<div class="stat-row"><span>Questions asked</span><span class="stat-value">{questions_asked}</span></div>'
+        f'<div class="stat-row"><span>Cache hit rate</span><span class="stat-value">{hit_rate}</span></div>'
+        f'<div class="stat-row"><span>Avg. latency</span><span class="stat-value">{avg_latency}</span></div>',
+        unsafe_allow_html=True,
+    )
+
+    st.markdown('<div class="side-label">Providers</div>', unsafe_allow_html=True)
+    provider_rows = ""
+    for provider in PROVIDERS:
+        ok = provider["check"]()
+        status_class = "ok" if ok else "missing"
+        status_text = "configured" if ok else "missing key"
+        provider_rows += (
+            f'<div class="provider-row">'
+            f'<div><span class="provider-name">{provider["label"]}</span>'
+            f'<span class="provider-role">{provider["role"]}</span></div>'
+            f'<div class="provider-status {status_class}"><span class="dot"></span>{status_text}</div>'
+            f"</div>"
+        )
+    st.markdown(provider_rows, unsafe_allow_html=True)
+
+    st.markdown('<div class="side-label">Display</div>', unsafe_allow_html=True)
+    show_trace = st.toggle("Show pipeline trace", value=True)
 
 
 # ---------- pipeline trace ----------
 
-def build_trace_conditions(details: dict) -> list[dict]:
+
+def build_trace_segments(details: dict) -> list[dict]:
     if details.get("error"):
-        return [{"type": "Pipeline", "status": False, "message": "error"}]
+        return [{"text": "pipeline error", "status": "fail"}]
 
     blocked_stage = details.get("blocked_stage")
     cache_layer = details.get("cache_layer")
     cache_checked = details.get("exact_cache_checked", False)
 
     if cache_layer == "exact":
-        return [{"type": "Cache", "status": True, "message": "exact hit"}]
+        return [{"text": "cache hit · exact", "status": "pass"}]
 
-    conditions = []
+    segments = []
     if blocked_stage == "safety":
-        conditions.append({"type": "Safety", "status": False, "message": "blocked"})
-        return conditions
-    conditions.append({"type": "Safety", "status": True, "message": "passed"})
+        segments.append({"text": "safety blocked", "status": "fail"})
+        return segments
+    segments.append({"text": "safety pass", "status": "pass"})
 
     if blocked_stage == "topic":
-        conditions.append({"type": "Topic", "status": False, "message": "off-topic"})
-        return conditions
-    conditions.append({"type": "Topic", "status": True, "message": "on-topic"})
+        segments.append({"text": "off-topic", "status": "fail"})
+        return segments
+    segments.append({"text": "on-topic", "status": "pass"})
 
     if cache_layer == "semantic":
-        conditions.append({"type": "Cache", "status": True, "message": "semantic hit"})
-        return conditions
-    conditions.append({"type": "Cache", "status": None, "message": "miss" if cache_checked else "lookup"})
+        segments.append({"text": "cache hit · semantic", "status": "pass"})
+        return segments
+    segments.append({"text": "cache miss" if cache_checked else "cache lookup", "status": "skip"})
 
     if details.get("service_unavailable"):
-        conditions.append({"type": "Retrieve", "status": False, "message": "service unavailable"})
-        return conditions
+        segments.append({"text": "retrieval unavailable", "status": "fail"})
+        return segments
 
     candidates_count = details.get("candidates_count", 0)
-    conditions.append({"type": "Retrieve", "status": True, "message": f"{candidates_count} found"})
+    segments.append({"text": f"retrieved {candidates_count}", "status": "pass"})
+
     reranked_count = details.get("reranked_count", 0)
     if reranked_count == 0:
-        conditions.append({"type": "Rerank", "status": False, "message": "0 survived"})
-        return conditions
-    conditions.append({"type": "Rerank", "status": True, "message": f"{reranked_count}/{candidates_count} passed"})
+        segments.append({"text": "0 survived rerank", "status": "fail"})
+        return segments
+    segments.append({"text": f"reranked {reranked_count}/{candidates_count}", "status": "pass"})
 
     provider = details.get("provider")
     model = details.get("model")
     if provider:
-        message = f"{provider} ({model})" if model else provider
-        conditions.append({"type": "Generate", "status": True, "message": message})
+        label = f"{provider} · {model}" if model else provider
+        segments.append({"text": label, "status": "neutral"})
 
     if blocked_stage == "response_safety":
-        conditions.append({"type": "Response Safety", "status": False, "message": "blocked"})
-    return conditions
+        segments.append({"text": "response blocked", "status": "fail"})
 
-
-def build_trace_nodes(details: dict) -> list[dict]:
-    conditions = build_trace_conditions(details)
-    nodes = []
-    for condition in conditions:
-        status = condition["status"]
-        nodes.append({
-            "label": condition["type"],
-            "status": "fail" if status is False else "skip" if status is None else "pass",
-            "message": condition["message"],
-        })
-    return nodes
+    return segments
 
 
 def render_trace(details: dict) -> None:
-    nodes = build_trace_nodes(details)
-    if nodes:
-        badge_icon = {"pass": "&#10003;", "fail": "&#10005;", "skip": "~"}
-        node_html = ""
-        for i, node in enumerate(nodes):
-            node_html += (
-                f'<div class="trace-node status-{node["status"]}">'
-                f'<span class="trace-node-badge">{badge_icon[node["status"]]}</span>'
-                f'<span class="trace-node-title">{node["label"]}</span>'
-                f'<span class="trace-node-message">{node["message"]}</span>'
-                f"</div>"
-            )
-            if i < len(nodes) - 1:
-                node_html += '<div class="trace-arrow-live">&#8594;</div>'
-
-        latency = details.get("latency_seconds")
-        footer_html = f'<div class="trace-footer">{latency:.2f}s total</div>' if latency is not None else ""
-
-        st.markdown(
-            f'<div class="trace-diagram-wrap"><div class="trace-diagram">{node_html}</div></div>{footer_html}',
-            unsafe_allow_html=True,
+    segments = build_trace_segments(details)
+    if segments:
+        pills = "".join(
+            f'<span class="trace-pill {seg["status"]}"><span class="dot"></span>{seg["text"]}</span>'
+            for seg in segments
         )
+        latency = details.get("latency_seconds")
+        latency_html = f'<span class="trace-latency">{latency:.2f}s</span>' if latency is not None else ""
+        st.markdown(f'<div class="trace-row">{pills}{latency_html}</div>', unsafe_allow_html=True)
 
     if details.get("error"):
         st.markdown(f'<div class="error-note">{PIPELINE_ERROR_MESSAGE}</div>', unsafe_allow_html=True)
@@ -539,67 +442,70 @@ def render_trace(details: dict) -> None:
     sources = details.get("sources") or []
     if sources:
         with st.expander(f"Sources ({len(sources)})"):
+            rows = ""
             for source in sources:
                 path = source["metadata"].get("source_path", "unknown")
                 # rerank_score is absent when rerank_and_gate degraded to
                 # unfiltered retrieval order (FlashRank failure, see
-                # src/retrieval/rerank.py) — there's no score to gate on in
-                # that case, so show "n/a" instead of a bar rather than
-                # raising a KeyError on a candidate that was never scored.
+                # src/retrieval/rerank.py) — there's no score to show in
+                # that case.
                 score = source.get("rerank_score")
-                if score is None:
-                    st.markdown(
-                        f'<div class="source-row">'
-                        f'<div class="source-meta">{path}</div>'
-                        f'<div class="source-score-wrap"></div>'
-                        f'<span class="score">n/a</span>'
-                        f"</div>",
-                        unsafe_allow_html=True,
-                    )
-                    continue
-                bar_width = max(0.0, min(1.0, score)) * 100
-                st.markdown(
-                    f'<div class="source-row">'
-                    f'<div class="source-meta">{path}</div>'
-                    f'<div class="source-score-wrap"><div class="source-score-bar" style="width:{bar_width:.0f}%"></div></div>'
-                    f'<span class="score">{score:.3f}</span>'
-                    f"</div>",
-                    unsafe_allow_html=True,
+                score_text = f"{score:.3f}" if score is not None else "n/a"
+                score_class = "" if score is not None else " na"
+                rows += (
+                    f'<div class="source-row"><span class="source-path">{path}</span>'
+                    f'<span class="source-score{score_class}">{score_text}</span></div>'
                 )
+            st.markdown(rows, unsafe_allow_html=True)
 
 
-# ---------- conversation ----------
+def render_architecture() -> None:
+    nodes_html = ""
+    for i, stage in enumerate(ARCHITECTURE_STAGES):
+        nodes_html += (
+            f'<div class="arch-node"><span class="arch-num">{i + 1}</span>'
+            f'<span class="arch-title">{stage["title"]}</span>'
+            f'<span class="arch-desc">{stage["desc"]}</span></div>'
+        )
+        if i < len(ARCHITECTURE_STAGES) - 1:
+            nodes_html += '<div class="arch-connector">&rsaquo;</div>'
+    st.markdown(
+        '<p class="arch-intro">Every question moves through this fixed sequence. A gate that blocks, '
+        "a cache hit, or an empty rerank ends the turn early — later stages simply don't run.</p>"
+        f'<div class="arch-strip-wrap"><div class="arch-strip">{nodes_html}</div></div>'
+        '<p class="arch-note">cache hit → answer returned immediately, no remote call &nbsp;·&nbsp; '
+        "gate blocked → refused before retrieval ever runs &nbsp;·&nbsp; "
+        "rerank finds nothing → answer says so and is cached with a TTL, not treated as an outage</p>",
+        unsafe_allow_html=True,
+    )
 
-# checked against `prompt` too, not just history: history is only empty
-# BEFORE this run's user message gets appended further down, so on the
-# very first-ever submission this condition would otherwise still be true
-# during the same run that's processing that submission, showing the
-# welcome block and the "running the pipeline" spinner at once.
+
+# ---------- page ----------
+
+configured_count = sum(1 for p in PROVIDERS if p["check"]())
+st.markdown(
+    f"""
+    <div class="topbar">
+        <div class="topbar-brand">
+            <div class="topbar-avatar">K</div>
+            <span class="topbar-title">Kubernetes RAG</span>
+        </div>
+        <span class="topbar-status">{configured_count}/{len(PROVIDERS)} providers configured</span>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
+
+with st.expander("Architecture — how a question becomes an answer", expanded=False):
+    render_architecture()
+
 if not st.session_state.history and not prompt:
-    with st.container(key="welcome_block"):
-        with st.expander("How this works", expanded=False):
-            diagram_html = ""
-            for i, stage in enumerate(PIPELINE_STAGES):
-                diagram_html += (
-                    f'<div class="pipeline-node">'
-                    f'<span class="pipeline-node-badge">{i + 1}</span>'
-                    f'<span class="pipeline-node-title">{stage["label"]}</span>'
-                    f'<span class="pipeline-node-desc">{stage["desc"]}</span>'
-                    f"</div>"
-                )
-                if i < len(PIPELINE_STAGES) - 1:
-                    diagram_html += '<div class="pipeline-arrow">&#8594;</div>'
-            st.markdown(
-                f'<div class="pipeline-diagram-wrap"><div class="pipeline-diagram">{diagram_html}</div></div>',
-                unsafe_allow_html=True,
-            )
-        st.markdown('<p class="welcome-caption">Try one of these, or ask your own below.</p>', unsafe_allow_html=True)
-
-    cols = st.columns(2)
-    for i, question in enumerate(EXAMPLE_QUESTIONS):
-        with cols[i % 2]:
-            if st.button(question, key=f"example_{i}", use_container_width=True):
-                st.session_state.pending_prompt = question
+    st.markdown(
+        '<div class="empty-state"><h2>Ask about your Kubernetes docs</h2>'
+        "<p>Every question runs through a safety gate, a topic gate, caching, retrieval, "
+        "a relevance-gated rerank, and a response safety check before it's shown or cached.</p></div>",
+        unsafe_allow_html=True,
+    )
 
 history_container = st.container(key="history_block")
 with history_container:
@@ -615,17 +521,18 @@ if prompt:
         st.markdown(prompt)
 
     with st.chat_message("assistant"):
-        with st.spinner("Running the pipeline..."):
+        with st.spinner("Running the pipeline…"):
             plain_history = [{"role": t["role"], "content": t["content"]} for t in st.session_state.history[:-1]]
             try:
                 result = run_turn(prompt, plain_history)
                 error = None
             except Exception as exc:
-                # narrowing RETRYABLE in src/llm.py means non-transient errors
-                # (bad request, auth, etc.) now propagate here instead of being
-                # swallowed into a RuntimeError after two wasted retries. Log
-                # the real exception for debugging, show a clean message to the
-                # user rather than a stack trace or raw provider error text.
+                # narrowing RETRYABLE in src/providers/llm.py means
+                # non-transient errors (bad request, auth, etc.) propagate
+                # here instead of being swallowed into a generic
+                # RuntimeError after wasted retries. Log the real exception
+                # for debugging, show a clean message to the user rather
+                # than a stack trace or raw provider error text.
                 logger.exception("run_turn failed")
                 result = None
                 error = exc
@@ -654,6 +561,3 @@ if prompt:
 
     st.session_state.history.append({"role": "assistant", "content": answer, "details": details})
     get_corpus_stats.clear()
-
-
-

@@ -43,6 +43,17 @@ INGEST_EMBED_DELAY_SECONDS = 1.0
 # that already made it in.
 UPSERT_BATCH_SIZE = 64
 
+# Anchored to this file's own directory (the repo root), not to the process's
+# current working directory. ingest.py and ui/app.py previously both wrote
+# ".cache/..." relative to cwd — if either was launched from a different
+# directory than the other (e.g. `cd ui && streamlit run app.py`), they'd
+# silently read and write two different .cache trees, breaking the corpus
+# fingerprint handshake between them with no error, just a fallback to the
+# static CORPUS_VERSION. src/retrieval/cache.py and src/retrieval/embeddings.py
+# anchor the same way for the same reason.
+PROJECT_ROOT = Path(__file__).resolve().parent
+CACHE_DIR = PROJECT_ROOT / ".cache"
+
 # src/retrieval/cache.py reads this file to get the "effective" corpus
 # version for cache keys, falling back to settings.corpus_version when it
 # doesn't exist. That marker is written below, from a hash of every file
@@ -51,7 +62,7 @@ UPSERT_BATCH_SIZE = 64
 # means an incremental re-ingest (no --wipe, just adding/changing files)
 # still invalidates stale cached answers automatically, instead of them
 # silently surviving forever because nobody remembered to edit .env.
-CORPUS_VERSION_MARKER = Path(".cache/corpus_version")
+CORPUS_VERSION_MARKER = CACHE_DIR / "corpus_version"
 
 
 @retry(
@@ -117,6 +128,7 @@ def _wipe_exact_cache() -> None:
 def ingest_directory(directory: Path, corpus_hasher: "hashlib._Hash | None" = None) -> dict:
     ingested = 0
     skipped_irrelevant = 0
+    failed = 0
 
     # Sorted so the corpus fingerprint is deterministic across runs on the
     # same content — rglob's own order depends on filesystem/OS details and
@@ -127,42 +139,60 @@ def ingest_directory(directory: Path, corpus_hasher: "hashlib._Hash | None" = No
             continue
 
         with node_span("ingest_file", path=str(path)):
-            text = parse_file(path)
-            if not text.strip():
+            # Isolated per file: a single bad document (corrupt PDF, a
+            # DOCX python-docx can't open, a transient embedding/Qdrant
+            # error on just this file) used to raise straight out of
+            # ingest_directory and abort the whole run, including files
+            # that already succeeded and were upserted into Qdrant earlier
+            # in the same loop. Those earlier files stayed in Qdrant, but
+            # _write_corpus_version() at the end of main() never ran
+            # because main() itself crashed — so the corpus fingerprint on
+            # disk silently fell behind what Qdrant actually held, and
+            # stale cache entries kept serving as if nothing had changed.
+            # Catching here means one bad file is logged and skipped, and
+            # the corpus fingerprint still reflects everything that
+            # actually made it in.
+            try:
+                text = parse_file(path)
+                if not text.strip():
+                    continue
+
+                if not is_relevant(text):
+                    logger.info("skipping (classified irrelevant to corpus): %s", path)
+                    skipped_irrelevant += 1
+                    continue
+
+                chunks = chunk_document(text, base_metadata={"source_path": str(path)})
+                if not chunks:
+                    continue
+
+                # one batched call for every chunk in this file instead of
+                # one Gemini round-trip per chunk.
+                vectors = embed_texts([chunk["text"] for chunk in chunks], task_type="RETRIEVAL_DOCUMENT")
+                time.sleep(INGEST_EMBED_DELAY_SECONDS)
+
+                points = [
+                    PointStruct(
+                        id=str(uuid.uuid4()),
+                        vector=vector,
+                        payload={"text": chunk["text"], "metadata": chunk["metadata"]},
+                    )
+                    for chunk, vector in zip(chunks, vectors)
+                ]
+
+                for batch_start in range(0, len(points), UPSERT_BATCH_SIZE):
+                    _upsert_batch(points[batch_start : batch_start + UPSERT_BATCH_SIZE])
+                ingested += len(points)
+
+                if corpus_hasher is not None:
+                    corpus_hasher.update(str(path.relative_to(directory)).encode("utf-8"))
+                    corpus_hasher.update(text.encode("utf-8"))
+            except Exception as error:
+                logger.error("failed to ingest %s, skipping this file: %s", path, error)
+                failed += 1
                 continue
 
-            if not is_relevant(text):
-                logger.info("skipping (classified irrelevant to corpus): %s", path)
-                skipped_irrelevant += 1
-                continue
-
-            chunks = chunk_document(text, base_metadata={"source_path": str(path)})
-            if not chunks:
-                continue
-
-            # one batched call for every chunk in this file instead of
-            # one Gemini round-trip per chunk.
-            vectors = embed_texts([chunk["text"] for chunk in chunks], task_type="RETRIEVAL_DOCUMENT")
-            time.sleep(INGEST_EMBED_DELAY_SECONDS)
-
-            points = [
-                PointStruct(
-                    id=str(uuid.uuid4()),
-                    vector=vector,
-                    payload={"text": chunk["text"], "metadata": chunk["metadata"]},
-                )
-                for chunk, vector in zip(chunks, vectors)
-            ]
-
-            for batch_start in range(0, len(points), UPSERT_BATCH_SIZE):
-                _upsert_batch(points[batch_start : batch_start + UPSERT_BATCH_SIZE])
-            ingested += len(points)
-
-            if corpus_hasher is not None:
-                corpus_hasher.update(str(path.relative_to(directory)).encode("utf-8"))
-                corpus_hasher.update(text.encode("utf-8"))
-
-    return {"ingested": ingested, "skipped_irrelevant": skipped_irrelevant}
+    return {"ingested": ingested, "skipped_irrelevant": skipped_irrelevant, "failed": failed}
 
 
 def _write_corpus_version(fingerprint: str) -> None:
@@ -196,31 +226,35 @@ def main() -> None:
     true_dir = args.data_dir / TRUE_DIR_NAME
     noisy_dir = args.data_dir / NOISY_DIR_NAME
     corpus_hasher = hashlib.sha256()
+    total_failed = 0
 
     if true_dir.is_dir():
         result = ingest_directory(true_dir, corpus_hasher)
+        total_failed += result["failed"]
         print(
             f"ingested {result['ingested']} chunks from {true_dir}, "
-            f"skipped {result['skipped_irrelevant']} document(s) as irrelevant"
+            f"skipped {result['skipped_irrelevant']} document(s) as irrelevant, "
+            f"failed on {result['failed']} document(s)"
         )
     else:
         print(f"no {TRUE_DIR_NAME}/ found under {args.data_dir}, skipping")
 
     if noisy_dir.is_dir():
         result = ingest_directory(noisy_dir, corpus_hasher)
+        total_failed += result["failed"]
         print(
             f"ingested {result['ingested']} chunks from {noisy_dir}, "
             f"skipped {result['skipped_irrelevant']} document(s) as irrelevant "
-            "(expect this to be at or near 100% of the files in noisy_data/)"
+            "(expect this to be at or near 100% of the files in noisy_data/), "
+            f"failed on {result['failed']} document(s)"
         )
     else:
         print(f"no {NOISY_DIR_NAME}/ found under {args.data_dir}, skipping")
 
     _write_corpus_version(corpus_hasher.hexdigest()[:16])
+    if total_failed:
+        print(f"note: {total_failed} document(s) failed to ingest — see logs above for which ones and why.")
 
 
 if __name__ == "__main__":
     main()
-
-
-

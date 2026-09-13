@@ -1,6 +1,7 @@
 import hashlib
 import logging
 import re
+from pathlib import Path
 
 import diskcache
 import numpy as np
@@ -14,7 +15,15 @@ from src.config import settings
 logger = logging.getLogger(__name__)
 EMBED_BATCH_SIZE = 100
 RETRY_DELAY_RE = re.compile(r"([\d.]+)\s*s")
-_embedding_cache = diskcache.Cache(".cache/embeddings")
+
+# Anchored to the repo root (src/retrieval/embeddings.py -> src/retrieval ->
+# src -> repo root), matching src/retrieval/cache.py and ingest.py. See the
+# comment on _CACHE_DIR in cache.py: a cwd-relative ".cache/embeddings" path
+# meant this cache could silently live in a different place than the exact
+# and semantic caches, depending on which directory a process happened to
+# be launched from.
+_PROJECT_ROOT = Path(__file__).resolve().parents[2]
+_embedding_cache = diskcache.Cache(str(_PROJECT_ROOT / ".cache" / "embeddings"))
 
 
 def _is_rate_limit_error(error: BaseException) -> bool:
@@ -128,6 +137,3 @@ def embed_document(text: str) -> list[float]:
 
 def embed_for_cache(text: str) -> list[float]:
     return embed_texts([text], task_type="SEMANTIC_SIMILARITY")[0]
-
-
-

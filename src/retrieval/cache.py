@@ -2,7 +2,6 @@ import hashlib
 import logging
 import pathlib
 import re
-import string
 import threading
 import uuid
 
@@ -15,7 +14,21 @@ from src.retrieval.embeddings import embed_for_cache
 
 logger = logging.getLogger(__name__)
 
-_exact_cache = diskcache.Cache(".cache/exact")
+# Anchored to the repo root (three levels up from this file:
+# src/retrieval/cache.py -> src/retrieval -> src -> repo root), not to the
+# process's current working directory. Previously ".cache/exact" and
+# ".cache/corpus_version" were relative paths, so ingest.py and
+# `streamlit run ui/app.py` only agreed on where the cache lived if both
+# happened to be launched from the same directory. Launch either from a
+# different cwd (e.g. `cd ui && streamlit run app.py`) and they'd silently
+# read/write two different .cache trees — no error, just a semantic cache
+# that never sees the real corpus fingerprint and falls back to the static
+# CORPUS_VERSION forever. src/retrieval/embeddings.py and ingest.py anchor
+# the same way for the same reason.
+_PROJECT_ROOT = pathlib.Path(__file__).resolve().parents[2]
+_CACHE_DIR = _PROJECT_ROOT / ".cache"
+
+_exact_cache = diskcache.Cache(str(_CACHE_DIR / "exact"))
 
 # Punctuation that's purely cosmetic in a typed question (trailing "?",
 # stray quotes, parentheses) is safe to strip for exact-match normalization.
@@ -47,7 +60,7 @@ _index_lock = threading.Lock()
 # manually-edited .env -- still changes the effective corpus_version and
 # invalidates stale cache entries automatically. See ingest.py's
 # _write_corpus_version.
-_CORPUS_VERSION_MARKER = pathlib.Path(".cache/corpus_version")
+_CORPUS_VERSION_MARKER = _CACHE_DIR / "corpus_version"
 
 
 def _current_corpus_version() -> str:

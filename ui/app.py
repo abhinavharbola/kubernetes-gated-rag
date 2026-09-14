@@ -92,23 +92,23 @@ CSS = """
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap');
 
 :root {
-    --bg: #EEF0F4;
-    --bg-sidebar: #E6E9EF;
-    --surface: #FFFFFF;
-    --surface-sunken: #F1F2F6;
-    --border: #DBDEE5;
-    --border-strong: #C7CBD4;
-    --text: #1B1D22;
-    --text-muted: #5B6070;
-    --text-faint: #868C99;
-    --accent: #2C4CB0;
-    --accent-hover: #223C8E;
-    --accent-soft: #E7ECF9;
-    --user-bubble: #E7E9EE;
+    --bg: #E6ECE9;
+    --bg-sidebar: #DEE5E1;
+    --surface: #F5F8F7;
+    --surface-sunken: #ECF1EF;
+    --border: #D4DBD7;
+    --border-strong: #BFC9C4;
+    --text: #1C201E;
+    --text-muted: #565F5A;
+    --text-faint: #838C87;
+    --accent: #B2593C;
+    --accent-hover: #954A32;
+    --accent-soft: #F2E3DA;
+    --user-bubble: #DFE6E2;
     --ok: #2F8F5B;
     --warn: #B08600;
     --bad: #BF4442;
-    --shadow-card: 0 1px 2px rgba(20, 22, 28, 0.06), 0 1px 1px rgba(20, 22, 28, 0.04);
+    --shadow-card: 0 1px 2px rgba(20, 24, 22, 0.07), 0 1px 1px rgba(20, 24, 22, 0.04);
     --font-ui: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
     --font-mono: "IBM Plex Mono", ui-monospace, "SFMono-Regular", monospace;
 }
@@ -148,11 +148,11 @@ footer { visibility: hidden; }
     padding: 0.3rem 0 1.2rem 0;
 }
 .brand-mark {
-    width: 30px; height: 30px; border-radius: 8px; flex-shrink: 0;
+    width: 34px; height: 34px; border-radius: 9px; flex-shrink: 0;
     overflow: hidden; display: flex; align-items: center; justify-content: center;
 }
 .brand-mark img { width: 100%; height: 100%; display: block; }
-.brand-name { font-size: 0.95rem; font-weight: 600; color: var(--text); }
+.brand-name { font-size: 1.2rem; font-weight: 700; color: var(--text); letter-spacing: -0.01em; }
 .brand-sub { font-size: 0.72rem; color: var(--text-faint); margin-top: 0.05rem; }
 
 .side-card {
@@ -247,6 +247,7 @@ footer { visibility: hidden; }
 [data-testid="stChatInput"] textarea { color: var(--text) !important; }
 [data-testid="stChatInputSubmitButton"] { background: var(--accent) !important; border-radius: 10px !important; }
 [data-testid="stChatInputSubmitButton"]:hover { background: var(--accent-hover) !important; }
+[data-testid="stChatInputSubmitButton"] svg { fill: #fff !important; color: #fff !important; }
 
 [data-testid="stExpander"] {
     border: 1px solid var(--border) !important; border-radius: 10px !important;
@@ -440,7 +441,7 @@ with st.sidebar:
     questions_asked, hit_rate, avg_latency = get_session_stats()
     st.markdown(
         '<div class="side-card">'
-        '<div class="side-card-title">This conversation</div>'
+        '<div class="side-card-title">This Session</div>'
         f'<div class="stat-line"><span>Questions asked</span><span class="value">{questions_asked}</span></div>'
         f'<div class="stat-line"><span>Cache hit rate</span><span class="value">{hit_rate}</span></div>'
         f'<div class="stat-line"><span>Avg. response time</span><span class="value">{avg_latency}</span></div>'

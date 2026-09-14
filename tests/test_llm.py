@@ -136,9 +136,3 @@ def test_open_breaker_never_skips_the_last_link(mock_nim, mock_groq):
     with pytest.raises(RuntimeError):
         generate_planner([{"role": "user", "content": "q4"}])
     assert mock_groq.chat.completions.create.call_count >= 2
-
-
-
-
-
-

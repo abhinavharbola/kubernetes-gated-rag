@@ -37,6 +37,3 @@ def test_retrieve_raises_unavailable_on_qdrant_failure(mock_embed, mock_qdrant):
 def test_retrieve_raises_unavailable_on_embedding_failure(mock_embed):
     with pytest.raises(RetrievalUnavailableError):
         retrieve("what is a Pod?")
-
-
-

@@ -65,6 +65,11 @@ class Settings(BaseSettings):
     rerank_top_k: int = 20
     rerank_model: str = "ms-marco-MiniLM-L-12-v2"
     rerank_fail_closed: bool = True
+    # Only used when rerank_fail_closed is False and FlashRank itself
+    # crashed, so no rerank_score is available to gate on. Conservative by
+    # default since this is already a degraded path with a cruder signal
+    # (raw retrieval similarity) than the real rerank score.
+    rerank_fallback_score_threshold: float = 0.6
 
     generation_timeout_seconds: float = 15.0
     planner_timeout_seconds: float = 4.0
@@ -96,9 +101,3 @@ class Settings(BaseSettings):
 
 
 settings = Settings()
-
-
-
-
-
-

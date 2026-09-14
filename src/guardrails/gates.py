@@ -345,6 +345,3 @@ def response_safety_gate(user_message: str, response_message: str) -> tuple[bool
     except Exception as error:
         logger.error("response safety gate failed, failing closed: %s", error)
         return False, UNSAFE_REFUSAL
-
-
-

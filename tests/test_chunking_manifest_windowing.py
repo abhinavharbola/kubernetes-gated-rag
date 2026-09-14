@@ -39,6 +39,3 @@ def test_oversized_manifest_windows_overlap_like_prose_fallback():
     first_words = set(blocks[0]["text"].split())
     second_words = set(blocks[1]["text"].split())
     assert first_words & second_words
-
-
-

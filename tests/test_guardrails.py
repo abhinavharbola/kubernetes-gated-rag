@@ -187,9 +187,3 @@ def test_response_safety_gate_fails_closed_when_primary_and_fallback_error(mock_
     allowed, reason = response_safety_gate("question", "answer")
     assert allowed is False
     assert reason is not None
-
-
-
-
-
-

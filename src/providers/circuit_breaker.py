@@ -35,9 +35,3 @@ class CircuitBreaker:
             self.failures += 1
             if self.failures >= self.failure_threshold:
                 self.opened_at = time.monotonic()
-
-
-
-
-
-

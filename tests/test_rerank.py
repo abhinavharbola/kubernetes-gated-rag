@@ -40,11 +40,14 @@ def test_ranker_crash_raises_unavailable_by_default(mock_ranker, mock_settings):
 
 @patch("src.retrieval.rerank.settings")
 @patch("src.retrieval.rerank._ranker")
-def test_ranker_failure_can_use_availability_fallback_when_explicitly_enabled(mock_ranker, mock_settings):
+def test_ranker_failure_fallback_still_applies_a_threshold(mock_ranker, mock_settings):
+    # The fallback path (FlashRank crashed, rerank_fail_closed explicitly
+    # disabled) must still gate on something - it can't silently return
+    # every candidate unfiltered, which would defeat the relevance gate
+    # entirely. It falls back to filtering on raw retrieval_score instead
+    # of a rerank_score, since no rerank score exists in this path.
     mock_settings.rerank_fail_closed = False
+    mock_settings.rerank_fallback_score_threshold = 0.5
     mock_ranker.rerank.side_effect = RuntimeError("ONNX load failed")
     candidates = [{**_candidate("low"), "retrieval_score": 0.3}, {**_candidate("high"), "retrieval_score": 0.7}]
-    assert [c["text"] for c in rerank_and_gate("question", candidates)] == ["high", "low"]
-
-
-
+    assert [c["text"] for c in rerank_and_gate("question", candidates)] == ["high"]

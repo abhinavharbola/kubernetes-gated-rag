@@ -44,9 +44,3 @@ def test_embed_texts_uses_persistent_cache_before_calling_gemini():
         second = embed_texts(["cached question"], task_type="RETRIEVAL_QUERY")
     assert first == second
     embed_batch.assert_called_once()
-
-
-
-
-
-

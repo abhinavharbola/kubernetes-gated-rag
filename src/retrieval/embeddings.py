@@ -137,6 +137,3 @@ def embed_document(text: str) -> list[float]:
 
 def embed_for_cache(text: str) -> list[float]:
     return embed_texts([text], task_type="SEMANTIC_SIMILARITY")[0]
-
-
-

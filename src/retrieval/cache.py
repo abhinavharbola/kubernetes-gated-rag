@@ -137,6 +137,15 @@ def exact_cache_set(question: str, answer: str, expire: float | None = None) -> 
     _exact_cache.set(_exact_key(question), answer, expire=expire)
 
 
+def exact_cache_count() -> int:
+    # Exposed so the UI can report the exact-cache size directly instead of
+    # relying only on the Qdrant semantic-cache count, which undercounts:
+    # cache_no_context_node only ever writes to the exact cache (a TTL'd
+    # "no grounded documentation" entry has no vector to key a Qdrant point
+    # on), so it never shows up in a semantic-cache-only count.
+    return len(_exact_cache)
+
+
 def embed_canonical_question(canonical_question: str) -> list[float]:
     # task_type=SEMANTIC_SIMILARITY: a different vector space from the
     # RETRIEVAL_QUERY embedding src/retrieval/search.py computes for the
@@ -196,6 +205,3 @@ def semantic_cache_set(canonical_question: str, canonical_question_vector: list[
             )
         ],
     )
-
-
-

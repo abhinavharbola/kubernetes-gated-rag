@@ -65,10 +65,12 @@ class GraphState(TypedDict, total=False):
     model: str | None
     cache_layer: str | None
     exact_cache_checked: bool
+    late_jailbreak_detected: bool
     candidates: list[dict]
     reranked: list[dict]
     retrieval_unavailable: bool
     service_unavailable: bool
+    unavailable_stage: str | None
     latency_seconds: float | None
 
 
@@ -155,12 +157,39 @@ def late_exact_cache_node(state: GraphState) -> GraphState:
         if not state.get("chat_history"):
             return {}
         if deterministic_jailbreak_check(state["standalone_question"]):
-            return {"exact_cache_checked": False}
+            # Bug fix: this used to only skip the cache lookup and then fall
+            # straight through to canonicalize_question, which meant a
+            # jailbreak-shaped standalone_question (one that only emerges
+            # after history-based rewriting, since safety_gate already ran
+            # on the pre-rewrite raw_message) was never actually blocked —
+            # it just went ungated into retrieval and generation. Flagging
+            # it here and routing back through a real safety check (see
+            # route_after_late_exact_cache / late_safety_gate_node) closes
+            # that gap, mirroring what exact_cache_node already does
+            # correctly on the first-turn path.
+            return {"exact_cache_checked": False, "late_jailbreak_detected": True}
         cached = exact_cache_get(state["standalone_question"])
         log_cache_decision("exact", hit=cached is not None)
         if cached is not None:
             return {"answer": cached, "cache_layer": "exact", "exact_cache_checked": True}
         return {"exact_cache_checked": True}
+
+
+def late_safety_gate_node(state: GraphState) -> GraphState:
+    with node_span("late_safety_gate"):
+        # Re-runs the full safety gate (deterministic pattern + NeMoGuard/
+        # fallback) against the rewritten standalone_question, not the raw
+        # first-turn message safety_gate_node already checked earlier in
+        # this same turn. check_safety() re-applies the deterministic
+        # jailbreak check internally, so a message that reached this node
+        # (because late_exact_cache_node flagged it) is blocked here too,
+        # not just skipped past the cache.
+        allowed, reason = safety_gate(state["standalone_question"])
+        return {
+            "allowed": allowed,
+            "refusal_reason": reason,
+            "blocked_stage": None if allowed else "late_safety",
+        }
 
 
 def topic_gate_node(state: GraphState) -> GraphState:
@@ -197,7 +226,7 @@ def retrieve_node(state: GraphState) -> GraphState:
             candidates = retrieve(state["canonical_question"])
         except RetrievalUnavailableError as error:
             logger.error("retrieval unavailable this turn, not caching: %s", error)
-            return {"candidates": [], "retrieval_unavailable": True}
+            return {"candidates": [], "retrieval_unavailable": True, "unavailable_stage": "retrieval"}
         return {"candidates": candidates}
 
 
@@ -209,19 +238,30 @@ def rerank_node(state: GraphState) -> GraphState:
             survivors = rerank_and_gate(state["canonical_question"], state.get("candidates", []))
         except RerankUnavailableError as error:
             logger.error("rerank service unavailable this turn, not caching: %s", error)
-            return {"reranked": [], "service_unavailable": True}
+            return {"reranked": [], "service_unavailable": True, "unavailable_stage": "rerank"}
         return {"reranked": survivors}
 
 
 def generate_node(state: GraphState) -> GraphState:
     with node_span("generate"):
         context = "\n\n---\n\n".join(c["text"] for c in state["reranked"])
-        result = generate_main(
-            [
-                {"role": "system", "content": ANSWER_SYSTEM_PROMPT},
-                {"role": "user", "content": f"Context:\n{context}\n\nQuestion: {state['standalone_question']}"},
-            ]
-        )
+        try:
+            result = generate_main(
+                [
+                    {"role": "system", "content": ANSWER_SYSTEM_PROMPT},
+                    {"role": "user", "content": f"Context:\n{context}\n\nQuestion: {state['standalone_question']}"},
+                ]
+            )
+        except Exception as error:
+            # generate_main's provider chain (Groq -> Groq secondary -> NIM)
+            # raises once every link has failed. Previously this propagated
+            # uncaught out of the graph, unlike the retrieval/rerank nodes,
+            # which both degrade to a distinct, uncached "service
+            # unavailable" outcome instead of crashing the turn. Nothing has
+            # been generated or cached yet, so this is a safe, consistent
+            # place to fail the same way.
+            logger.error("generation unavailable this turn, not caching: %s", error)
+            return {"service_unavailable": True, "unavailable_stage": "generation"}
         return {"answer": result.content, "provider": result.provider, "model": result.model}
 
 
@@ -286,7 +326,15 @@ def route_after_safety_gate(state: GraphState) -> str:
 
 
 def route_after_late_exact_cache(state: GraphState) -> str:
-    return END if state.get("cache_layer") == "exact" else "canonicalize_question"
+    if state.get("cache_layer") == "exact":
+        return END
+    if state.get("late_jailbreak_detected"):
+        return "late_safety_gate"
+    return "canonicalize_question"
+
+
+def route_after_late_safety_gate(state: GraphState) -> str:
+    return END if not state["allowed"] else "canonicalize_question"
 
 
 def route_after_topic_gate(state: GraphState) -> str:
@@ -307,6 +355,10 @@ def route_after_rerank(state: GraphState) -> str:
     return "cache_no_context"
 
 
+def route_after_generate(state: GraphState) -> str:
+    return "service_unavailable" if state.get("service_unavailable") else "response_safety_gate"
+
+
 def route_after_response_safety_gate(state: GraphState) -> str:
     return END if not state.get("allowed", True) else "write_caches"
 
@@ -317,6 +369,7 @@ def build_graph():
     graph.add_node("safety_gate", safety_gate_node)
     graph.add_node("rewrite_with_history", rewrite_with_history_node)
     graph.add_node("late_exact_cache_check", late_exact_cache_node)
+    graph.add_node("late_safety_gate", late_safety_gate_node)
     graph.add_node("topic_gate", topic_gate_node)
     graph.add_node("canonicalize_question", canonicalize_node)
     graph.add_node("semantic_cache_check", semantic_cache_node)
@@ -334,11 +387,12 @@ def build_graph():
     graph.add_edge("rewrite_with_history", "topic_gate")
     graph.add_conditional_edges("topic_gate", route_after_topic_gate)
     graph.add_conditional_edges("late_exact_cache_check", route_after_late_exact_cache)
+    graph.add_conditional_edges("late_safety_gate", route_after_late_safety_gate)
     graph.add_edge("canonicalize_question", "semantic_cache_check")
     graph.add_conditional_edges("semantic_cache_check", route_after_semantic_cache)
     graph.add_edge("retrieve", "rerank_and_gate")
     graph.add_conditional_edges("rerank_and_gate", route_after_rerank)
-    graph.add_edge("generate", "response_safety_gate")
+    graph.add_conditional_edges("generate", route_after_generate)
     graph.add_conditional_edges("response_safety_gate", route_after_response_safety_gate)
     graph.add_edge("write_caches", END)
     graph.add_edge("cache_no_context", END)
@@ -358,6 +412,3 @@ def run_turn(raw_message: str, chat_history: list[dict]) -> GraphState:
             final_state["answer"] = final_state["refusal_reason"]
     final_state["latency_seconds"] = time.perf_counter() - start
     return final_state
-
-
-

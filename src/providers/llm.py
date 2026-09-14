@@ -162,9 +162,3 @@ def generate_planner(
         _openai_link(groq_client, settings.groq_planner_model, "groq", messages, temperature, max_tokens, "planner", timeout),
     ]
     return _run_chain(chain)
-
-
-
-
-
-

@@ -23,9 +23,3 @@ def load_eval_set(path: Path = DEFAULT_PATH) -> list[dict]:
             raise ValueError(f"eval set record {i} missing keys: {missing}")
 
     return records
-
-
-
-
-
-

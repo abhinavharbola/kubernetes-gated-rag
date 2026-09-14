@@ -6,6 +6,7 @@ import src.retrieval.cache as cache_module
 from src.retrieval.cache import (
     embed_canonical_question,
     ensure_semantic_cache_indexes,
+    exact_cache_count,
     exact_cache_get,
     exact_cache_set,
     normalize_exact,
@@ -201,7 +202,8 @@ def test_ensure_semantic_cache_indexes_does_not_latch_on_real_failure(mock_qdran
     assert mock_qdrant.create_payload_index.call_count == 6
 
 
-
-
-
-
+def test_exact_cache_count_reflects_diskcache_size():
+    assert exact_cache_count() == 0
+    exact_cache_set("what is a pod", "a pod is...")
+    exact_cache_set("what is a service", "a service is...")
+    assert exact_cache_count() == 2

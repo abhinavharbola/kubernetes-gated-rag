@@ -13,6 +13,7 @@ import streamlit as st
 from src.providers.clients import qdrant_client
 from src.config import settings
 from src.graph import run_turn
+from src.retrieval.cache import exact_cache_count
 from src.retrieval.rerank import preload as preload_rerank
 
 logger = logging.getLogger(__name__)
@@ -43,12 +44,22 @@ PLACEHOLDER_EXAMPLES = [
     "How do I give each StatefulSet replica its own persistent storage?",
 ]
 
-PROVIDERS = [
-    {"label": "Groq A", "check": lambda: bool(settings.groq_api_key)},
-    {"label": "Groq B", "check": lambda: bool(settings.groq_api_key_secondary)},
-    {"label": "NIM", "check": lambda: bool(settings.nvidia_nim_api_key)},
-    {"label": "Gemini", "check": lambda: bool(settings.gemini_api_key)},
-    {"label": "Qdrant", "check": lambda: bool(settings.qdrant_url and settings.qdrant_api_key)},
+PROVIDER_GROUPS = [
+    (
+        "Generation",
+        [
+            {"label": "Groq (primary)", "check": lambda: bool(settings.groq_api_key)},
+            {"label": "Groq (secondary)", "check": lambda: bool(settings.groq_api_key_secondary)},
+            {"label": "NVIDIA NIM", "check": lambda: bool(settings.nvidia_nim_api_key)},
+        ],
+    ),
+    (
+        "Infrastructure",
+        [
+            {"label": "Gemini embeddings", "check": lambda: bool(settings.gemini_api_key)},
+            {"label": "Qdrant", "check": lambda: bool(settings.qdrant_url and settings.qdrant_api_key)},
+        ],
+    ),
 ]
 
 CSS = """
@@ -56,23 +67,23 @@ CSS = """
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap');
 
 :root {
-    --bg: #EEF0F3;
-    --bg-sidebar: #E4E7EC;
+    --bg: #FFFFFF;
+    --bg-sidebar: #F7F8FA;
     --surface: #FFFFFF;
-    --surface-sunken: #F3F4F6;
-    --border: #D9DCE1;
-    --border-strong: #C6CAD1;
-    --text: #16181D;
-    --text-muted: #5B5F68;
-    --text-faint: #868B94;
-    --accent: #2563EB;
-    --accent-hover: #1D4ED8;
-    --accent-soft: #EFF4FF;
-    --user-bubble: #E4E7EC;
-    --ok: #15803D;
-    --warn: #B45309;
-    --bad: #DC2626;
-    --shadow-card: 0 1px 2px rgba(16, 20, 27, 0.06), 0 1px 1px rgba(16, 20, 27, 0.04);
+    --surface-sunken: #F1F2F5;
+    --border: #E4E6EA;
+    --border-strong: #D3D6DC;
+    --text: #1C1E21;
+    --text-muted: #61666F;
+    --text-faint: #8D929B;
+    --accent: #2C4CB0;
+    --accent-hover: #223C8E;
+    --accent-soft: #EEF1FA;
+    --user-bubble: #F1F2F5;
+    --ok: #2F8F5B;
+    --warn: #B08600;
+    --bad: #BF4442;
+    --shadow-card: 0 1px 2px rgba(20, 22, 28, 0.05), 0 1px 1px rgba(20, 22, 28, 0.03);
     --font-ui: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
     --font-mono: "IBM Plex Mono", ui-monospace, "SFMono-Regular", monospace;
 }
@@ -81,54 +92,75 @@ CSS = """
 .stMarkdown, .stApp p, .stApp li { color: var(--text); line-height: 1.6; }
 code { font-family: var(--font-mono); }
 
-#MainMenu, footer, header { visibility: hidden; }
+#MainMenu, footer { visibility: hidden; }
+/* Keep [data-testid="stHeader"] itself visible (rather than hiding it
+   outright): the sidebar's collapse/expand control lives inside it, and
+   hiding the whole header made that control disappear along with it once
+   the sidebar was collapsed, leaving no way to bring the sidebar back
+   without a page reload. Hiding just the toolbar and decoration bar
+   removes the unwanted chrome (Deploy button, running-man indicator)
+   while leaving the collapse control reachable. */
+[data-testid="stHeader"] { background: transparent; }
+[data-testid="stToolbar"] { visibility: hidden; }
+[data-testid="stDecoration"] { display: none; }
+[data-testid="stSidebarCollapsedControl"], [data-testid="collapsedControl"] {
+    visibility: visible !important; opacity: 1 !important;
+}
 
 [data-testid="stSidebar"] {
     background: var(--bg-sidebar);
-    border-right: 1px solid var(--border-strong);
+    border-right: 1px solid var(--border);
 }
 [data-testid="stSidebar"] [data-testid="stMarkdownContainer"] p { color: var(--text-muted); }
+[data-testid="stSidebarContent"] { padding-top: 0.5rem; }
 
 .brand {
-    display: flex; align-items: center; gap: 0.55rem;
-    padding: 0.2rem 0 1.1rem 0;
+    display: flex; align-items: center; gap: 0.6rem;
+    padding: 0.3rem 0 1.2rem 0;
 }
 .brand-mark {
-    width: 28px; height: 28px; border-radius: 8px; background: var(--accent);
+    width: 30px; height: 30px; border-radius: 8px; background: var(--accent);
     color: #fff; display: flex; align-items: center; justify-content: center;
-    font-weight: 700; font-size: 0.95rem; flex-shrink: 0;
+    font-weight: 700; font-size: 1rem; flex-shrink: 0;
 }
 .brand-name { font-size: 0.95rem; font-weight: 600; color: var(--text); }
+.brand-sub { font-size: 0.72rem; color: var(--text-faint); margin-top: 0.05rem; }
 
-.sidebar-section-title {
-    font-size: 0.7rem; font-weight: 600; letter-spacing: 0.05em; text-transform: uppercase;
-    color: var(--text-faint); margin: 1.4rem 0 0.5rem 0;
+.side-card {
+    background: var(--surface); border: 1px solid var(--border); border-radius: 12px;
+    padding: 0.85rem 0.95rem; margin-bottom: 0.65rem;
 }
-.sidebar-section-title:first-of-type { margin-top: 0.2rem; }
+.side-card-title {
+    font-size: 0.8rem; font-weight: 600; color: var(--text); margin-bottom: 0.55rem;
+}
+.side-card-title .muted { font-weight: 400; color: var(--text-faint); }
 
 .stat-line {
-    display: flex; justify-content: space-between; font-size: 0.82rem;
-    color: var(--text-muted); padding: 0.22rem 0;
+    display: flex; justify-content: space-between; align-items: baseline; font-size: 0.82rem;
+    color: var(--text-muted); padding: 0.28rem 0;
 }
-.stat-line .value { font-family: var(--font-mono); color: var(--text); }
+.stat-line + .stat-line { border-top: 1px solid var(--surface-sunken); }
+.stat-line .value { font-family: var(--font-mono); color: var(--text); font-weight: 500; }
 
-.provider-pill {
-    display: inline-flex; align-items: center; gap: 0.35rem;
-    font-size: 0.75rem; padding: 0.24rem 0.55rem; border-radius: 999px;
-    background: var(--surface); border: 1px solid var(--border); margin: 0 0.3rem 0.3rem 0;
-    color: var(--text-muted);
+.status-row {
+    display: flex; justify-content: space-between; align-items: center; font-size: 0.82rem;
+    padding: 0.32rem 0; color: var(--text);
 }
-.provider-pill .dot { width: 6px; height: 6px; border-radius: 50%; }
-.provider-pill.ok .dot { background: var(--ok); }
-.provider-pill.missing { color: var(--bad); border-color: #F3C9C4; }
-.provider-pill.missing .dot { background: var(--bad); }
+.status-row + .status-row { border-top: 1px solid var(--surface-sunken); }
+.status-row .status-label { display: flex; align-items: center; gap: 0.5rem; }
+.status-row .dot { width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0; }
+.status-row .dot.ok { background: var(--ok); }
+.status-row .dot.missing { background: var(--bad); }
+.status-row .status-text { font-size: 0.74rem; color: var(--text-faint); }
+.status-row .status-text.missing { color: var(--bad); }
 
 [data-testid="stSidebar"] .stButton button {
-    width: 100%; text-align: left; border-radius: 10px; border: 1px solid var(--border-strong) !important;
-    background: var(--surface) !important; color: var(--text) !important; font-weight: 500 !important;
+    width: 100%; border-radius: 8px; border: none !important;
+    background: var(--accent) !important; color: #fff !important; font-weight: 500 !important;
     box-shadow: none !important; padding: 0.55rem 0.8rem !important;
 }
-[data-testid="stSidebar"] .stButton button:hover { border-color: var(--accent) !important; color: var(--accent) !important; }
+[data-testid="stSidebar"] .stButton button:hover { background: var(--accent-hover) !important; }
+[data-testid="stSidebar"] .stButton button p { color: #fff !important; }
 
 .st-key-chat_scroll { max-width: 46rem; margin: 0 auto; padding: 0 1rem 9rem 1rem; }
 
@@ -185,7 +217,7 @@ code { font-family: var(--font-mono); }
 }
 .pill .dot { width: 5px; height: 5px; border-radius: 50%; }
 .pill.pass .dot { background: var(--ok); }
-.pill.fail { border-color: #F3C9C4; color: var(--bad); }
+.pill.fail { border-color: #E3C6C5; color: var(--bad); }
 .pill.fail .dot { background: var(--bad); }
 .pill.skip .dot { background: var(--warn); }
 .pill.info .dot { background: var(--accent); }
@@ -201,7 +233,7 @@ code { font-family: var(--font-mono); }
 
 .error-note {
     font-size: 0.82rem; color: var(--bad); padding: 0.5rem 0.7rem; border-radius: 8px;
-    background: #FDF1F0; border: 1px solid #F3C9C4; margin-top: 0.3rem;
+    background: #FBEFEE; border: 1px solid #E3C6C5; margin-top: 0.3rem;
 }
 </style>
 """
@@ -219,10 +251,14 @@ if "pending_prompt" not in st.session_state:
 def get_corpus_stats():
     try:
         docs = qdrant_client.count(collection_name=settings.qdrant_docs_collection, exact=False).count
-        cached = qdrant_client.count(collection_name=settings.qdrant_cache_collection, exact=False).count
-        return docs, cached
+        semantic_cached = qdrant_client.count(collection_name=settings.qdrant_cache_collection, exact=False).count
     except Exception:
-        return None, None
+        return None, None, None
+    try:
+        exact_cached = exact_cache_count()
+    except Exception:
+        exact_cached = None
+    return docs, semantic_cached, exact_cached
 
 
 def get_session_stats():
@@ -247,6 +283,7 @@ def build_trace_segments(details: dict) -> list[dict]:
     blocked_stage = details.get("blocked_stage")
     cache_layer = details.get("cache_layer")
     cache_checked = details.get("exact_cache_checked", False)
+    unavailable_stage = details.get("unavailable_stage")
 
     if cache_layer == "exact":
         return [{"text": "cache hit, exact", "status": "pass"}]
@@ -267,18 +304,33 @@ def build_trace_segments(details: dict) -> list[dict]:
         return segments
     segments.append({"text": "cache miss" if cache_checked else "cache lookup", "status": "skip"})
 
-    if details.get("service_unavailable"):
+    if blocked_stage == "late_safety":
+        # The rewritten (history-based) standalone question matched a known
+        # jailbreak pattern and was blocked on a full safety recheck, not
+        # just skipped past the cache.
+        segments.append({"text": "safety blocked, rewritten question", "status": "fail"})
+        return segments
+
+    if unavailable_stage == "retrieval":
         segments.append({"text": "retrieval unavailable", "status": "fail"})
         return segments
 
     candidates_count = details.get("candidates_count", 0)
     segments.append({"text": f"retrieved {candidates_count}", "status": "pass"})
 
+    if unavailable_stage == "rerank":
+        segments.append({"text": "rerank unavailable", "status": "fail"})
+        return segments
+
     reranked_count = details.get("reranked_count", 0)
     if reranked_count == 0:
         segments.append({"text": "0 survived rerank", "status": "fail"})
         return segments
     segments.append({"text": f"reranked {reranked_count}/{candidates_count}", "status": "pass"})
+
+    if unavailable_stage == "generation":
+        segments.append({"text": "generation unavailable", "status": "fail"})
+        return segments
 
     provider = details.get("provider")
     model = details.get("model")
@@ -320,7 +372,11 @@ def render_details(details: dict) -> None:
 
 with st.sidebar:
     st.markdown(
-        '<div class="brand"><div class="brand-mark">K</div><div class="brand-name">Kubernetes Assistant</div></div>',
+        '<div class="brand">'
+        '<div class="brand-mark">K</div>'
+        '<div><div class="brand-name">Kubernetes Assistant</div>'
+        '<div class="brand-sub">Gated RAG over your docs</div></div>'
+        "</div>",
         unsafe_allow_html=True,
     )
 
@@ -330,34 +386,48 @@ with st.sidebar:
         get_corpus_stats.clear()
         st.rerun()
 
-    st.markdown('<div class="sidebar-section-title">Corpus</div>', unsafe_allow_html=True)
-    doc_count, cache_count = get_corpus_stats()
-    st.markdown(
-        f'<div class="stat-line"><span>Chunks indexed</span><span class="value">{doc_count if doc_count is not None else "-"}</span></div>'
-        f'<div class="stat-line"><span>Cached answers</span><span class="value">{cache_count if cache_count is not None else "-"}</span></div>',
-        unsafe_allow_html=True,
-    )
+    st.markdown('<div style="height: 0.9rem"></div>', unsafe_allow_html=True)
 
-    st.markdown('<div class="sidebar-section-title">This session</div>', unsafe_allow_html=True)
     questions_asked, hit_rate, avg_latency = get_session_stats()
     st.markdown(
-        f'<div class="stat-line"><span>Questions</span><span class="value">{questions_asked}</span></div>'
+        '<div class="side-card">'
+        '<div class="side-card-title">This conversation</div>'
+        f'<div class="stat-line"><span>Questions asked</span><span class="value">{questions_asked}</span></div>'
         f'<div class="stat-line"><span>Cache hit rate</span><span class="value">{hit_rate}</span></div>'
-        f'<div class="stat-line"><span>Avg. latency</span><span class="value">{avg_latency}</span></div>',
+        f'<div class="stat-line"><span>Avg. response time</span><span class="value">{avg_latency}</span></div>'
+        "</div>",
         unsafe_allow_html=True,
     )
 
-    st.markdown('<div class="sidebar-section-title">Providers</div>', unsafe_allow_html=True)
-    provider_html = ""
-    for provider in PROVIDERS:
-        ok = provider["check"]()
-        provider_html += (
-            f'<span class="provider-pill {"ok" if ok else "missing"}">'
-            f'<span class="dot"></span>{provider["label"]}</span>'
-        )
-    st.markdown(provider_html, unsafe_allow_html=True)
+    doc_count, semantic_cache_count, exact_cache_size = get_corpus_stats()
+    st.markdown(
+        '<div class="side-card">'
+        '<div class="side-card-title">Knowledge base</div>'
+        f'<div class="stat-line"><span>Chunks indexed</span><span class="value">{doc_count if doc_count is not None else "-"}</span></div>'
+        f'<div class="stat-line"><span>Semantic cache entries</span><span class="value">{semantic_cache_count if semantic_cache_count is not None else "-"}</span></div>'
+        f'<div class="stat-line"><span>Exact cache entries</span><span class="value">{exact_cache_size if exact_cache_size is not None else "-"}</span></div>'
+        "</div>",
+        unsafe_allow_html=True,
+    )
 
-    st.markdown('<div class="sidebar-section-title">Display</div>', unsafe_allow_html=True)
+    for group_name, providers in PROVIDER_GROUPS:
+        rows = ""
+        for provider in providers:
+            ok = provider["check"]()
+            dot_class = "ok" if ok else "missing"
+            status_text = "Connected" if ok else "Not configured"
+            status_class = "" if ok else "missing"
+            rows += (
+                '<div class="status-row">'
+                f'<span class="status-label"><span class="dot {dot_class}"></span>{provider["label"]}</span>'
+                f'<span class="status-text {status_class}">{status_text}</span>'
+                "</div>"
+            )
+        st.markdown(
+            f'<div class="side-card"><div class="side-card-title">{group_name}</div>{rows}</div>',
+            unsafe_allow_html=True,
+        )
+
     show_details = st.toggle("Show pipeline details", value=False)
 
 with st.container(key="chat_scroll"):
@@ -410,6 +480,7 @@ if prompt:
             "candidates_count": len(result.get("candidates") or []),
             "reranked_count": len(result.get("reranked") or []),
             "service_unavailable": result.get("service_unavailable", False),
+            "unavailable_stage": result.get("unavailable_stage"),
             "sources": result.get("reranked") if not result.get("cache_layer") else None,
             "latency_seconds": result.get("latency_seconds"),
         }

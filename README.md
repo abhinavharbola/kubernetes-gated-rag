@@ -17,7 +17,10 @@ flowchart TD
     Topic -->|allowed, with history| LateExact{"Exact cache hit?"}
     Topic -->|allowed, no history| Canonicalize["Deterministic normalization"]
     LateExact -->|hit| ReturnExact
-    LateExact -->|miss| Canonicalize
+    LateExact -->|miss, jailbreak-shaped| LateSafety["Safety Gate\nrecheck on rewritten question"]
+    LateSafety -->|blocked| RefusalUnsafe
+    LateSafety -->|allowed| Canonicalize
+    LateExact -->|miss, clean| Canonicalize
     Canonicalize --> SemanticCache{"Semantic cache hit?\nQdrant, cosine >= threshold"}
     SemanticCache -->|hit| ReturnSemantic([Return cached answer])
     SemanticCache -->|miss| Retrieve["Retrieve top K\nQdrant dense search"]
@@ -26,19 +29,22 @@ flowchart TD
     Rerank -->|unavailable| ServiceDown
     Rerank -->|zero survivors| NoContext([No grounded documentation, cached])
     Rerank -->|survivors| Generate["Generate\nGroq -> Groq secondary -> NIM"]
-    Generate --> ResponseSafety["Response Safety Gate\nNeMoGuard, checks the generated answer"]
+    Generate -->|all providers down| ServiceDown
+    Generate -->|ok| ResponseSafety["Response Safety Gate\nNeMoGuard, checks the generated answer"]
     ResponseSafety -->|blocked| RefusalUnsafe
     ResponseSafety -->|allowed| WriteCache([Async cache writes])
     WriteCache --> ReturnAnswer([Return answer])
 ```
 
-The important latency change is deliberate: a first-turn exact-cache hit does not invoke any remote model (it still runs the free, local jailbreak-pattern check against the raw message before serving the cached answer, closing the gap where a jailbreak-shaped repeat of a previously-approved question would otherwise skip both gates entirely). Context-dependent turns do not use the early exact cache because the same short message can mean different things in different histories. Those turns are rewritten, safety-checked, topic-checked, then get a context-safe exact-cache check (also jailbreak-pattern-checked first).
+The important latency change is deliberate: a first-turn exact-cache hit does not invoke any remote model (it still runs the free, local jailbreak-pattern check against the raw message before serving the cached answer, closing the gap where a jailbreak-shaped repeat of a previously-approved question would otherwise skip both gates entirely). Context-dependent turns do not use the early exact cache because the same short message can mean different things in different histories. Those turns are rewritten, safety-checked, topic-checked, then get a context-safe exact-cache check (also jailbreak-pattern-checked first) — and if that check finds a jailbreak-shaped rewritten question, it's routed through a full safety-gate recheck (deterministic pattern + NeMoGuard/fallback) on the rewritten text rather than just skipping the cache lookup and continuing on unchecked, since `safety_gate` earlier in the same turn only ever saw the pre-rewrite raw message.
 
-An infrastructure failure partway through retrieval or reranking (a Qdrant timeout, a FlashRank crash) is routed to a distinct "temporarily unavailable" answer rather than being treated the same as a genuine "no relevant documentation found". Only the latter is cached — conflating the two would let a transient outage get baked into the cache as a wrong answer for as long as `NO_CONTEXT_CACHE_TTL_SECONDS`.
+An infrastructure failure partway through retrieval, reranking, or generation (a Qdrant timeout, a FlashRank crash, every generation provider being down at once) is routed to a distinct "temporarily unavailable" answer rather than being treated the same as a genuine "no relevant documentation found". Only the latter is cached — conflating the two would let a transient outage get baked into the cache as a wrong answer for as long as `NO_CONTEXT_CACHE_TTL_SECONDS`.
 
 ## Guardrails
 
 Safety remains fail-closed. Known jailbreak-shaped requests are rejected locally with deterministic patterns, avoiding a second remote model call. All other requests go through NeMoGuard content-safety. The NeMoGuard call has a short timeout and an automatic circuit breaker; when its circuit is open or the call fails, the planner chain is used as a lower-confidence fallback. If neither path produces a usable verdict, the request is blocked.
+
+A jailbreak-shaped standalone question that only emerges after history-based rewriting (the raw message looked innocuous; rewriting it against chat history produced text matching a known jailbreak pattern) is caught and blocked, not just skipped past the cache. `safety_gate` runs once per turn against the raw message, before any rewrite happens, so a rewritten question needs its own check; the late exact-cache lookup's jailbreak check now routes into a dedicated safety-gate recheck against the rewritten text instead of falling through to retrieval and generation unchecked.
 
 The generated answer is checked too, not just the incoming question. The safety prompt and JSON schema always asked the classifier for a `Response Safety` verdict alongside `User Safety`; a response safety gate now actually calls for it, after generation and before the answer is shown or cached, using the same NeMoGuard/fallback/circuit-breaker machinery as the input-side safety gate.
 
@@ -46,7 +52,9 @@ Topic classification defaults to the planner-chain classifier (Groq, via `TOPIC_
 
 Safety classification still defaults to NeMoGuard content-safety (`GUARDRAIL_SKIP_NEMOGUARD_SAFETY=false`) since it's been reliable; the same skip switch and circuit breaker exist for it if that changes.
 
-FlashRank failure is fail-closed by default: a retrieval result that has not passed the rerank gate is not silently forwarded to generation. A FlashRank *crash* (as opposed to a real rerank producing zero survivors) is treated as an infrastructure failure and routed to the uncached "temporarily unavailable" answer, not to the cached "no grounded documentation" one.
+FlashRank failure is fail-closed by default: a retrieval result that has not passed the rerank gate is not silently forwarded to generation. A FlashRank *crash* (as opposed to a real rerank producing zero survivors) is treated as an infrastructure failure and routed to the uncached "temporarily unavailable" answer, not to the cached "no grounded documentation" one. If `RERANK_FAIL_CLOSED` is explicitly disabled, a crash falls back to raw retrieval similarity instead — but that fallback still applies `RERANK_FALLBACK_SCORE_THRESHOLD` rather than forwarding every retrieved candidate ungated; there's no rerank score to gate on in that path, so a cruder retrieval-similarity threshold stands in for it instead of skipping the gate entirely.
+
+A full generation-provider outage (Groq, Groq secondary, and NIM all failing) degrades to the same uncached "temporarily unavailable" answer as a retrieval or rerank infrastructure failure, rather than surfacing a raw error.
 
 ## Caching
 
@@ -74,6 +82,7 @@ GUARDRAIL_CIRCUIT_FAILURE_THRESHOLD=2
 GUARDRAIL_CIRCUIT_RECOVERY_SECONDS=30
 EMBEDDING_CACHE_TTL_SECONDS=86400
 RERANK_FAIL_CLOSED=true
+RERANK_FALLBACK_SCORE_THRESHOLD=0.6
 GENERATION_TIMEOUT_SECONDS=15
 PLANNER_TIMEOUT_SECONDS=4
 CACHE_SCHEMA_VERSION=3
@@ -82,7 +91,7 @@ CORPUS_VERSION=1
 TRACING_LOG_RAW_MESSAGES=false
 ```
 
-Increase `CACHE_POLICY_VERSION` whenever the safety/topic/cache policy changes in a way that makes an old answer unsuitable — this one is still manual, since "the policy changed" isn't something `ingest.py` can detect. `CORPUS_VERSION` is only a pre-first-ingest fallback now; once `ingest.py` has run at least once, the effective corpus version comes from `.cache/corpus_version`'s content fingerprint and updates automatically on every subsequent ingest. `TRACING_LOG_RAW_MESSAGES` controls whether raw user messages (as opposed to just a length + hash) are attached to Logfire spans; leave it `false` unless you're debugging locally against a private Logfire sink.
+Increase `CACHE_POLICY_VERSION` whenever the safety/topic/cache policy changes in a way that makes an old answer unsuitable — this one is still manual, since "the policy changed" isn't something `ingest.py` can detect. `CORPUS_VERSION` is only a pre-first-ingest fallback now; once `ingest.py` has run at least once, the effective corpus version comes from `.cache/corpus_version`'s content fingerprint and updates automatically on every subsequent ingest. `TRACING_LOG_RAW_MESSAGES` controls whether raw user messages (as opposed to just a length + hash) are attached to Logfire spans; leave it `false` unless you're debugging locally against a private Logfire sink. `RERANK_FALLBACK_SCORE_THRESHOLD` only matters if `RERANK_FAIL_CLOSED=false`; it's the retrieval-similarity cutoff used in place of a rerank score when FlashRank itself has crashed.
 
 `SEMANTIC_CACHE_SIMILARITY_THRESHOLD` and `RERANK_SCORE_THRESHOLD` remain empirical tuning knobs. Retrieval and rerank score distributions should be evaluated on the real corpus before changing them.
 
@@ -127,9 +136,3 @@ kubernetes-gated-rag/
 ├── requirements.txt
 └── .env.example
 ```
-
-
-
-
-
-

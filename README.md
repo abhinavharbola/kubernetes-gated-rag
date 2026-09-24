@@ -77,8 +77,8 @@ Split across three providers so a single account's rate limit can't take down ge
 
  - **Fail-closed safety:** Known jailbreak patterns are blocked locally. All other requests go through NeMoGuard with a short timeout and circuit breaker; failures fall back to the planner. If no usable verdict exists, block the request.
 - **Rewrite safety:** Rewritten questions are rechecked for jailbreaks. `safety_gate` runs on the raw message first, with a dedicated recheck if rewriting introduces a known pattern.
-- **Response safety:** Generated answers are safety-checked before being shown or cached, using the same NeMoGuard/fallback/circuit-breaker flow.
-- **Topic gating:** Planner classification is the default (`GUARDRAIL_SKIP_NEMOGUARD_TOPIC=true`) because NVIDIA's topic endpoint has recurring server-side failures. NeMoGuard topic checks are opt-in. Greetings and thanks are allowed locally. Topic checks fail closed without a usable verdict.
+- **Response safety:** Generated answers are safety-checked before being shown or cached, using the same NeMoGuard/fallback flow as input safety, but tracked by its own independent circuit breaker (not shared with the input-safety check), so a burst of failures on one side doesn't change fallback routing on the other.
+- **Topic gating:** Planner classification is the default (`GUARDRAIL_SKIP_NEMOGUARD_TOPIC=true`) because NVIDIA's topic endpoint has recurring server-side failures. NeMoGuard topic checks are opt-in. Greetings and thanks are allowed locally. Topic checks fail closed without a usable verdict, and use their own separate circuit breaker as well.
 - **Rerank fail-closed:** Only rerank-approved results reach generation. FlashRank crashes are treated as infrastructure failures and return the uncached 'temporarily unavailable' response. If `RERANK_FAIL_CLOSED=false`, raw similarity is allowed only above `RERANK_FALLBACK_SCORE_THRESHOLD`.
 - **Generation resilience:** If Groq, its secondary, and NIM all fail, return the same uncached 'temporarily unavailable' response instead of surfacing an error.
 
@@ -121,6 +121,7 @@ TRACING_LOG_RAW_MESSAGES=false
 - **`TRACING_LOG_RAW_MESSAGES`:** Controls whether Logfire spans include raw user messages or only length/hash metadata. Keep `false` unless debugging locally with a private Logfire sink.
 - **`RERANK_FALLBACK_SCORE_THRESHOLD`:** Used only when `RERANK_FAIL_CLOSED=false`; it sets the retrieval-similarity cutoff when FlashRank crashes.
 - **`SEMANTIC_CACHE_SIMILARITY_THRESHOLD` / `RERANK_SCORE_THRESHOLD`:** Empirical tuning knobs. Evaluate score distributions on the real corpus before changing them.
+- **`GUARDRAIL_CIRCUIT_FAILURE_THRESHOLD` / `GUARDRAIL_CIRCUIT_RECOVERY_SECONDS`:** Shared thresholds applied to three independent circuit breakers, one each for input-side safety, response-side safety, and topic gating. They're independent instances so a burst of failures on one (e.g. response-safety calls timing out more often on longer generated answers) doesn't open the breaker for another, only the threshold/recovery values are shared, not the breaker state itself.
 
 ## Evaluation
 

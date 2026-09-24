@@ -81,8 +81,23 @@ _SAFETY_RESPONSE_FORMAT = (
 )
 
 
+# Three independent breakers, not two: "safety" (input-side classification) and
+# "response_safety" (output-side classification) used to share a single "safety"
+# breaker, even though they're different call sites with different payload
+# shapes (a short user question vs. a full user+answer conversation) and
+# different points in the turn. A burst of failures on one — e.g. longer
+# generated answers pushing response-safety calls past the guardrail timeout
+# more often than short input questions do — would open the shared breaker and
+# push input-safety checks onto the fallback classifier too, for a reason that
+# had nothing to do with input safety itself. Splitting them mirrors the
+# per-name:model breaker keying the provider chain already uses in
+# src/providers/llm.py (_breaker_for): each failure domain gets its own
+# breaker, so failures in one don't affect routing decisions for the other.
 _breakers = {
     "safety": CircuitBreaker(settings.guardrail_circuit_failure_threshold, settings.guardrail_circuit_recovery_seconds),
+    "response_safety": CircuitBreaker(
+        settings.guardrail_circuit_failure_threshold, settings.guardrail_circuit_recovery_seconds
+    ),
     "topic": CircuitBreaker(settings.guardrail_circuit_failure_threshold, settings.guardrail_circuit_recovery_seconds),
 }
 
@@ -164,6 +179,10 @@ def _safety_field_for(response_message: str | None) -> str:
     return "User Safety" if response_message is None else "Response Safety"
 
 
+def _safety_breaker_for(response_message: str | None) -> CircuitBreaker:
+    return _breakers["safety"] if response_message is None else _breakers["response_safety"]
+
+
 def _direct_safety_check(user_message: str, response_message: str | None = None) -> bool | None:
     prompt = _safety_prompt(user_message, response_message)
     role = "safety_gate" if response_message is None else "response_safety_gate"
@@ -189,9 +208,13 @@ def _fallback_safety_check(user_message: str, response_message: str | None = Non
 def _safety_classifier_verdict(user_message: str, response_message: str | None = None) -> bool | None:
     if settings.guardrail_skip_nemoguard_safety:
         return _fallback_safety_check(user_message, response_message)
-    breaker = _breakers["safety"]
+    # Each call site (input-side vs. response-side) checks and updates its own
+    # breaker, so an outage on one side doesn't push the other side's calls
+    # onto the fallback classifier for an unrelated reason. See the comment
+    # on _breakers above.
+    breaker = _safety_breaker_for(response_message)
     if not breaker.allow():
-        logger.warning("safety NeMoGuard circuit open, using fallback classifier")
+        logger.warning("%s NeMoGuard circuit open, using fallback classifier", _safety_field_for(response_message))
         return _fallback_safety_check(user_message, response_message)
     try:
         verdict = _direct_safety_check(user_message, response_message)

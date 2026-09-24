@@ -187,3 +187,30 @@ def test_response_safety_gate_fails_closed_when_primary_and_fallback_error(mock_
     allowed, reason = response_safety_gate("question", "answer")
     assert allowed is False
     assert reason is not None
+
+
+@patch("src.guardrails.gates.generate_planner")
+@patch("src.guardrails.gates.nim_client")
+def test_safety_and_response_safety_use_independent_circuit_breakers(mock_nim, mock_planner):
+    # Regression test: safety_gate and response_safety_gate used to share a
+    # single "safety" CircuitBreaker. Opening it via repeated input-safety
+    # failures would also silently push response-safety calls onto the
+    # fallback classifier, for a reason unrelated to response safety. With
+    # independent breakers, tripping the input-safety breaker must not stop
+    # response_safety_gate from calling NeMoGuard directly.
+    mock_nim.chat.completions.create.side_effect = RuntimeError("provider down")
+    mock_planner.return_value = CompletionResult(
+        content=json.dumps({"User Safety": "safe"}), provider="nim", model="x"
+    )
+    for _ in range(settings.guardrail_circuit_failure_threshold):
+        safety_gate("how do I write a pod manifest?")
+
+    mock_nim.reset_mock()
+    mock_nim.chat.completions.create.side_effect = None
+    mock_nim.chat.completions.create.return_value = _mock_response_safety_response("safe")
+
+    allowed, reason = response_safety_gate("what is a Pod?", "A Pod is the smallest deployable unit.")
+
+    assert allowed is True
+    assert reason is None
+    assert mock_nim.chat.completions.create.called

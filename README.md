@@ -131,6 +131,23 @@ TRACING_LOG_RAW_MESSAGES=false
 
  The current evaluation set contains eight hand-written examples—enough to validate the harness, but not enough for strong benchmark conclusions. Treat it as a starter set to expand. Per-row results are written to `eval/results.csv`, with summary statistics printed to stdout.
 
+## Evaluation Metrics (Local Run)
+
+This is a local evaluation run, not a benchmark. The results are included to demonstrate the evaluation pipeline and provide a concrete end-to-end sanity check.
+
+8-example eval set (`eval/eval_set.json`), generation from `openai/gpt-oss-120b` (Groq), judged by `gemini-3.5-flash`:
+
+| Metric | Value |
+|---|---|
+| `faithfulness` | 0.94 |
+| `answer_relevancy` | 0.90 |
+| `context_precision` | 0.87 |
+| `context_recall` | 0.88 |
+| `context_entity_recall` | 0.81 |
+| `semantic_similarity` | 0.89 |
+
+These numbers reflect grounding given supplied context, not the full pipeline (see above: safety/topic gates, caching, retrieval, and reranking are bypassed for this eval). `n=8` is a smoke test, not a statistically meaningful sample; treat these as a sanity check that the harness works end to end, not as a benchmark of generation quality.
+
 ## Project Structure
 
 ```text

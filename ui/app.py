@@ -517,10 +517,6 @@ with st.container(key="chat_scroll"):
                 if turn["role"] == "assistant" and show_details and turn.get("details"):
                     render_details(turn["details"])
 
-        # The just-appended user turn above has no assistant reply yet -
-        # generate and render it right here, in the same run, so the
-        # answer streams into place under the question that's already
-        # visible instead of both appearing together only after a rerun.
         if st.session_state.history[-1]["role"] == "user":
             with st.chat_message("assistant"):
                 with st.spinner("Thinking..."):

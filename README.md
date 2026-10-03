@@ -16,140 +16,130 @@ A production-oriented RAG system for Kubernetes Q&A that answers only from your 
 
 Given a question, the pipeline:
 
-1. Checks two layers of cache, exact match then semantic similarity, before doing any retrieval or generation.
-2. Runs the question through a safety gate (deterministic jailbreak patterns + NeMoGuard) and a topic gate (is this actually about Kubernetes) before spending a generation call on something it shouldn't answer.
-3. Retrieves candidate chunks from Qdrant, reranks them, and applies a hard relevance threshold. If nothing clears the bar, it says so instead of guessing.
-4. Generates an answer from the surviving context only, then re-checks the *generated answer itself* for safety before it's shown or cached, not just the incoming question.
+1. Checks two layers of **cache**, exact match then semantic similarity, before doing any retrieval or generation.
+2. Runs the question through a **safety gate** (deterministic jailbreak patterns + NeMoGuard) and a topic gate (is this actually about Kubernetes) before spending a generation call on something it shouldn't answer.
+3. **Retrieves** candidate chunks from Qdrant, reranks them, and applies a hard relevance threshold. If nothing clears the bar, it says so instead of guessing.
+4. **Generates** an answer from the surviving context only, then re-checks the *generated answer itself* for safety before it's shown or cached, not just the incoming question.
 
-Anything an infrastructure failure interrupts along the way (a Qdrant timeout, a FlashRank crash, every generation provider being down at once) is surfaced as "temporarily unavailable" and is never cached, so a transient outage can't get baked into the cache as a wrong answer.
+Infrastructure failures (a Qdrant timeout, a FlashRank crash, every generation provider down, an unreachable safety or topic classifier) return "temporarily unavailable" and are never cached. A classifier outage is reported as an outage, not a policy refusal, and an answer whose response-safety check could not run is withheld.
 
 ## Architecture
 
 ```mermaid
 flowchart TD
-    Start([User turn]) --> ExactCache{"Exact cache hit?\nlocal diskcache"}
-    ExactCache -->|hit| ReturnExact([Return cached answer])
-    ExactCache -->|miss| Safety["Safety Gate\ndeterministic jailbreak + NeMoGuard"]
-    Safety -->|blocked| RefusalUnsafe([Refusal: unsafe / jailbreak])
-    Safety -->|allowed, no history| Topic["Topic Gate\nplanner classifier (Groq) by default"]
-    Safety -->|allowed, with history| Rewrite["Rewrite with History\nplanner chain"]
-    Rewrite --> Topic
-    Topic -->|blocked| RefusalOffTopic([Refusal: off-topic])
-    Topic -->|allowed, with history| LateExact{"Exact cache hit?"}
-    Topic -->|allowed, no history| Canonicalize["Deterministic normalization"]
-    LateExact -->|hit| ReturnExact
-    LateExact -->|miss, jailbreak-shaped| LateSafety["Safety Gate\nrecheck on rewritten question"]
-    LateSafety -->|blocked| RefusalUnsafe
-    LateSafety -->|allowed| Canonicalize
-    LateExact -->|miss, clean| Canonicalize
-    Canonicalize --> SemanticCache{"Semantic cache hit?\nQdrant, cosine >= threshold"}
-    SemanticCache -->|hit| ReturnSemantic([Return cached answer])
-    SemanticCache -->|miss| Retrieve["Retrieve top K\nQdrant dense search"]
-    Retrieve -->|unavailable| ServiceDown([Temporarily unavailable, NOT cached])
-    Retrieve -->|ok| Rerank["Rerank + hard threshold\nFlashRank"]
-    Rerank -->|unavailable| ServiceDown
-    Rerank -->|zero survivors| NoContext([No grounded documentation, cached])
-    Rerank -->|survivors| Generate["Generate\nGroq -> Groq secondary -> NIM"]
-    Generate -->|all providers down| ServiceDown
-    Generate -->|ok| ResponseSafety["Response Safety Gate\nNeMoGuard, checks the generated answer"]
-    ResponseSafety -->|blocked| RefusalUnsafe
-    ResponseSafety -->|allowed| WriteCache([Async cache writes])
-    WriteCache --> ReturnAnswer([Return answer])
+    Start([User turn]) --> Exact{"Greeting check, and exact cache\non first turns only"}
+    Exact -->|hit| Cached([Cached answer])
+    Exact -->|greeting| Hello([Canned reply])
+    Exact -->|miss| Safety["Safety gate"]
+    Safety --> Topic["Topic gate\nfollow-ups rewrite the question first"]
+    Topic --> Recheck["Follow-ups only:\nexact cache, then safety recheck if rewritten"]
+    Recheck -->|hit| Cached
+    Recheck --> Semantic{"Semantic cache"}
+    Semantic -->|hit| Cached
+    Semantic -->|miss| Retrieve["Retrieve + rerank\nhard relevance threshold"]
+    Retrieve -->|nothing clears| NoDocs([No grounded docs])
+    Retrieve -->|ok| Generate["Generate\nGroq, Groq secondary, NIM"]
+    Generate --> Check["Response safety gate"]
+    Check -->|ok| Answer([Answer + async cache writes])
+    Safety -.->|blocked| Refusal([Refusal])
+    Topic -.->|blocked| Refusal
+    Recheck -.->|blocked| Refusal
+    Check -.->|blocked| Refusal
 ```
 
-The important latency choice is deliberate: a first-turn exact-cache hit does not invoke any remote model (it still runs the free, local jailbreak-pattern check against the raw message before serving the cached answer, closing the gap where a jailbreak-shaped repeat of a previously-approved question would otherwise skip both gates entirely). Context-dependent turns do not use the early exact cache because the same short message can mean different things in different histories. Those turns are rewritten, safety-checked, topic-checked, then get a context-safe exact-cache check (also jailbreak-pattern-checked first), and if that check finds a jailbreak-shaped rewritten question, it's routed through a full safety-gate recheck (deterministic pattern + NeMoGuard/fallback) on the rewritten text rather than just skipping the cache lookup and continuing on unchecked, since `safety_gate` earlier in the same turn only ever saw the pre-rewrite raw message.
+- A first-turn exact-cache hit calls no remote model.
+- Turns with history skip the early cache and are rewritten. If the rewrite changed the question, it gets its own safety check.
+- A failed or unusable rewrite (empty, multi-line, oversized) marks the turn degraded: it is answered, but no cache is read or written.
+- The UI sends only answered turns as history (no refusals, errors, outages or greetings), capped at `HISTORY_MAX_MESSAGES`.
 
 ## Models
-
-Split across three providers so a single account's rate limit can't take down generation, and so the eval judge is a different model family from anything it's grading:
-
+ 
 | Role | Model | Provider | Notes |
 |---|---|---|---|
-| Generation | `openai/gpt-oss-120b` | Groq → Groq (secondary account) → NIM | Same model string on all three links deliberately: this failover is about separate rate-limit budgets, not model diversity. |
-| Planner / rewrite / topic fallback | `nvidia/nemotron-3-super-120b-a12b` → `openai/gpt-oss-20b` | NIM → Groq | Used for history-based query rewriting and the default topic classifier. |
-| Topic gate (opt-in) | `nvidia/llama-3.1-nemoguard-8b-topic-control` | NIM (NeMoGuard) | Off by default, NVIDIA's hosted endpoint for this one has a recurring server-side reliability issue, see Guardrails. |
-| Safety gate | `nvidia/llama-3.1-nemoguard-8b-content-safety` | NIM (NeMoGuard) | Default for both the input-side and response-side safety checks. |
-| Embeddings | `gemini-embedding-001` | Gemini | Semantic cache keys, document chunks, and query embeddings, persisted locally with a TTL. |
-| Reranker | `ms-marco-MiniLM-L-12-v2` | FlashRank, local CPU | The only model in the pipeline that isn't a hosted API call. |
-| Eval judge | `gemini-3.5-flash` | Gemini | A different family from every model in the live pipeline, so it never grades a model from its own family. |
-
+| Generation | `openai/gpt-oss-120b` | Groq -> Groq (secondary account) -> NIM | Same model on every link: separate rate-limit budgets. Auth, permission and not-found errors also fail over. |
+| Planner / rewrite / topic fallback | `nvidia/nemotron-3-super-120b-a12b` -> `openai/gpt-oss-20b` | NIM -> Groq | Rewrite, default topic classifier, ingestion relevance, safety fallback. |
+| Topic gate (opt-in) | `nvidia/llama-3.1-nemoguard-8b-topic-control` | NIM (NeMoGuard) | Off by default: NVIDIA's endpoint fails recurrently. |
+| Safety gate | `nvidia/llama-3.1-nemoguard-8b-content-safety` | NIM (NeMoGuard) | Input and response checks. |
+| Embeddings | `gemini-embedding-001` (768 dims) | Gemini | Cache keys, chunks, queries. Cached locally with a TTL. |
+| Reranker | `ms-marco-MiniLM-L-12-v2` | FlashRank, local CPU | The only local model. |
+| Eval judge | `gemini-3.5-flash` | Gemini | Set via `GEMINI_EVAL_JUDGE_MODEL`. A different family from the pipeline. |
+ 
 ## Guardrails
-
- - **Fail-closed safety:** Known jailbreak patterns are blocked locally. All other requests go through NeMoGuard with a short timeout and circuit breaker; failures fall back to the planner. If no usable verdict exists, block the request.
-- **Rewrite safety:** Rewritten questions are rechecked for jailbreaks. `safety_gate` runs on the raw message first, with a dedicated recheck if rewriting introduces a known pattern.
-- **Response safety:** Generated answers are safety-checked before being shown or cached, using the same NeMoGuard/fallback flow as input safety, but tracked by its own independent circuit breaker (not shared with the input-safety check), so a burst of failures on one side doesn't change fallback routing on the other.
-- **Topic gating:** Planner classification is the default (`GUARDRAIL_SKIP_NEMOGUARD_TOPIC=true`) because NVIDIA's topic endpoint has recurring server-side failures. NeMoGuard topic checks are opt-in. Greetings and thanks are allowed locally. Topic checks fail closed without a usable verdict, and use their own separate circuit breaker as well.
-- **Rerank fail-closed:** Only rerank-approved results reach generation. FlashRank crashes are treated as infrastructure failures and return the uncached 'temporarily unavailable' response. If `RERANK_FAIL_CLOSED=false`, raw similarity is allowed only above `RERANK_FALLBACK_SCORE_THRESHOLD`.
-- **Generation resilience:** If Groq, its secondary, and NIM all fail, return the same uncached 'temporarily unavailable' response instead of surfacing an error.
+ 
+- **Safety:** Unicode-normalized jailbreak patterns block locally. Everything else goes to NeMoGuard, then the planner chain. No usable verdict reports "unavailable", not a refusal.
+- **Rewrite safety:** A rewritten question is rechecked before retrieval.
+- **Response safety:** Answers are checked before display and caching. If the check cannot run, the answer is withheld.
+- **Topic:** Planner-chain classifier by default (`GUARDRAIL_SKIP_NEMOGUARD_TOPIC=true`). NeMoGuard topic is opt-in.
+- **Breakers:** After recovery a breaker admits one probe, and a failed probe reopens it immediately. Input safety, response safety, topic and each generation provider have separate breakers.
+- **Rerank:** Fail-closed. With `RERANK_FAIL_CLOSED=false`, raw similarity must exceed `RERANK_FALLBACK_SCORE_THRESHOLD`.
+- **Generation:** Empty, blank or truncated (`finish_reason=length`) completions fail over. All providers down returns the uncached "unavailable" response.
 
 ## Caching
+ 
+- **Exact:** `diskcache`, keyed by question plus schema, policy and corpus versions. Only whitespace and trailing `?`, `!`, `.` are normalized, so `-l` vs `-L` and `{.items[0]}` stay distinct.
+- **Semantic:** Qdrant with the same version filters and deterministic normalization (no LLM). Index creation backs off 30 seconds after a failure.
+- **Embeddings:** Query and cache lookups try once with no rate-limit wait, so a 429 becomes a miss. Ingestion retries, capped by `EMBEDDING_MAX_RETRY_WAIT_SECONDS`.
+- **No-context answers:** Exact cache only, with a short TTL (`NO_CONTEXT_CACHE_TTL_SECONDS`).
+- **Writes:** Background, failures logged, drained on shutdown. Degraded turns never touch the cache.
+- **Invalidation:** Each ingest fingerprints the docs collection into `<cache dir>/corpus_version`, and keys include it. `--wipe` also clears the exact cache.
+- **Paths:** `.cache` and `.env` resolve from the repo root. `CACHE_DIR` overrides the cache.
 
- - **Exact match:** Uses `diskcache`, keyed by the normalized question plus cache, policy, and corpus versions. Only cosmetic punctuation is stripped; Kubernetes-significant characters like `-`, `/`, `.`, and `:` are preserved to prevent collisions.
-- **Semantic match:** Uses Qdrant with the same version filters, preventing stale entries after policy or cache changes. Normalization is deterministic—no LLM canonicalization. Gemini embeddings are locally cached with a TTL and reused by task type, model, dimension, and text.
-- **Background writes:** Qdrant and disk writes happen off the critical path. Failures are logged without affecting the response, and in-flight writes are drained on shutdown.
-- **Automatic corpus invalidation:** Each successful ingest fingerprints the corpus into `.cache/corpus_version`; cache keys use this fingerprint once available. Any re-ingest automatically invalidates stale answers, including incremental updates. `--wipe` clears exact-cache data and recreates both Qdrant collections for space reclamation, not correctness.
+## Ingestion
+ 
+- **Formats:** `.pdf`, `.docx`, `.pptx`, `.html`, `.htm`, `.txt`, `.md`, `.yaml`, `.yml`. Tables in `.docx` and `.pptx` become `cell | cell` rows.
+- **Relevance gate:** `true_data/` fails open, `noisy_data/` fails closed (`INGEST_CLASSIFIER_TIMEOUT_SECONDS`).
+- **Re-ingest:** Point IDs are deterministic, and a file's old points are deleted before upsert, so edits replace rather than duplicate. Removed files need `--wipe`.
+- **Paths:** `source_path` is relative to the data directory, for example `true_data/pods.md`.
+- **Chunking:** Markdown splits on `#` headers outside code fences (not in YAML files). A manifest starts at a top-level `apiVersion:` and ends at the next manifest, `---`, a closing fence, or non-YAML text. Other text and long manifests are word-windowed with overlap, keeping line breaks. Chunks record `manifest_kind` and `manifest_name`.
+- **Exit:** Status 1 with no fingerprint if the docs collection is empty. File failures are logged and skipped.
 
 ## Provider latency budgets
-
-Generation defaults to a 15 second per-provider timeout. Planner operations default to 4 seconds. NeMoGuard calls default to 3 seconds. Provider links fail over immediately on transient errors instead of retrying the same provider before moving on. Qdrant uses a 5 second client timeout for the interactive path (raised from an earlier 2 seconds, which was too tight for real hosted Qdrant Cloud latency and caused ReadTimeouts on healthy requests).
-
-These values are starting budgets, not universal truths. Generation quality and provider tail latency still depend on the deployed models and network path.
-
+ 
+Timeouts: generation 15 seconds per provider, planner 4 seconds, NeMoGuard 3 seconds, Qdrant client 5 seconds. Failover is immediate, with no same-provider retry. Token budgets: `GENERATION_MAX_TOKENS` (2048), `PLANNER_MAX_TOKENS` (512), `CLASSIFIER_MAX_TOKENS` (512). Treat all of these as starting points.
+ 
 ## Configuration
-
-The relevant `.env` settings are:
-
-```text
-GUARDRAIL_TIMEOUT_SECONDS=3
-GUARDRAIL_CIRCUIT_FAILURE_THRESHOLD=2
-GUARDRAIL_CIRCUIT_RECOVERY_SECONDS=30
-EMBEDDING_CACHE_TTL_SECONDS=86400
-RERANK_FAIL_CLOSED=true
-RERANK_FALLBACK_SCORE_THRESHOLD=0.6
-GENERATION_TIMEOUT_SECONDS=15
-PLANNER_TIMEOUT_SECONDS=4
-CACHE_SCHEMA_VERSION=3
-CACHE_POLICY_VERSION=2
-CORPUS_VERSION=1
-TRACING_LOG_RAW_MESSAGES=false
-```
-
-## Configuration Notes
-
- - **`CACHE_POLICY_VERSION`:** Increment manually whenever safety, topic, or cache policy changes enough to invalidate existing answers. This cannot be inferred by `ingest.py`.
-- **`CORPUS_VERSION`:** Used only before the first ingest. Afterward, the effective version comes from `.cache/corpus_version` and updates automatically on every ingest.
-- **`TRACING_LOG_RAW_MESSAGES`:** Controls whether Logfire spans include raw user messages or only length/hash metadata. Keep `false` unless debugging locally with a private Logfire sink.
-- **`RERANK_FALLBACK_SCORE_THRESHOLD`:** Used only when `RERANK_FAIL_CLOSED=false`; it sets the retrieval-similarity cutoff when FlashRank crashes.
-- **`SEMANTIC_CACHE_SIMILARITY_THRESHOLD` / `RERANK_SCORE_THRESHOLD`:** Empirical tuning knobs. Evaluate score distributions on the real corpus before changing them.
-- **`GUARDRAIL_CIRCUIT_FAILURE_THRESHOLD` / `GUARDRAIL_CIRCUIT_RECOVERY_SECONDS`:** Shared thresholds applied to three independent circuit breakers, one each for input-side safety, response-side safety, and topic gating. They're independent instances so a burst of failures on one (e.g. response-safety calls timing out more often on longer generated answers) doesn't open the breaker for another, only the threshold/recovery values are shared, not the breaker state itself.
+ 
+Copy `.env.example` to `.env` and add the API keys. Everything else (models, URLs, timeouts, token budgets, breakers) has a default in `src/config.py`. The settings that matter:
+ 
+| Setting | Default | Notes |
+|---|---|---|
+| `CACHE_POLICY_VERSION` | 2 | Bump when safety, topic or cache policy changes. |
+| `CACHE_SCHEMA_VERSION` | 4 | Bump when cache key or payload format changes. |
+| `CORPUS_VERSION` | 1 | Used until the first ingest, then `<cache dir>/corpus_version` takes over. |
+| `CACHE_DIR` | `.cache` | Overrides the cache location. Tests use a temp dir. |
+| `GUARDRAIL_SKIP_NEMOGUARD_TOPIC` | true | Planner-chain topic gate. False enables NeMoGuard. |
+| `RERANK_SCORE_THRESHOLD` | 0.5 | Relevance cutoff. Tune on your corpus. |
+| `SEMANTIC_CACHE_SIMILARITY_THRESHOLD` | 0.95 | Tune on your corpus. |
+| `RERANK_FAIL_CLOSED` | true | If false, similarity above `RERANK_FALLBACK_SCORE_THRESHOLD` (0.6) is used when FlashRank crashes. |
+| `GENERATION_CONTEXT_CHUNKS` | 5 | Chunks sent to generation and shown as sources. |
+| `TRACING_LOG_RAW_MESSAGES` | false | When false, only message length and hash are logged. |
 
 ## Evaluation
-
- `eval/run_eval.py` uses Ragas to evaluate generation quality across faithfulness, answer relevancy, context precision/recall, context entity recall, and semantic similarity. The judge is `gemini-3.5-flash` via Gemini’s OpenAI-compatible endpoint, keeping evaluation independent from the Groq/NIM generation models. Gemini embeddings are reused for similarity metrics.
-
- This evaluates **grounding given supplied context**, not the full pipeline. Each row in `eval/eval_set.json` provides its own `retrieved_contexts`; missing answers are generated directly with `generate_main`, bypassing safety/topic gates, caching, retrieval, and reranking. Evaluation is capped at two concurrent rows to stay within Gemini’s rate limits.
-
- The current evaluation set contains eight hand-written examples—enough to validate the harness, but not enough for strong benchmark conclusions. Treat it as a starter set to expand. Per-row results are written to `eval/results.csv`, with summary statistics printed to stdout.
+ 
+`eval/run_eval.py` scores generation with Ragas: faithfulness, answer relevancy, context precision and recall, context entity recall, semantic similarity. The judge (`GEMINI_EVAL_JUDGE_MODEL`) runs through Gemini's OpenAI-compatible endpoint, with Gemini embeddings for similarity.
+ 
+- **Scope:** Grounding given supplied context only. Each row of `eval/eval_set.json` brings its own `retrieved_contexts`. Missing answers use `generate_main` with the live prompt (`build_answer_messages`), skipping gates, caches, retrieval and rerank.
+- **Concurrency:** Two rows at a time, with generation in a worker thread.
+- **Caveat:** The three context metrics score the hand-written contexts, not the retriever, and faithfulness is easier than on real retrieval.
+- **Size:** Eight examples validate the harness but prove no benchmark. Output goes to `eval/results.csv` and stdout.
 
 ## Evaluation Metrics (Local Run)
-
-This is a local evaluation run, not a benchmark. The results are included to demonstrate the evaluation pipeline and provide a concrete end-to-end sanity check.
-
+  
 8-example eval set (`eval/eval_set.json`), generation from `openai/gpt-oss-120b` (Groq), judged by `gemini-3.5-flash`:
-
+ 
 | Metric | Value |
 |---|---|
-| `faithfulness` | 0.94 |
-| `answer_relevancy` | 0.90 |
-| `context_precision` | 0.87 |
-| `context_recall` | 0.88 |
-| `context_entity_recall` | 0.81 |
-| `semantic_similarity` | 0.89 |
-
-These numbers reflect grounding given supplied context, not the full pipeline (see above: safety/topic gates, caching, retrieval, and reranking are bypassed for this eval). `n=8` is a smoke test, not a statistically meaningful sample; treat these as a sanity check that the harness works end to end, not as a benchmark of generation quality.
-
+| `faithfulness` | 0.95 |
+| `answer_relevancy` | 0.91 |
+| `context_precision` | 1.00 |
+| `context_recall` | 0.94 |
+| `context_entity_recall` | 0.90 |
+| `semantic_similarity` | 0.91 |
+ 
+Largest expected gains are `context_recall` and `context_entity_recall`, since each ground truth now claims only what its context supports. `n=8` is a smoke test.
+ 
 ## Project Structure
-
+ 
 ```text
 kubernetes-gated-rag/
 ├── .streamlit/config.toml          # Streamlit configuration
@@ -158,6 +148,7 @@ kubernetes-gated-rag/
 ├── src/
 │   ├── config.py                   # environment loading and pipeline configuration
 │   ├── graph.py                    # pipeline graph wiring
+│   ├── history.py                  # chat history selection for query rewriting
 │   ├── tracing.py                  # Logfire tracing
 │   │
 │   ├── guardrails/
@@ -186,46 +177,54 @@ kubernetes-gated-rag/
 │   └── run_eval.py                 # Ragas scoring harness
 │
 ├── assets/                         # screenshots, icons and static assets
-├── tests/                          # pipeline and guardrail tests
+├── tests/                          # unit, graph routing, in-memory Qdrant integration, and UI tests (isolated cache dir, fake credentials)
 │
 ├── ingest.py                       # document ingestion entry point
 ├── .env.example                    # environment variable template
+├── .gitignore                      # keeps .env, caches and local results out of version control
 ├── pytest.ini                      # pytest configuration
-├── requirements.txt                # Python dependencies
+├── requirements.txt                # runtime dependencies
 └── README.md
 ```
-
+ 
 ## Getting started
-
-1. **API keys**, you'll need:
+ 
+1. **API keys**, you will need:
    - NVIDIA NIM: https://build.nvidia.com
    - Groq, two accounts (primary and secondary, used for separate rate-limit budgets): https://console.groq.com/keys
    - Gemini: https://aistudio.google.com/apikey
    - Qdrant Cloud: https://cloud.qdrant.io
-   - Logfire (optional, tracing just no-ops without it): https://logfire.pydantic.dev
+   - Logfire (optional, tracing no-ops without it): https://logfire.pydantic.dev
 
-2. **Install**
-   ```bash
+2. **Install** (Python 3.10 or newer)
+   ```
    python3 -m venv venv && source venv/bin/activate
    pip install -r requirements.txt
-   cp .env.example .env   # fill in every key except LOGFIRE_TOKEN if you're skipping tracing
+   cp .env.example .env   # fill in every key except LOGFIRE_TOKEN if you are skipping tracing
    ```
-
-3. **Docs and Qdrant collections.** Unlike a hosted database, there's no separate setup step here, `ingest.py` creates both Qdrant collections itself on first run. Put your Kubernetes documentation under a data directory with `true_data/` and/or `noisy_data/` subfolders (`noisy_data` is optional and exists to prove the ingestion relevance gate actually rejects off-topic content, not as a second valid content tier), then run:
-   ```bash
-   pytest tests/ -v
+ 
+3. **Docs.** `ingest.py` creates the Qdrant collections. Put docs in a data directory with `true_data/` and/or `noisy_data/` (optional, there to prove the relevance gate rejects off-topic content), then run:
+   ```
+   pytest
    python ingest.py data --wipe
    ```
-
+   `pytest` runs offline with fake credentials. Omit `--wipe` later to update in place.
+ 
 ## Running it
-
-```bash
-streamlit run ui/app.py            # live chat UI
-python -m eval.run_eval            # Ragas scoring against eval/eval_set.json
-```
+ 
+   ```
+   streamlit run ui/app.py            # live chat UI
+   python -m eval.run_eval            # Ragas scoring against eval/eval_set.json
+   ```
+ 
+- **First launch:** Downloads the FlashRank model from Hugging Face into `/tmp`. Needs internet, and repeats if `/tmp` is cleared. If it fails, the app starts and retries on the first question. Until then, reranking returns "temporarily unavailable".
+- **Sidebar:** New chat, session stats (hit rate counts answered questions only), and a "Show pipeline details" toggle for the per-turn trace and sources.
 
 ## Known limitations
-
-- `eval/eval_set.json` is an 8-row starter set, not a finished benchmark, see Evaluation above.
-- `eval/run_eval.py` tests generation grounding against pre-supplied contexts, it does not exercise the safety/topic gates, caching, retrieval, or rerank stages, so a clean eval run is not by itself evidence that the full pipeline behaves correctly end to end. `tests/` covers those stages instead.
-- There is no ablation harness comparing the pipeline with a guardrail or cache layer disabled against the same eval set, unlike the gated-vs-ungated comparisons a fuller eval suite would have. Guardrail behavior is currently verified by `tests/test_guardrails.py`, not by the Ragas eval.
+ 
+- The eval set has 8 rows, and the metrics table is synthetic until you run the harness.
+- `ragas==0.4.3` needs `langchain-community<0.4.2` (pinned in `requirements.txt`). Drop the pin when Ragas stops importing the removed module.
+- Removing a source document requires `--wipe`.
+- Eval skips gates, caches, retrieval and rerank. `tests/` covers them with stubbed providers, an in-memory Qdrant and the UI.
+- No ablation harness for disabling a guardrail or cache layer. Guardrails are verified in `tests/test_guardrails.py`, not by the eval.
+- The test suite uses no live providers, hosted Qdrant or real FlashRank model.

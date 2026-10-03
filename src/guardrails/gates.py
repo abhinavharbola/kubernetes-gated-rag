@@ -2,14 +2,19 @@ import json
 import logging
 import re
 
-from src.guardrails.jailbreak_patterns import deterministic_jailbreak_check
 from src.config import settings
+from src.guardrails.jailbreak_patterns import deterministic_jailbreak_check
 from src.providers.circuit_breaker import CircuitBreaker
 from src.providers.clients import nim_client
 from src.providers.llm import generate_planner
 from src.tracing import provider_call_span
 
 logger = logging.getLogger(__name__)
+
+
+class GateUnavailableError(RuntimeError):
+    pass
+
 
 OFF_TOPIC_REFUSAL = (
     "I'm built to help with Kubernetes questions specifically. "
@@ -81,30 +86,26 @@ _SAFETY_RESPONSE_FORMAT = (
 )
 
 
-# Three independent breakers, not two: "safety" (input-side classification) and
-# "response_safety" (output-side classification) used to share a single "safety"
-# breaker, even though they're different call sites with different payload
-# shapes (a short user question vs. a full user+answer conversation) and
-# different points in the turn. A burst of failures on one — e.g. longer
-# generated answers pushing response-safety calls past the guardrail timeout
-# more often than short input questions do — would open the shared breaker and
-# push input-safety checks onto the fallback classifier too, for a reason that
-# had nothing to do with input safety itself. Splitting them mirrors the
-# per-name:model breaker keying the provider chain already uses in
-# src/providers/llm.py (_breaker_for): each failure domain gets its own
-# breaker, so failures in one don't affect routing decisions for the other.
+def _new_breaker() -> CircuitBreaker:
+    return CircuitBreaker(settings.guardrail_circuit_failure_threshold, settings.guardrail_circuit_recovery_seconds)
+
+
 _breakers = {
-    "safety": CircuitBreaker(settings.guardrail_circuit_failure_threshold, settings.guardrail_circuit_recovery_seconds),
-    "response_safety": CircuitBreaker(
-        settings.guardrail_circuit_failure_threshold, settings.guardrail_circuit_recovery_seconds
-    ),
-    "topic": CircuitBreaker(settings.guardrail_circuit_failure_threshold, settings.guardrail_circuit_recovery_seconds),
+    "safety": _new_breaker(),
+    "response_safety": _new_breaker(),
+    "topic": _new_breaker(),
 }
 
 
 def reset_circuit_breakers() -> None:
     for breaker in _breakers.values():
         breaker.record_success()
+
+
+def _require_verdict(verdict: bool | None, gate: str) -> bool:
+    if verdict is None:
+        raise GateUnavailableError(f"{gate} classifier unavailable or unparseable")
+    return verdict
 
 
 def _parse_binary_verdict(raw: str, true_word: str, false_word: str) -> bool | None:
@@ -127,16 +128,19 @@ def _parse_binary_verdict(raw: str, true_word: str, false_word: str) -> bool | N
 def _extract_json_object(raw: str) -> dict | None:
     stripped = raw.strip()
     try:
-        return json.loads(stripped)
+        parsed = json.loads(stripped)
     except Exception:
-        pass
+        parsed = None
+    if isinstance(parsed, dict):
+        return parsed
     match = re.search(r"\{.*\}", stripped, re.DOTALL)
     if not match:
         return None
     try:
-        return json.loads(match.group(0))
+        parsed = json.loads(match.group(0))
     except Exception:
         return None
+    return parsed if isinstance(parsed, dict) else None
 
 
 def _parse_safety_field(raw: str, field: str) -> bool | None:
@@ -196,7 +200,7 @@ def _fallback_safety_check(user_message: str, response_message: str | None = Non
         result = generate_planner(
             [{"role": "user", "content": prompt}],
             temperature=0.0,
-            max_tokens=250,
+            max_tokens=settings.classifier_max_tokens,
             timeout_seconds=settings.planner_timeout_seconds,
         )
     except Exception as error:
@@ -208,10 +212,6 @@ def _fallback_safety_check(user_message: str, response_message: str | None = Non
 def _safety_classifier_verdict(user_message: str, response_message: str | None = None) -> bool | None:
     if settings.guardrail_skip_nemoguard_safety:
         return _fallback_safety_check(user_message, response_message)
-    # Each call site (input-side vs. response-side) checks and updates its own
-    # breaker, so an outage on one side doesn't push the other side's calls
-    # onto the fallback classifier for an unrelated reason. See the comment
-    # on _breakers above.
     breaker = _safety_breaker_for(response_message)
     if not breaker.allow():
         logger.warning("%s NeMoGuard circuit open, using fallback classifier", _safety_field_for(response_message))
@@ -232,25 +232,11 @@ def _safety_classifier_verdict(user_message: str, response_message: str | None =
 def check_safety(raw_message: str) -> bool:
     if deterministic_jailbreak_check(raw_message):
         return False
-    verdict = _safety_classifier_verdict(raw_message)
-    if verdict is None:
-        logger.warning("safety classifier unavailable or unparseable, failing closed")
-        return False
-    return verdict
+    return _require_verdict(_safety_classifier_verdict(raw_message), "safety")
 
 
 def check_response_safety(user_message: str, response_message: str) -> bool:
-    # Mirrors check_safety but classifies the assistant's generated answer
-    # (grounded in retrieved context Claude doesn't fully control) rather
-    # than the incoming question. The safety prompt/schema above always
-    # supported a "Response Safety" verdict; this is the first caller that
-    # actually asks for it, so a bad or unexpectedly-unsafe generation no
-    # longer reaches the user or the cache unchecked.
-    verdict = _safety_classifier_verdict(user_message, response_message)
-    if verdict is None:
-        logger.warning("response safety classifier unavailable or unparseable, failing closed")
-        return False
-    return verdict
+    return _require_verdict(_safety_classifier_verdict(user_message, response_message), "response safety")
 
 
 def _fallback_topic_check(standalone_question: str) -> bool | None:
@@ -264,7 +250,7 @@ def _fallback_topic_check(standalone_question: str) -> bool | None:
                 {"role": "user", "content": standalone_question},
             ],
             temperature=0.0,
-            max_tokens=100,
+            max_tokens=settings.classifier_max_tokens,
             timeout_seconds=settings.planner_timeout_seconds,
         )
     except Exception as error:
@@ -298,22 +284,21 @@ _SMALL_TALK_PHRASES = {
 }
 
 
-def _is_small_talk(standalone_question: str) -> bool:
-    normalized = re.sub(r"\s+", " ", standalone_question.strip().lower()).rstrip("!.")
+def is_small_talk(message: str) -> bool:
+    normalized = re.sub(r"\s+", " ", message.strip().lower()).rstrip("!.,")
     return normalized in _SMALL_TALK_PHRASES
 
 
 def check_topic(standalone_question: str) -> bool:
-    if _is_small_talk(standalone_question):
+    if is_small_talk(standalone_question):
         return True
     if settings.guardrail_skip_nemoguard_topic:
-        verdict = _fallback_topic_check(standalone_question)
-        return verdict if verdict is not None else False
+        return _require_verdict(_fallback_topic_check(standalone_question), "topic")
     breaker = _breakers["topic"]
     if not breaker.allow():
         logger.warning("topic NeMoGuard circuit open, using fallback classifier")
-        verdict = _fallback_topic_check(standalone_question)
-        return verdict if verdict is not None else False
+        return _require_verdict(_fallback_topic_check(standalone_question), "topic")
+    verdict = None
     try:
         response = _call_nemoguard(
             settings.nemoguard_topic_model,
@@ -330,41 +315,34 @@ def check_topic(standalone_question: str) -> bool:
             false_word="off-topic",
         )
     except Exception as error:
-        breaker.record_failure()
         logger.warning("NeMoGuard topic call failed: %s", error)
-        verdict = None
     if verdict is None:
-        fallback_verdict = _fallback_topic_check(standalone_question)
-        return fallback_verdict if fallback_verdict is not None else False
+        breaker.record_failure()
+        return _require_verdict(_fallback_topic_check(standalone_question), "topic")
     breaker.record_success()
     return verdict
 
 
-def safety_gate(raw_message: str) -> tuple[bool, str | None]:
+def _run_gate(check, refusal: str, name: str, *args) -> tuple[bool, str | None]:
     try:
-        if not check_safety(raw_message):
-            return False, UNSAFE_REFUSAL
-        return True, None
+        allowed = check(*args)
+    except GateUnavailableError:
+        raise
     except Exception as error:
-        logger.error("safety gate failed, failing closed: %s", error)
-        return False, UNSAFE_REFUSAL
+        logger.error("%s gate failed: %s", name, error)
+        raise GateUnavailableError(f"{name} gate failed: {error}") from error
+    if not allowed:
+        return False, refusal
+    return True, None
+
+
+def safety_gate(raw_message: str) -> tuple[bool, str | None]:
+    return _run_gate(check_safety, UNSAFE_REFUSAL, "safety", raw_message)
 
 
 def topic_gate(standalone_question: str) -> tuple[bool, str | None]:
-    try:
-        if not check_topic(standalone_question):
-            return False, OFF_TOPIC_REFUSAL
-        return True, None
-    except Exception as error:
-        logger.error("topic gate failed, failing closed: %s", error)
-        return False, OFF_TOPIC_REFUSAL
+    return _run_gate(check_topic, OFF_TOPIC_REFUSAL, "topic", standalone_question)
 
 
 def response_safety_gate(user_message: str, response_message: str) -> tuple[bool, str | None]:
-    try:
-        if not check_response_safety(user_message, response_message):
-            return False, UNSAFE_REFUSAL
-        return True, None
-    except Exception as error:
-        logger.error("response safety gate failed, failing closed: %s", error)
-        return False, UNSAFE_REFUSAL
+    return _run_gate(check_response_safety, UNSAFE_REFUSAL, "response safety", user_message, response_message)

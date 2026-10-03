@@ -1,5 +1,7 @@
 import logging
+import re
 
+from src.config import settings
 from src.providers.llm import generate_planner
 
 logger = logging.getLogger(__name__)
@@ -14,39 +16,29 @@ RELEVANCE_SYSTEM_PROMPT = (
     "'irrelevant'."
 )
 
-# enough for the classifier to judge subject matter (title, abstract, intro)
-# without paying embedding-scale token cost on the full document
 EXCERPT_CHARS = 2000
 
+_VERDICT_RE = re.compile(r"\b(irrelevant|not\s+relevant|relevant)\b")
 
-def is_relevant(document_text: str) -> bool:
-    """Classifies a parsed document's excerpt for corpus relevance before it's
-    chunked and embedded. Fails OPEN (treated as relevant) on any classifier
-    error or unparseable response, deliberately the opposite of the
-    query-time guardrails' fail-closed behavior: a missed rejection here just
-    leaves one extra document that the rerank gate will very likely still
-    filter out per-query, whereas a false rejection here silently shrinks a
-    batch ingestion job's corpus with nobody watching to notice."""
+
+def is_relevant(document_text: str, fail_open: bool = True) -> bool:
     excerpt = document_text[:EXCERPT_CHARS]
     try:
         result = generate_planner(
             [
                 {"role": "system", "content": RELEVANCE_SYSTEM_PROMPT},
                 {"role": "user", "content": excerpt},
-            ]
+            ],
+            timeout_seconds=settings.ingest_classifier_timeout_seconds,
         )
         verdict = result.content.strip().lower()
     except Exception as error:
-        logger.warning("relevance classifier failed, ingesting anyway: %s", error)
-        return True
+        logger.warning("relevance classifier failed, %s: %s", "ingesting anyway" if fail_open else "skipping", error)
+        return fail_open
 
-    # checked in this order deliberately: "irrelevant" contains "relevant"
-    # as a substring, so checking for "relevant" first would misread every
-    # "irrelevant" verdict as an affirmative match.
-    if "irrelevant" in verdict:
-        return False
-    if "relevant" in verdict:
-        return True
+    match = _VERDICT_RE.search(verdict)
+    if match:
+        return match.group(1) == "relevant"
 
-    logger.warning("relevance classifier gave unparseable verdict %r, ingesting anyway", verdict)
-    return True
+    logger.warning("relevance classifier gave unparseable verdict %r, %s", verdict, "ingesting anyway" if fail_open else "skipping")
+    return fail_open

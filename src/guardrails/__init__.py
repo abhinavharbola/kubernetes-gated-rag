@@ -1,17 +1,19 @@
 from src.guardrails.gates import (
-    check_response_safety,
-    check_safety,
-    check_topic,
+    GateUnavailableError,
+    OFF_TOPIC_REFUSAL,
+    UNSAFE_REFUSAL,
+    is_small_talk,
     response_safety_gate,
     safety_gate,
     topic_gate,
 )
 
 __all__ = [
+    "GateUnavailableError",
+    "OFF_TOPIC_REFUSAL",
+    "UNSAFE_REFUSAL",
+    "is_small_talk",
+    "response_safety_gate",
     "safety_gate",
     "topic_gate",
-    "response_safety_gate",
-    "check_safety",
-    "check_topic",
-    "check_response_safety",
 ]

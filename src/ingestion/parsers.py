@@ -2,6 +2,7 @@ from pathlib import Path
 
 import pdfplumber
 from docx import Document as DocxDocument
+from docx.text.paragraph import Paragraph as DocxParagraph
 from pptx import Presentation
 from bs4 import BeautifulSoup
 
@@ -11,19 +12,31 @@ def parse_pdf(path: Path) -> str:
         return "\n\n".join(page.extract_text() or "" for page in pdf.pages)
 
 
+def _table_rows(table) -> list[str]:
+    return [" | ".join(cell.text.strip() for cell in row.cells) for row in table.rows]
+
+
 def parse_docx(path: Path) -> str:
     doc = DocxDocument(path)
-    return "\n".join(paragraph.text for paragraph in doc.paragraphs)
+    parts: list[str] = []
+    for block in doc.iter_inner_content():
+        if isinstance(block, DocxParagraph):
+            parts.append(block.text)
+        else:
+            parts.extend(_table_rows(block))
+    return "\n".join(parts)
 
 
 def parse_pptx(path: Path) -> str:
     presentation = Presentation(path)
-    slides_text = []
+    parts: list[str] = []
     for slide in presentation.slides:
         for shape in slide.shapes:
             if shape.has_text_frame:
-                slides_text.append(shape.text_frame.text)
-    return "\n".join(slides_text)
+                parts.append(shape.text_frame.text)
+            elif getattr(shape, "has_table", False) and shape.has_table:
+                parts.extend(_table_rows(shape.table))
+    return "\n".join(parts)
 
 
 def parse_html(path: Path) -> str:
@@ -43,7 +56,7 @@ PARSERS = {
     ".htm": parse_html,
     ".txt": parse_txt,
     ".md": parse_txt,
-    ".yaml": parse_txt,  # raw K8s manifests, plain text is enough for the chunker
+    ".yaml": parse_txt,
     ".yml": parse_txt,
 }
 

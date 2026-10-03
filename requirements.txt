@@ -1,24 +1,18 @@
-google-genai
+google-genai>=2.0
 flashrank
 streamlit
-langgraph
+langgraph>=1.0
 diskcache
 beautifulsoup4
-pydantic-settings
+pydantic-settings>=2.0
 pdfplumber
-python-dotenv
-qdrant-client
+qdrant-client>=1.9
 logfire
-ragas
-numpy  # used directly in src/retrieval/embeddings.py for vector normalization
-langchain-community<0.4.2  # ragas==0.4.3 imports langchain_community.chat_models.vertexai directly with
-                           # no version constraint of its own; that module was removed in 0.4.2, so an
-                           # unpinned install breaks eval/run_eval.py's `import ragas` at the top of the
-                           # chain. Pin below the break until ragas stops depending on the removed path.
+ragas==0.4.3
+langchain-community<0.4.2
+numpy
 tenacity
-pydantic
 pandas
-pytest
-openai
-python-docx
+openai>=1.0
+python-docx>=1.0
 python-pptx

@@ -2,27 +2,44 @@ import logging
 import threading
 from dataclasses import dataclass
 
-from openai import OpenAI, APITimeoutError, APIConnectionError, InternalServerError, RateLimitError
+from openai import (
+    APIConnectionError,
+    APITimeoutError,
+    AuthenticationError,
+    InternalServerError,
+    NotFoundError,
+    OpenAI,
+    PermissionDeniedError,
+    RateLimitError,
+)
 
-from src.providers.circuit_breaker import CircuitBreaker
-from src.providers.clients import nim_client, groq_client, groq_client_secondary
 from src.config import settings
+from src.providers.circuit_breaker import CircuitBreaker
+from src.providers.clients import groq_client, groq_client_secondary, nim_client
 from src.tracing import provider_call_span
 
 logger = logging.getLogger(__name__)
 
 
 class EmptyCompletionError(RuntimeError):
-    """Raised when a provider returns a completion with no content. Subclasses
-    RuntimeError so any old call site catching RuntimeError still works, but
-    is listed in RETRYABLE below so _run_chain treats it as failover-worthy
-    instead of raising immediately: an empty completion (clipped by a content
-    filter, a hosted-model hiccup, etc.) is exactly the kind of single-provider
-    flakiness the chain exists to route around, not a sign the whole request
-    is malformed the way a 400 is."""
+    pass
 
 
-RETRYABLE = (APITimeoutError, RateLimitError, APIConnectionError, InternalServerError, EmptyCompletionError)
+class IncompleteCompletionError(RuntimeError):
+    pass
+
+
+RETRYABLE = (
+    APITimeoutError,
+    RateLimitError,
+    APIConnectionError,
+    InternalServerError,
+    AuthenticationError,
+    PermissionDeniedError,
+    NotFoundError,
+    EmptyCompletionError,
+    IncompleteCompletionError,
+)
 
 _provider_breakers: dict[str, CircuitBreaker] = {}
 _provider_breakers_lock = threading.Lock()
@@ -63,9 +80,12 @@ def _call_openai(
             max_tokens=max_tokens,
             timeout=timeout_seconds,
         )
-        content = response.choices[0].message.content
-        if content is None:
+        choice = response.choices[0]
+        content = choice.message.content
+        if content is None or not content.strip():
             raise EmptyCompletionError(f"{provider_name} returned an empty completion")
+        if choice.finish_reason == "length":
+            raise IncompleteCompletionError(f"{provider_name} completion was cut off at max_tokens={max_tokens}")
         return content
 
 
@@ -97,7 +117,6 @@ def _openai_link(
 
 
 def _run_chain(chain: list[dict]) -> CompletionResult:
-    last_error: Exception | None = None
     for i, link in enumerate(chain):
         is_last = i == len(chain) - 1
         breaker = _breaker_for(link["name"], link["model"])
@@ -106,12 +125,9 @@ def _run_chain(chain: list[dict]) -> CompletionResult:
             continue
         try:
             content = link["call"]()
-            logger.info("served by %s (%s)", link["name"], link["model"])
-            breaker.record_success()
-            return CompletionResult(content=content, provider=link["name"], model=link["model"])
         except Exception as error:
-            last_error = error
             if not link["is_transient"](error):
+                breaker.record_success()
                 raise
             breaker.record_failure()
             if is_last:
@@ -123,16 +139,16 @@ def _run_chain(chain: list[dict]) -> CompletionResult:
                 chain[i + 1]["name"],
                 error,
             )
-    # every link was skipped via an open breaker except (by construction)
-    # the last one, which either returned above or raised above — this is
-    # unreachable, but guards against a future edit changing that invariant.
-    if last_error is not None:
-        raise RuntimeError("provider chain exhausted") from last_error
-    raise RuntimeError("provider chain was empty")
+            continue
+        logger.info("served by %s (%s)", link["name"], link["model"])
+        breaker.record_success()
+        return CompletionResult(content=content, provider=link["name"], model=link["model"])
+    raise RuntimeError("provider chain exhausted")
 
 
-def generate_main(messages: list[dict], temperature: float = 0.2, max_tokens: int = 1024) -> CompletionResult:
+def generate_main(messages: list[dict], temperature: float = 0.2, max_tokens: int | None = None) -> CompletionResult:
     timeout = settings.generation_timeout_seconds
+    max_tokens = max_tokens or settings.generation_max_tokens
     chain = [
         _openai_link(groq_client, settings.groq_main_model, "groq", messages, temperature, max_tokens, "main", timeout),
         _openai_link(
@@ -153,10 +169,11 @@ def generate_main(messages: list[dict], temperature: float = 0.2, max_tokens: in
 def generate_planner(
     messages: list[dict],
     temperature: float = 0.0,
-    max_tokens: int = 256,
+    max_tokens: int | None = None,
     timeout_seconds: float | None = None,
 ) -> CompletionResult:
     timeout = timeout_seconds or settings.planner_timeout_seconds
+    max_tokens = max_tokens or settings.planner_max_tokens
     chain = [
         _openai_link(nim_client, settings.nim_planner_model, "nim", messages, temperature, max_tokens, "planner", timeout),
         _openai_link(groq_client, settings.groq_planner_model, "groq", messages, temperature, max_tokens, "planner", timeout),

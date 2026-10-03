@@ -1,7 +1,6 @@
 import hashlib
 import logging
 import re
-from pathlib import Path
 
 import diskcache
 import numpy as np
@@ -9,21 +8,14 @@ from google.genai import types
 from google.genai.errors import ClientError
 from tenacity import retry, retry_if_exception, stop_after_attempt
 
+from src.config import cache_root, settings
 from src.providers.clients import gemini_client
-from src.config import settings
 
 logger = logging.getLogger(__name__)
 EMBED_BATCH_SIZE = 100
 RETRY_DELAY_RE = re.compile(r"([\d.]+)\s*s")
 
-# Anchored to the repo root (src/retrieval/embeddings.py -> src/retrieval ->
-# src -> repo root), matching src/retrieval/cache.py and ingest.py. See the
-# comment on _CACHE_DIR in cache.py: a cwd-relative ".cache/embeddings" path
-# meant this cache could silently live in a different place than the exact
-# and semantic caches, depending on which directory a process happened to
-# be launched from.
-_PROJECT_ROOT = Path(__file__).resolve().parents[2]
-_embedding_cache = diskcache.Cache(str(_PROJECT_ROOT / ".cache" / "embeddings"))
+_embedding_cache = diskcache.Cache(str(cache_root() / "embeddings"))
 
 
 def _is_rate_limit_error(error: BaseException) -> bool:
@@ -45,18 +37,12 @@ def _extract_retry_delay_seconds(error: ClientError, default: float = 30.0) -> f
 
 def _rate_limit_wait(retry_state) -> float:
     error = retry_state.outcome.exception()
-    delay = _extract_retry_delay_seconds(error)
+    delay = min(_extract_retry_delay_seconds(error), settings.embedding_max_retry_wait_seconds)
     logger.warning("Gemini embed_content rate limited, waiting %.0fs before retry", delay)
     return delay + 1.0
 
 
-@retry(
-    stop=stop_after_attempt(4),
-    wait=_rate_limit_wait,
-    retry=retry_if_exception(_is_rate_limit_error),
-    reraise=True,
-)
-def _embed_batch(batch: list[str], task_type: str) -> list[list[float]]:
+def _embed_batch_once(batch: list[str], task_type: str) -> list[list[float]]:
     response = gemini_client.models.embed_content(
         model=settings.gemini_embedding_model,
         contents=batch,
@@ -66,6 +52,20 @@ def _embed_batch(batch: list[str], task_type: str) -> list[list[float]]:
         ),
     )
     return [_normalize(embedding.values) for embedding in response.embeddings]
+
+
+_embed_batch_with_retry = retry(
+    stop=stop_after_attempt(4),
+    wait=_rate_limit_wait,
+    retry=retry_if_exception(_is_rate_limit_error),
+    reraise=True,
+)(_embed_batch_once)
+
+
+def _embed_batch(batch: list[str], task_type: str, interactive: bool = False) -> list[list[float]]:
+    if interactive:
+        return _embed_batch_once(batch, task_type)
+    return _embed_batch_with_retry(batch, task_type)
 
 
 def _normalize(vector: list[float]) -> list[float]:
@@ -84,7 +84,7 @@ def _cache_key(text: str, task_type: str) -> str:
     )
 
 
-def embed_texts(texts: list[str], task_type: str) -> list[list[float]]:
+def embed_texts(texts: list[str], task_type: str, interactive: bool = False) -> list[list[float]]:
     if not texts:
         return []
     for i, text in enumerate(texts):
@@ -102,7 +102,7 @@ def embed_texts(texts: list[str], task_type: str) -> list[list[float]]:
 
     for start in range(0, len(misses), EMBED_BATCH_SIZE):
         batch_pairs = misses[start : start + EMBED_BATCH_SIZE]
-        batch_vectors = _embed_batch([text for _, text in batch_pairs], task_type)
+        batch_vectors = _embed_batch([text for _, text in batch_pairs], task_type, interactive=interactive)
         if len(batch_vectors) != len(batch_pairs):
             raise RuntimeError(f"Gemini returned {len(batch_vectors)} embeddings for {len(batch_pairs)} inputs")
         for (index, text), vector in zip(batch_pairs, batch_vectors):
@@ -113,12 +113,6 @@ def embed_texts(texts: list[str], task_type: str) -> list[list[float]]:
                 expire=settings.embedding_cache_ttl_seconds,
             )
 
-    # By this point every slot should be filled, from either the cache or a
-    # batch call above. Silently filtering out any remaining None would turn
-    # a real bug (a batch that didn't cover every input, an index mismatch)
-    # into a shorter-than-expected list, which then surfaces as a confusing
-    # IndexError at the caller (embed_query/embed_document index into [0])
-    # instead of a clear error pointing at the actual cause.
     missing = [i for i, vector in enumerate(vectors) if vector is None]
     if missing:
         raise RuntimeError(
@@ -128,12 +122,8 @@ def embed_texts(texts: list[str], task_type: str) -> list[list[float]]:
 
 
 def embed_query(text: str) -> list[float]:
-    return embed_texts([text], task_type="RETRIEVAL_QUERY")[0]
-
-
-def embed_document(text: str) -> list[float]:
-    return embed_texts([text], task_type="RETRIEVAL_DOCUMENT")[0]
+    return embed_texts([text], task_type="RETRIEVAL_QUERY", interactive=True)[0]
 
 
 def embed_for_cache(text: str) -> list[float]:
-    return embed_texts([text], task_type="SEMANTIC_SIMILARITY")[0]
+    return embed_texts([text], task_type="SEMANTIC_SIMILARITY", interactive=True)[0]

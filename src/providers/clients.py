@@ -1,6 +1,6 @@
-from openai import OpenAI
 from google import genai
 from google.genai import types
+from openai import OpenAI
 from qdrant_client import QdrantClient
 
 from src.config import settings
@@ -26,10 +26,6 @@ groq_client_secondary = OpenAI(
     max_retries=0,
 )
 
-# http_options.timeout is milliseconds in the google-genai SDK (unlike every
-# other client here, which takes seconds) — previously unset entirely, so a
-# slow embed_content call had no budget of its own and could run for however
-# long the transport's own default allows.
 gemini_client = genai.Client(
     api_key=settings.gemini_api_key,
     http_options=types.HttpOptions(timeout=int(settings.embedding_timeout_seconds * 1000)),
@@ -39,4 +35,5 @@ qdrant_client = QdrantClient(
     url=settings.qdrant_url,
     api_key=settings.qdrant_api_key,
     timeout=settings.qdrant_timeout_seconds,
+    check_compatibility=False,
 )

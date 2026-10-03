@@ -1,8 +1,12 @@
+from pathlib import Path
+
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+    model_config = SettingsConfigDict(env_file=str(PROJECT_ROOT / ".env"), extra="ignore")
 
     nvidia_nim_api_key: str
     groq_api_key: str
@@ -11,20 +15,10 @@ class Settings(BaseSettings):
     qdrant_url: str
     qdrant_api_key: str
     logfire_token: str | None = None
-    # Off by default: turn_span() logs only a length + hash of the user
-    # message when this is False, so raw user input (which may contain PII,
-    # per the safety taxonomy's own S9 category) isn't shipped to Logfire.
-    # Set True only for local debugging with a private/local Logfire sink.
     tracing_log_raw_messages: bool = False
 
-    # Deliberately the same open-weights model string across all three
-    # links of generate_main's chain: the failover this project needs is
-    # provider/account diversity (Groq primary account, Groq secondary
-    # account, NVIDIA NIM), not model diversity — the goal is "keep
-    # answering if one hosted endpoint is down or rate-limited", not "try a
-    # different model". If you intend these to actually be different
-    # models, set them explicitly via env vars; leaving them identical here
-    # is intentional, not a copy-paste leftover.
+    cache_dir: str = ""
+
     groq_main_model: str = "openai/gpt-oss-120b"
     groq_main_model_secondary: str = "openai/gpt-oss-120b"
     nim_main_model: str = "openai/gpt-oss-120b"
@@ -35,14 +29,6 @@ class Settings(BaseSettings):
     nemoguard_topic_model: str = "nvidia/llama-3.1-nemoguard-8b-topic-control"
     nemoguard_safety_model: str = "nvidia/llama-3.1-nemoguard-8b-content-safety"
     guardrail_skip_nemoguard_safety: bool = False
-    # NeMoGuard topic-control has been the one reliably crashing (a
-    # recurring server-side TensorRT-LLM/CUDA error on NVIDIA's hosted
-    # endpoint, not something a client-side retry or timeout fixes).
-    # Default true: use the existing fallback classifier (Groq, via
-    # TOPIC_POLICY_PROMPT) as topic's primary path instead of paying for a
-    # call to a model that's reliably failing. Flip to false to give
-    # NeMoGuard topic-control another try once NVIDIA's instance is
-    # confirmed healthy again.
     guardrail_skip_nemoguard_topic: bool = True
     guardrail_timeout_seconds: float = 3.0
     guardrail_circuit_failure_threshold: int = 2
@@ -51,6 +37,7 @@ class Settings(BaseSettings):
     gemini_embedding_model: str = "gemini-embedding-001"
     embedding_dim: int = 768
     embedding_cache_ttl_seconds: int = 86400
+    embedding_max_retry_wait_seconds: float = 60.0
 
     semantic_cache_similarity_threshold: float = 0.95
     rerank_score_threshold: float = 0.5
@@ -65,39 +52,31 @@ class Settings(BaseSettings):
     rerank_top_k: int = 20
     rerank_model: str = "ms-marco-MiniLM-L-12-v2"
     rerank_fail_closed: bool = True
-    # Only used when rerank_fail_closed is False and FlashRank itself
-    # crashed, so no rerank_score is available to gate on. Conservative by
-    # default since this is already a degraded path with a cruder signal
-    # (raw retrieval similarity) than the real rerank score.
     rerank_fallback_score_threshold: float = 0.6
+    generation_context_chunks: int = 5
 
     generation_timeout_seconds: float = 15.0
+    generation_max_tokens: int = 2048
     planner_timeout_seconds: float = 4.0
-    # 2.0s (the previous hardcoded value) was too tight for real hosted
-    # Qdrant Cloud latency, especially free-tier, and caused ReadTimeouts
-    # on otherwise-healthy requests rather than only on genuine outages.
-    # 5s still keeps a stalled Qdrant from eating the whole interactive
-    # budget the way the original 60s did, with realistic headroom.
+    planner_max_tokens: int = 512
+    classifier_max_tokens: int = 512
+    ingest_classifier_timeout_seconds: float = 20.0
     qdrant_timeout_seconds: float = 5.0
-    # Gemini's client previously had no timeout configured at all, unlike
-    # every other provider client here — a slow embed_content call could
-    # hang for however long the underlying SDK/transport defaults to.
     embedding_timeout_seconds: float = 10.0
 
-    # Circuit breaker for the shared provider chain in src/providers/llm.py
-    # (nim/groq/groq-secondary), separate from guardrail_circuit_* above,
-    # which only covers the two NeMoGuard classifier calls. Without this,
-    # an unhealthy NIM meant every independent generate_planner/generate_main
-    # call in a turn re-paid the full planner/generation timeout discovering
-    # the same outage from scratch — e.g. rewrite_with_history and the topic
-    # gate's fallback classifier both hitting a dead NIM for 4s each, in the
-    # same turn, with no memory of the first failure.
+    history_max_messages: int = 6
+    rewrite_max_chars: int = 500
+
     provider_circuit_failure_threshold: int = 2
     provider_circuit_recovery_seconds: float = 20.0
 
-    cache_schema_version: str = "3"
+    cache_schema_version: str = "4"
     cache_policy_version: str = "2"
     corpus_version: str = "1"
 
 
 settings = Settings()
+
+
+def cache_root() -> Path:
+    return Path(settings.cache_dir) if settings.cache_dir else PROJECT_ROOT / ".cache"

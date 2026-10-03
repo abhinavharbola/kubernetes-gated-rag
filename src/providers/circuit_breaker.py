@@ -3,16 +3,12 @@ import time
 
 
 class CircuitBreaker:
-    """Opens after failure_threshold consecutive failures, refuses calls
-    until recovery_seconds has passed, then fully closes again (not a
-    gradual half-open trial — the next call after recovery just tries
-    normally and reopens fast if the provider is still down)."""
-
     def __init__(self, failure_threshold: int, recovery_seconds: float):
         self.failure_threshold = failure_threshold
         self.recovery_seconds = recovery_seconds
         self.failures = 0
         self.opened_at = 0.0
+        self._probing = False
         self._lock = threading.Lock()
 
     def allow(self) -> bool:
@@ -20,8 +16,9 @@ class CircuitBreaker:
             if self.opened_at == 0.0:
                 return True
             if time.monotonic() - self.opened_at >= self.recovery_seconds:
-                self.opened_at = 0.0
-                self.failures = 0
+                if self._probing:
+                    return False
+                self._probing = True
                 return True
             return False
 
@@ -29,9 +26,13 @@ class CircuitBreaker:
         with self._lock:
             self.failures = 0
             self.opened_at = 0.0
+            self._probing = False
 
     def record_failure(self) -> None:
         with self._lock:
             self.failures += 1
-            if self.failures >= self.failure_threshold:
+            if self._probing:
+                self.opened_at = time.monotonic()
+                self._probing = False
+            elif self.failures >= self.failure_threshold and self.opened_at == 0.0:
                 self.opened_at = time.monotonic()

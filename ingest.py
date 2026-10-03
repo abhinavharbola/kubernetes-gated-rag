@@ -6,86 +6,80 @@ import uuid
 from pathlib import Path
 
 from qdrant_client.http.exceptions import ResponseHandlingException
-from qdrant_client.models import Distance, PointStruct, VectorParams
+from qdrant_client.models import (
+    Distance,
+    FieldCondition,
+    Filter,
+    FilterSelector,
+    MatchValue,
+    PayloadSchemaType,
+    PointStruct,
+    VectorParams,
+)
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
+from src.config import cache_root, settings
 from src.ingestion.chunking import chunk_document
-from src.providers.clients import qdrant_client
-from src.config import settings
-from src.retrieval.embeddings import embed_texts
 from src.ingestion.filters import is_relevant
 from src.ingestion.parsers import PARSERS, parse_file
-from src.retrieval.cache import ensure_semantic_cache_indexes
+from src.providers.clients import qdrant_client
+from src.retrieval.cache import ensure_semantic_cache_indexes, exact_cache_clear
+from src.retrieval.embeddings import embed_texts
 from src.tracing import node_span
 
 logger = logging.getLogger(__name__)
 
-# matches the on-disk convention from the source data: a DATA/ directory
-# containing a true_data/ subfolder (the real corpus) and a noisy_data/
-# subfolder (off-topic/adversarial content, expected to be rejected by
-# is_relevant() before it's ever chunked or embedded, not a lower-trust
-# second tier of valid content).
 TRUE_DIR_NAME = "true_data"
 NOISY_DIR_NAME = "noisy_data"
 
-# Gemini's free-tier embed_content quota is 100 requests/minute. embed_texts()
-# already retries on a 429 respecting the server's suggested backoff, but
-# that's a reactive fix — spacing ingestion's own calls out proactively means
-# fewer 429s to react to in the first place. 1s between files keeps a
-# many-small-files corpus comfortably under the ceiling; raise this if you're
-# still hitting 429s with a lot of files.
 INGEST_EMBED_DELAY_SECONDS = 1.0
-
-# a single large-file upsert (many points, each with a full vector + text
-# payload) can be a big enough request body to hit a write timeout on a
-# free-tier Qdrant Cloud connection. Splitting into smaller batches keeps
-# each request quick and means a mid-file failure doesn't lose the points
-# that already made it in.
 UPSERT_BATCH_SIZE = 64
+SOURCE_PATH_FIELD = "metadata.source_path"
+YAML_SUFFIXES = {".yaml", ".yml"}
 
-# Anchored to this file's own directory (the repo root), not to the process's
-# current working directory. ingest.py and ui/app.py previously both wrote
-# ".cache/..." relative to cwd — if either was launched from a different
-# directory than the other (e.g. `cd ui && streamlit run app.py`), they'd
-# silently read and write two different .cache trees, breaking the corpus
-# fingerprint handshake between them with no error, just a fallback to the
-# static CORPUS_VERSION. src/retrieval/cache.py and src/retrieval/embeddings.py
-# anchor the same way for the same reason.
-PROJECT_ROOT = Path(__file__).resolve().parent
-CACHE_DIR = PROJECT_ROOT / ".cache"
-
-# src/retrieval/cache.py reads this file to get the "effective" corpus
-# version for cache keys, falling back to settings.corpus_version when it
-# doesn't exist. That marker is written below, from a hash of every file
-# that actually made it into the corpus this run (path + content). Deriving
-# it from content rather than relying on a human to bump CORPUS_VERSION
-# means an incremental re-ingest (no --wipe, just adding/changing files)
-# still invalidates stale cached answers automatically, instead of them
-# silently surviving forever because nobody remembered to edit .env.
+CACHE_DIR = cache_root()
 CORPUS_VERSION_MARKER = CACHE_DIR / "corpus_version"
 
-
-@retry(
+_transport_retry = retry(
     stop=stop_after_attempt(4),
     wait=wait_exponential(multiplier=2, min=2, max=30),
     retry=retry_if_exception_type(ResponseHandlingException),
     reraise=True,
 )
+
+
+@_transport_retry
 def _upsert_batch(points: list[PointStruct]) -> None:
-    # ResponseHandlingException wraps transport-level failures (timeouts,
-    # connection resets), not a real server-side rejection of the request
-    # (that's UnexpectedResponse, a 4xx/5xx with a body) — safe to retry.
     qdrant_client.upsert(collection_name=settings.qdrant_docs_collection, points=points)
 
 
+@_transport_retry
+def _delete_source_points(source: str) -> None:
+    qdrant_client.delete(
+        collection_name=settings.qdrant_docs_collection,
+        points_selector=FilterSelector(
+            filter=Filter(must=[FieldCondition(key=SOURCE_PATH_FIELD, match=MatchValue(value=source))])
+        ),
+    )
+
+
+def _point_id(source: str, index: int) -> str:
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, f"{source}#{index}"))
+
+
+def _ensure_source_index() -> None:
+    try:
+        qdrant_client.create_payload_index(
+            collection_name=settings.qdrant_docs_collection,
+            field_name=SOURCE_PATH_FIELD,
+            field_schema=PayloadSchemaType.KEYWORD,
+        )
+    except Exception as error:
+        if "already exist" not in str(error).lower():
+            raise
+
+
 def ensure_collection(wipe: bool = False) -> None:
-    # wipe clears BOTH the docs collection and the semantic cache, not just
-    # docs. A cached answer (semantic or the permanent, expire=None exact
-    # cache) points at content that may no longer exist or may have changed
-    # once the corpus is re-ingested; leaving the cache alone means repeat
-    # or paraphrased questions keep silently serving pre-wipe answers
-    # indefinitely, since only the "no grounded documentation" outcome has
-    # a TTL, not a real generated answer.
     existing = {c.name for c in qdrant_client.get_collections().collections}
 
     if wipe:
@@ -106,93 +100,93 @@ def ensure_collection(wipe: bool = False) -> None:
             collection_name=settings.qdrant_cache_collection,
             vectors_config=VectorParams(size=settings.embedding_dim, distance=Distance.COSINE),
         )
-    # payload index for cache_schema_version/policy_version/corpus_version,
-    # required for the version filter in src/retrieval/cache.py's
-    # semantic_cache_get/set. Idempotent, safe whether the collection was
-    # just created above or already existed from a previous run.
+    _ensure_source_index()
     ensure_semantic_cache_indexes()
 
 
 def _wipe_exact_cache() -> None:
-    # local import: ingest.py otherwise has no reason to touch
-    # src.retrieval.cache, and importing it unconditionally at module load
-    # would pull in diskcache's on-disk init for a CLI path that might
-    # never need it (e.g. --help).
-    from src.retrieval.cache import _exact_cache
-
-    count = len(_exact_cache)
-    _exact_cache.clear()
+    count = exact_cache_clear()
     logger.info("wiped %d entr%s from the local exact cache", count, "y" if count == 1 else "ies")
 
 
-def ingest_directory(directory: Path, corpus_hasher: "hashlib._Hash | None" = None) -> dict:
+def ingest_directory(directory: Path, root: Path | None = None, relevance_fail_open: bool = True) -> dict:
     ingested = 0
     skipped_irrelevant = 0
     failed = 0
+    root = root or directory
 
-    # Sorted so the corpus fingerprint is deterministic across runs on the
-    # same content — rglob's own order depends on filesystem/OS details and
-    # would otherwise make corpus_hasher's digest vary between two ingests
-    # of identical files, defeating the point of fingerprinting.
     for path in sorted(directory.rglob("*")):
         if not path.is_file() or path.suffix.lower() not in PARSERS:
             continue
 
-        with node_span("ingest_file", path=str(path)):
-            # Isolated per file: a single bad document (corrupt PDF, a
-            # DOCX python-docx can't open, a transient embedding/Qdrant
-            # error on just this file) used to raise straight out of
-            # ingest_directory and abort the whole run, including files
-            # that already succeeded and were upserted into Qdrant earlier
-            # in the same loop. Those earlier files stayed in Qdrant, but
-            # _write_corpus_version() at the end of main() never ran
-            # because main() itself crashed — so the corpus fingerprint on
-            # disk silently fell behind what Qdrant actually held, and
-            # stale cache entries kept serving as if nothing had changed.
-            # Catching here means one bad file is logged and skipped, and
-            # the corpus fingerprint still reflects everything that
-            # actually made it in.
+        source = path.relative_to(root).as_posix()
+        with node_span("ingest_file", path=source):
             try:
                 text = parse_file(path)
                 if not text.strip():
+                    _delete_source_points(source)
                     continue
 
-                if not is_relevant(text):
-                    logger.info("skipping (classified irrelevant to corpus): %s", path)
+                if not is_relevant(text, fail_open=relevance_fail_open):
+                    logger.info("skipping (classified irrelevant to corpus): %s", source)
+                    _delete_source_points(source)
                     skipped_irrelevant += 1
                     continue
 
-                chunks = chunk_document(text, base_metadata={"source_path": str(path)})
+                chunks = chunk_document(
+                    text,
+                    base_metadata={"source_path": source},
+                    markdown=path.suffix.lower() not in YAML_SUFFIXES,
+                )
                 if not chunks:
+                    _delete_source_points(source)
                     continue
 
-                # one batched call for every chunk in this file instead of
-                # one Gemini round-trip per chunk.
                 vectors = embed_texts([chunk["text"] for chunk in chunks], task_type="RETRIEVAL_DOCUMENT")
                 time.sleep(INGEST_EMBED_DELAY_SECONDS)
 
                 points = [
                     PointStruct(
-                        id=str(uuid.uuid4()),
+                        id=_point_id(source, index),
                         vector=vector,
                         payload={"text": chunk["text"], "metadata": chunk["metadata"]},
                     )
-                    for chunk, vector in zip(chunks, vectors)
+                    for index, (chunk, vector) in enumerate(zip(chunks, vectors))
                 ]
 
+                _delete_source_points(source)
                 for batch_start in range(0, len(points), UPSERT_BATCH_SIZE):
                     _upsert_batch(points[batch_start : batch_start + UPSERT_BATCH_SIZE])
                 ingested += len(points)
-
-                if corpus_hasher is not None:
-                    corpus_hasher.update(str(path.relative_to(directory)).encode("utf-8"))
-                    corpus_hasher.update(text.encode("utf-8"))
             except Exception as error:
-                logger.error("failed to ingest %s, skipping this file: %s", path, error)
+                logger.error("failed to ingest %s, skipping this file: %s", source, error)
                 failed += 1
                 continue
 
     return {"ingested": ingested, "skipped_irrelevant": skipped_irrelevant, "failed": failed}
+
+
+def compute_corpus_fingerprint() -> str:
+    digests = []
+    offset = None
+    while True:
+        points, offset = qdrant_client.scroll(
+            collection_name=settings.qdrant_docs_collection,
+            limit=256,
+            offset=offset,
+            with_payload=True,
+            with_vectors=False,
+        )
+        for point in points:
+            payload = point.payload or {}
+            source = (payload.get("metadata") or {}).get("source_path", "")
+            digests.append(hashlib.sha256(f"{source}\0{payload.get('text', '')}".encode("utf-8")).hexdigest())
+        if offset is None:
+            break
+    combined = hashlib.sha256()
+    for digest in sorted(digests):
+        combined.update(digest.encode("ascii"))
+    return combined.hexdigest()[:16]
 
 
 def _write_corpus_version(fingerprint: str) -> None:
@@ -201,7 +195,17 @@ def _write_corpus_version(fingerprint: str) -> None:
     logger.info("corpus fingerprint written: %s", fingerprint)
 
 
+def _current_fingerprint() -> str:
+    try:
+        return compute_corpus_fingerprint()
+    except Exception as error:
+        logger.error("could not fingerprint the corpus, using a unique marker to invalidate caches: %s", error)
+        return uuid.uuid4().hex[:16]
+
+
 def main() -> None:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+
     parser = argparse.ArgumentParser(
         description=(
             "Ingest Kubernetes docs into Qdrant. Expects a data directory containing "
@@ -215,9 +219,7 @@ def main() -> None:
         "--wipe",
         action="store_true",
         help="delete and recreate the docs collection AND the semantic/exact caches first. "
-        "Not required for cache correctness any more (the corpus fingerprint written to "
-        ".cache/corpus_version after every run already invalidates stale cached answers "
-        "automatically), it's for reclaiming space / starting from a clean collection.",
+        "Required to drop documents whose source files were deleted from disk.",
     )
     args = parser.parse_args()
 
@@ -225,19 +227,14 @@ def main() -> None:
     noisy_dir = args.data_dir / NOISY_DIR_NAME
 
     if not true_dir.is_dir() and not noisy_dir.is_dir():
-        parser.error(
-            f"neither {TRUE_DIR_NAME}/ nor {NOISY_DIR_NAME}/ found under {args.data_dir}; "
-            "refusing to run, since writing a corpus fingerprint from zero ingested files "
-            "would invalidate every cached answer for the real corpus"
-        )
+        parser.error(f"neither {TRUE_DIR_NAME}/ nor {NOISY_DIR_NAME}/ found under {args.data_dir}")
 
     ensure_collection(wipe=args.wipe)
 
-    corpus_hasher = hashlib.sha256()
     total_failed = 0
 
     if true_dir.is_dir():
-        result = ingest_directory(true_dir, corpus_hasher)
+        result = ingest_directory(true_dir, root=args.data_dir)
         total_failed += result["failed"]
         print(
             f"ingested {result['ingested']} chunks from {true_dir}, "
@@ -248,7 +245,7 @@ def main() -> None:
         print(f"no {TRUE_DIR_NAME}/ found under {args.data_dir}, skipping")
 
     if noisy_dir.is_dir():
-        result = ingest_directory(noisy_dir, corpus_hasher)
+        result = ingest_directory(noisy_dir, root=args.data_dir, relevance_fail_open=False)
         total_failed += result["failed"]
         print(
             f"ingested {result['ingested']} chunks from {noisy_dir}, "
@@ -259,9 +256,13 @@ def main() -> None:
     else:
         print(f"no {NOISY_DIR_NAME}/ found under {args.data_dir}, skipping")
 
-    _write_corpus_version(corpus_hasher.hexdigest()[:16])
+    total_points = qdrant_client.count(collection_name=settings.qdrant_docs_collection, exact=True).count
+    if total_points == 0:
+        parser.exit(1, "the docs collection is empty after ingestion, corpus fingerprint not updated\n")
+
+    _write_corpus_version(_current_fingerprint())
     if total_failed:
-        print(f"note: {total_failed} document(s) failed to ingest — see logs above for which ones and why.")
+        print(f"note: {total_failed} document(s) failed to ingest, see logs above for which ones and why.")
 
 
 if __name__ == "__main__":

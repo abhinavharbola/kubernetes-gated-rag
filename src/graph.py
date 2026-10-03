@@ -4,9 +4,12 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import TypedDict
 
-from langgraph.graph import StateGraph, START, END
+from langgraph.graph import END, START, StateGraph
 
+from src.config import settings
+from src.guardrails import GateUnavailableError, is_small_talk, response_safety_gate, safety_gate, topic_gate
 from src.guardrails.jailbreak_patterns import deterministic_jailbreak_check
+from src.providers.llm import generate_main, generate_planner
 from src.retrieval.cache import (
     embed_canonical_question,
     exact_cache_get,
@@ -15,24 +18,23 @@ from src.retrieval.cache import (
     semantic_cache_get,
     semantic_cache_set,
 )
-from src.config import settings
-from src.guardrails import response_safety_gate, safety_gate, topic_gate
-from src.providers.llm import generate_main, generate_planner
 from src.retrieval.rerank import RerankUnavailableError, rerank_and_gate
 from src.retrieval.search import RetrievalUnavailableError, retrieve
-from src.tracing import node_span, log_cache_decision, turn_span
+from src.tracing import log_cache_decision, node_span, turn_span
 
 logger = logging.getLogger(__name__)
 
 NO_CONTEXT_MESSAGE = (
     "I don't have grounded documentation for that. Try rephrasing, or ask about "
-    "a specific resource, provider, or module."
+    "a specific resource, controller, or manifest field."
 )
 
 SERVICE_UNAVAILABLE_MESSAGE = (
-    "I'm having trouble reaching the retrieval service right now. Please try "
-    "again in a moment."
+    "I'm having trouble reaching one of the services this answer depends on right now. "
+    "Please try again in a moment."
 )
+
+SMALL_TALK_MESSAGE = "Hi! Ask me a Kubernetes question, for example about Pods, Deployments, or manifest syntax."
 
 ANSWER_SYSTEM_PROMPT = (
     "Answer the Kubernetes question using ONLY the provided context. "
@@ -40,14 +42,15 @@ ANSWER_SYSTEM_PROMPT = (
     "rather than guessing."
 )
 
-_cache_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="cache-writer")
+REWRITE_SYSTEM_PROMPT = (
+    "Rewrite the user's latest message as a standalone question. "
+    "Only use chat history to resolve pronouns, ellipsis, or implicit references "
+    "the latest message depends on. If the latest message is already self-contained, "
+    "return it unchanged or with only minor grammatical cleanup. Preserve intent exactly. "
+    "Return only the rewritten question."
+)
 
-# Without this, background exact/semantic cache writes still in flight at
-# process exit (or a Streamlit rerun tearing down the interpreter) are
-# silently dropped rather than completing — a generated answer would be
-# thrown away instead of cached, with no error surfaced anywhere. wait=True
-# bounds process exit on whatever's left in the queue, which in practice is
-# a few fast disk/Qdrant writes, not an open-ended hang.
+_cache_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="cache-writer")
 atexit.register(_cache_executor.shutdown, wait=True)
 
 
@@ -65,13 +68,23 @@ class GraphState(TypedDict, total=False):
     model: str | None
     cache_layer: str | None
     exact_cache_checked: bool
-    late_jailbreak_detected: bool
+    small_talk: bool
+    rewrite_degraded: bool
+    needs_late_safety: bool
     candidates: list[dict]
     reranked: list[dict]
     retrieval_unavailable: bool
     service_unavailable: bool
     unavailable_stage: str | None
     latency_seconds: float | None
+
+
+def build_answer_messages(question: str, contexts: list[str]) -> list[dict]:
+    context = "\n\n---\n\n".join(contexts)
+    return [
+        {"role": "system", "content": ANSWER_SYSTEM_PROMPT},
+        {"role": "user", "content": f"Context:\n{context}\n\nQuestion: {question}"},
+    ]
 
 
 def _log_background_failure(future) -> None:
@@ -86,18 +99,20 @@ def _submit_cache_write(fn, *args, **kwargs) -> None:
     future.add_done_callback(_log_background_failure)
 
 
+def _gate_unavailable(stage: str) -> GraphState:
+    return {
+        "allowed": False,
+        "refusal_reason": SERVICE_UNAVAILABLE_MESSAGE,
+        "blocked_stage": None,
+        "service_unavailable": True,
+        "unavailable_stage": stage,
+    }
+
+
 def exact_cache_node(state: GraphState) -> GraphState:
     with node_span("exact_cache_check"):
         if state.get("chat_history"):
             return {"exact_cache_checked": False}
-        # The deterministic jailbreak check is free (local regex, no network
-        # call) and cheap enough to run even on the fast cache-hit path.
-        # Running it here closes a real gap: without it, a message matching
-        # a known jailbreak shape that happens to normalize to a previously
-        # cached, previously-approved question would skip both the safety
-        # and topic gates entirely on a cache hit. Skipping straight to the
-        # normal gated path (which performs this same check first) is
-        # cheap insurance against exactly that.
         if deterministic_jailbreak_check(state["raw_message"]):
             return {"exact_cache_checked": False}
         cached = exact_cache_get(state["raw_message"])
@@ -112,43 +127,41 @@ def exact_cache_node(state: GraphState) -> GraphState:
         return {"exact_cache_checked": True, "standalone_question": state["raw_message"]}
 
 
+def small_talk_node(state: GraphState) -> GraphState:
+    with node_span("small_talk"):
+        return {"answer": SMALL_TALK_MESSAGE, "small_talk": True, "cache_layer": None}
+
+
 def safety_gate_node(state: GraphState) -> GraphState:
     with node_span("safety_gate"):
-        allowed, reason = safety_gate(state["raw_message"])
+        try:
+            allowed, reason = safety_gate(state["raw_message"])
+        except GateUnavailableError as error:
+            logger.error("safety gate unavailable this turn: %s", error)
+            return _gate_unavailable("safety")
         return {"allowed": allowed, "refusal_reason": reason, "blocked_stage": None if allowed else "safety"}
 
 
 def rewrite_with_history_node(state: GraphState) -> GraphState:
     with node_span("rewrite_with_history"):
-        history_text = "\n".join(f"{m['role']}: {m['content']}" for m in state.get("chat_history", []))
+        raw = state["raw_message"]
+        history = state.get("chat_history", [])[-settings.history_max_messages :]
+        history_text = "\n".join(f"{m['role']}: {m['content']}" for m in history)
         try:
             result = generate_planner(
                 [
-                    {
-                        "role": "system",
-                        "content": "Rewrite the user's latest message as a standalone question. "
-                        "Only use chat history to resolve pronouns, ellipsis, or implicit references "
-                        "the latest message depends on. If the latest message is already self-contained, "
-                        "return it unchanged or with only minor grammatical cleanup. Preserve intent exactly. "
-                        "Return only the rewritten question.",
-                    },
-                    {"role": "user", "content": f"History:\n{history_text}\n\nLatest: {state['raw_message']}"},
+                    {"role": "system", "content": REWRITE_SYSTEM_PROMPT},
+                    {"role": "user", "content": f"History:\n{history_text}\n\nLatest: {raw}"},
                 ],
                 timeout_seconds=settings.planner_timeout_seconds,
             )
         except Exception as error:
-            # Every provider in the planner chain is down. Losing the whole
-            # turn here isn't necessary — treating the raw message as
-            # already self-contained is exactly what the prompt above tells
-            # a healthy rewrite call to do anyway when nothing needs
-            # resolving, so it's a safe degrade, not a wrong answer, for the
-            # (common) case where the latest message didn't actually need
-            # history to understand. It's only wrong for messages that
-            # genuinely depend on unresolved pronouns/ellipsis, which is a
-            # narrower failure than crashing every turn during an outage.
-            logger.warning("rewrite_with_history failed, using raw message as-is: %s", error)
-            return {"standalone_question": state["raw_message"]}
-        standalone = result.content.strip() or state["raw_message"]
+            logger.warning("rewrite_with_history failed, using raw message and skipping caches: %s", error)
+            return {"standalone_question": raw, "rewrite_degraded": True}
+        standalone = result.content.strip()
+        if not standalone or "\n" in standalone or len(standalone) > max(settings.rewrite_max_chars, 2 * len(raw)):
+            logger.warning("rewrite output rejected, using raw message and skipping caches")
+            return {"standalone_question": raw, "rewrite_degraded": True}
         return {"standalone_question": standalone}
 
 
@@ -156,35 +169,26 @@ def late_exact_cache_node(state: GraphState) -> GraphState:
     with node_span("late_exact_cache_check"):
         if not state.get("chat_history"):
             return {}
-        if deterministic_jailbreak_check(state["standalone_question"]):
-            # Bug fix: this used to only skip the cache lookup and then fall
-            # straight through to canonicalize_question, which meant a
-            # jailbreak-shaped standalone_question (one that only emerges
-            # after history-based rewriting, since safety_gate already ran
-            # on the pre-rewrite raw_message) was never actually blocked —
-            # it just went ungated into retrieval and generation. Flagging
-            # it here and routing back through a real safety check (see
-            # route_after_late_exact_cache / late_safety_gate_node) closes
-            # that gap, mirroring what exact_cache_node already does
-            # correctly on the first-turn path.
-            return {"exact_cache_checked": False, "late_jailbreak_detected": True}
-        cached = exact_cache_get(state["standalone_question"])
+        standalone = state["standalone_question"]
+        if deterministic_jailbreak_check(standalone):
+            return {"exact_cache_checked": False, "needs_late_safety": True}
+        if state.get("rewrite_degraded"):
+            return {"exact_cache_checked": False}
+        cached = exact_cache_get(standalone)
         log_cache_decision("exact", hit=cached is not None)
         if cached is not None:
             return {"answer": cached, "cache_layer": "exact", "exact_cache_checked": True}
-        return {"exact_cache_checked": True}
+        rewritten = normalize_semantic(standalone) != normalize_semantic(state["raw_message"])
+        return {"exact_cache_checked": True, "needs_late_safety": rewritten}
 
 
 def late_safety_gate_node(state: GraphState) -> GraphState:
     with node_span("late_safety_gate"):
-        # Re-runs the full safety gate (deterministic pattern + NeMoGuard/
-        # fallback) against the rewritten standalone_question, not the raw
-        # first-turn message safety_gate_node already checked earlier in
-        # this same turn. check_safety() re-applies the deterministic
-        # jailbreak check internally, so a message that reached this node
-        # (because late_exact_cache_node flagged it) is blocked here too,
-        # not just skipped past the cache.
-        allowed, reason = safety_gate(state["standalone_question"])
+        try:
+            allowed, reason = safety_gate(state["standalone_question"])
+        except GateUnavailableError as error:
+            logger.error("late safety gate unavailable this turn: %s", error)
+            return _gate_unavailable("late_safety")
         return {
             "allowed": allowed,
             "refusal_reason": reason,
@@ -194,7 +198,11 @@ def late_safety_gate_node(state: GraphState) -> GraphState:
 
 def topic_gate_node(state: GraphState) -> GraphState:
     with node_span("topic_gate"):
-        allowed, reason = topic_gate(state["standalone_question"])
+        try:
+            allowed, reason = topic_gate(state["standalone_question"])
+        except GateUnavailableError as error:
+            logger.error("topic gate unavailable this turn: %s", error)
+            return _gate_unavailable("topic")
         return {"allowed": allowed, "refusal_reason": reason, "blocked_stage": None if allowed else "topic"}
 
 
@@ -205,9 +213,8 @@ def canonicalize_node(state: GraphState) -> GraphState:
 
 def semantic_cache_node(state: GraphState) -> GraphState:
     with node_span("semantic_cache_check"):
-        # A failed embedding call degrades to a cache miss rather than
-        # crashing the turn — the graph falls through to retrieval either
-        # way, same as a genuine miss.
+        if state.get("rewrite_degraded"):
+            return {"canonical_question_vector": None}
         try:
             vector = embed_canonical_question(state["canonical_question"])
         except Exception as error:
@@ -239,27 +246,16 @@ def rerank_node(state: GraphState) -> GraphState:
         except RerankUnavailableError as error:
             logger.error("rerank service unavailable this turn, not caching: %s", error)
             return {"reranked": [], "service_unavailable": True, "unavailable_stage": "rerank"}
-        return {"reranked": survivors}
+        return {"reranked": survivors[: settings.generation_context_chunks]}
 
 
 def generate_node(state: GraphState) -> GraphState:
     with node_span("generate"):
-        context = "\n\n---\n\n".join(c["text"] for c in state["reranked"])
         try:
             result = generate_main(
-                [
-                    {"role": "system", "content": ANSWER_SYSTEM_PROMPT},
-                    {"role": "user", "content": f"Context:\n{context}\n\nQuestion: {state['standalone_question']}"},
-                ]
+                build_answer_messages(state["standalone_question"], [c["text"] for c in state["reranked"]])
             )
         except Exception as error:
-            # generate_main's provider chain (Groq -> Groq secondary -> NIM)
-            # raises once every link has failed. Previously this propagated
-            # uncaught out of the graph, unlike the retrieval/rerank nodes,
-            # which both degrade to a distinct, uncached "service
-            # unavailable" outcome instead of crashing the turn. Nothing has
-            # been generated or cached yet, so this is a safe, consistent
-            # place to fail the same way.
             logger.error("generation unavailable this turn, not caching: %s", error)
             return {"service_unavailable": True, "unavailable_stage": "generation"}
         return {"answer": result.content, "provider": result.provider, "model": result.model}
@@ -267,7 +263,11 @@ def generate_node(state: GraphState) -> GraphState:
 
 def response_safety_gate_node(state: GraphState) -> GraphState:
     with node_span("response_safety_gate"):
-        allowed, reason = response_safety_gate(state["standalone_question"], state["answer"])
+        try:
+            allowed, reason = response_safety_gate(state["standalone_question"], state["answer"])
+        except GateUnavailableError as error:
+            logger.error("response safety gate unavailable this turn, withholding answer: %s", error)
+            return {**_gate_unavailable("response_safety"), "answer": SERVICE_UNAVAILABLE_MESSAGE, "cache_layer": None}
         if not allowed:
             return {
                 "allowed": False,
@@ -281,11 +281,9 @@ def response_safety_gate_node(state: GraphState) -> GraphState:
 
 def write_caches_node(state: GraphState) -> GraphState:
     with node_span("write_caches"):
+        if state.get("rewrite_degraded"):
+            return {}
         _submit_cache_write(exact_cache_set, state["standalone_question"], state["answer"])
-        # vector is None when semantic_cache_node's embedding call failed —
-        # nothing to key a semantic-cache point on, and Qdrant upsert needs
-        # a real vector, so skip it rather than writing garbage. The exact
-        # cache write above still happens either way.
         if state.get("canonical_question_vector") is not None:
             _submit_cache_write(
                 semantic_cache_set,
@@ -298,25 +296,27 @@ def write_caches_node(state: GraphState) -> GraphState:
 
 def cache_no_context_node(state: GraphState) -> GraphState:
     with node_span("cache_no_context"):
-        _submit_cache_write(
-            exact_cache_set,
-            state["standalone_question"],
-            NO_CONTEXT_MESSAGE,
-            expire=settings.no_context_cache_ttl_seconds,
-        )
+        if not state.get("rewrite_degraded"):
+            _submit_cache_write(
+                exact_cache_set,
+                state["standalone_question"],
+                NO_CONTEXT_MESSAGE,
+                expire=settings.no_context_cache_ttl_seconds,
+            )
         return {"answer": NO_CONTEXT_MESSAGE}
 
 
 def service_unavailable_node(state: GraphState) -> GraphState:
     with node_span("service_unavailable"):
-        # Deliberately not cached in any layer: this reflects the state of
-        # the retrieval/rerank infrastructure at this moment, not a fact
-        # about the question, and must not outlive the outage that caused it.
         return {"answer": SERVICE_UNAVAILABLE_MESSAGE, "cache_layer": None}
 
 
 def route_after_exact_cache(state: GraphState) -> str:
-    return END if state.get("cache_layer") == "exact" else "safety_gate"
+    if state.get("cache_layer") == "exact":
+        return END
+    if is_small_talk(state["raw_message"]):
+        return "small_talk"
+    return "safety_gate"
 
 
 def route_after_safety_gate(state: GraphState) -> str:
@@ -328,7 +328,7 @@ def route_after_safety_gate(state: GraphState) -> str:
 def route_after_late_exact_cache(state: GraphState) -> str:
     if state.get("cache_layer") == "exact":
         return END
-    if state.get("late_jailbreak_detected"):
+    if state.get("needs_late_safety"):
         return "late_safety_gate"
     return "canonicalize_question"
 
@@ -366,6 +366,7 @@ def route_after_response_safety_gate(state: GraphState) -> str:
 def build_graph():
     graph = StateGraph(GraphState)
     graph.add_node("exact_cache_check", exact_cache_node)
+    graph.add_node("small_talk", small_talk_node)
     graph.add_node("safety_gate", safety_gate_node)
     graph.add_node("rewrite_with_history", rewrite_with_history_node)
     graph.add_node("late_exact_cache_check", late_exact_cache_node)
@@ -383,6 +384,7 @@ def build_graph():
 
     graph.add_edge(START, "exact_cache_check")
     graph.add_conditional_edges("exact_cache_check", route_after_exact_cache)
+    graph.add_edge("small_talk", END)
     graph.add_conditional_edges("safety_gate", route_after_safety_gate)
     graph.add_edge("rewrite_with_history", "topic_gate")
     graph.add_conditional_edges("topic_gate", route_after_topic_gate)
@@ -409,6 +411,6 @@ def run_turn(raw_message: str, chat_history: list[dict]) -> GraphState:
         initial_state: GraphState = {"raw_message": raw_message, "chat_history": chat_history}
         final_state = compiled_graph.invoke(initial_state)
         if not final_state.get("allowed", True):
-            final_state["answer"] = final_state["refusal_reason"]
+            final_state["answer"] = final_state.get("refusal_reason") or SERVICE_UNAVAILABLE_MESSAGE
     final_state["latency_seconds"] = time.perf_counter() - start
     return final_state

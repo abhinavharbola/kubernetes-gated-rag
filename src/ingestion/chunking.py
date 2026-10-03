@@ -1,62 +1,57 @@
 import re
 
-MARKDOWN_HEADER_RE = re.compile(r"^(#{1,6})\s+(.*)$", re.MULTILINE)
-
-# A Kubernetes manifest conventionally begins with `apiVersion:` as its first
-# top-level field, by the same near-universal convention that made a resource
-# block's `resource "type" "name" {` a reliable start marker for HCL. Using
-# it as the block-start marker means an object's boundary is simply "up to
-# the next top-level apiVersion:" — no brace or indent matching needed, since
-# YAML's own indentation already keeps everything belonging to one object
-# nested under it.
-MANIFEST_START_RE = re.compile(r"^apiVersion:\s*\S", re.MULTILINE)
-
-# a standalone `---` is the YAML multi-document separator between manifests,
-# not part of any object's own content
-SEPARATOR_LINE_RE = re.compile(r"^---[ \t]*\r?\n?", re.MULTILINE)
+HEADER_LINE_RE = re.compile(r"^(#{1,6})\s+(.*)$")
+MANIFEST_START_RE = re.compile(r"^apiVersion:\s*\S")
+SEPARATOR_RE = re.compile(r"^---\s*$")
+FENCE_RE = re.compile(r"^\s*(?:```|~~~)")
+YAML_CONTINUATION_RE = re.compile(r"^(?:[A-Za-z_][\w.\-/]*\s*:|#|-\s|-$)")
+WORD_SPAN_RE = re.compile(r"\S+")
 
 FALLBACK_WINDOW_WORDS = 300
 FALLBACK_OVERLAP_WORDS = 50
-
-# Same cap as the prose fallback window, applied to manifest blocks too. A
-# manifest block used to be emitted as a single chunk no matter how large —
-# fine for a typical Pod/Deployment manifest, but a large CRD, a big
-# multi-container spec, or a ConfigMap embedding a whole config file could
-# run to several thousand words, embedded whole with no truncation guard.
-# Gemini's embedding endpoint has an input token ceiling; a chunk over it
-# either gets silently truncated server-side or rejected, and either way the
-# indexed vector no longer represents the full manifest. Reusing
-# _fallback_window keeps a manifest block's kind/name metadata attached to
-# every sub-chunk it's split into, so retrieval and the UI still show which
-# resource a hit came from.
 MANIFEST_MAX_WORDS = FALLBACK_WINDOW_WORDS
 
 
 def split_by_markdown_headers(text: str) -> list[dict]:
-    matches = list(MARKDOWN_HEADER_RE.finditer(text))
-    if not matches:
-        return [{"header": None, "text": text}]
-
     sections = []
-    if matches[0].start() > 0:
-        sections.append({"header": None, "text": text[: matches[0].start()]})
+    header = None
+    buffer: list[str] = []
+    fence_marker = None
 
-    for i, match in enumerate(matches):
-        start = match.start()
-        end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
-        sections.append({"header": match.group(2).strip(), "text": text[start:end]})
+    def flush() -> None:
+        if buffer:
+            sections.append({"header": header, "text": "".join(buffer)})
 
+    for line in text.splitlines(keepends=True):
+        stripped = line.lstrip()
+        if stripped.startswith("```") or stripped.startswith("~~~"):
+            marker = stripped[:3]
+            if fence_marker is None:
+                fence_marker = marker
+            elif marker == fence_marker:
+                fence_marker = None
+        match = None if fence_marker is not None else HEADER_LINE_RE.match(line.rstrip("\r\n"))
+        if match:
+            flush()
+            header = match.group(2).strip()
+            buffer = [line]
+        else:
+            buffer.append(line)
+    flush()
+
+    if not sections:
+        return [{"header": None, "text": text}]
     return sections
-
-
-def _strip_separator_lines(text: str) -> str:
-    return SEPARATOR_LINE_RE.sub("", text)
 
 
 def _clean_scalar(value: str | None) -> str | None:
     if value is None:
         return None
     return value.strip().strip("'\"")
+
+
+def _indent(line: str) -> int:
+    return len(line) - len(line.lstrip())
 
 
 def _parse_manifest_kind_and_name(block_text: str) -> tuple[str | None, str | None]:
@@ -67,83 +62,97 @@ def _parse_manifest_kind_and_name(block_text: str) -> tuple[str | None, str | No
     metadata_match = re.search(r"^metadata:\s*$", block_text, re.MULTILINE)
     if metadata_match:
         rest = block_text[metadata_match.end() :]
-        # metadata's indented body runs until the next line back at column 0
-        # (the next top-level key in this object, or the next manifest entirely)
         next_top_level = re.search(r"^\S", rest, re.MULTILINE)
         metadata_body = rest[: next_top_level.start()] if next_top_level else rest
-        name_match = re.search(r"^\s+name:\s*(\S+)", metadata_body, re.MULTILINE)
-        name = _clean_scalar(name_match.group(1)) if name_match else None
+        lines = [line for line in metadata_body.splitlines() if line.strip()]
+        if lines:
+            base_indent = _indent(lines[0])
+            for line in lines:
+                if _indent(line) != base_indent:
+                    continue
+                name_match = re.match(r"name:\s*(\S+)", line.strip())
+                if name_match:
+                    name = _clean_scalar(name_match.group(1))
+                    break
 
     return kind, name
 
 
-def split_by_manifest_blocks(section_text: str) -> list[dict]:
-    # Known limitation, same class as the old HCL chunker's brace-inside-a-
-    # string edge case: this is a structural heuristic, not a real YAML
-    # parser. A block scalar (`|` or `>`) whose literal content happens to
-    # contain a line that is exactly `---` will be mis-split as if it were a
-    # document boundary. Rare in practice for Kubernetes manifests, but a
-    # real limitation worth knowing about rather than silently pretending
-    # this is full YAML awareness.
-    blocks = []
-    cursor = 0
-    starts = list(MANIFEST_START_RE.finditer(section_text))
-
-    if not starts:
-        return _fallback_window(section_text)
-
-    for i, match in enumerate(starts):
-        if match.start() > cursor:
-            leftover = _strip_separator_lines(section_text[cursor : match.start()])
-            blocks.extend(_fallback_window(leftover))
-
-        end = starts[i + 1].start() if i + 1 < len(starts) else len(section_text)
-        block_text = _strip_separator_lines(section_text[match.start() : end]).strip()
-
-        if block_text:
-            kind, name = _parse_manifest_kind_and_name(block_text)
-            if len(block_text.split()) > MANIFEST_MAX_WORDS:
-                # too large for one embedding-safe chunk — window it like
-                # prose, but keep the parsed kind/name on every sub-chunk so
-                # a hit anywhere in the manifest still identifies which
-                # resource it came from.
-                for sub_chunk in _fallback_window(block_text):
-                    blocks.append({"text": sub_chunk["text"], "kind": kind, "name": name})
-            else:
-                blocks.append({"text": block_text, "kind": kind, "name": name})
-        cursor = end
-
-    # no trailing-leftover step after this loop: `end` for the last match is
-    # always len(section_text) (see the conditional above), so cursor always
-    # equals len(section_text) once the loop finishes — there is never
-    # content after the last manifest block left to sweep up separately. An
-    # earlier version had a dead `if cursor < len(section_text)` branch here
-    # that could never run; removed rather than left as misleading dead code.
-
-    return blocks
-
-
 def _fallback_window(text: str) -> list[dict]:
-    words = text.split()
-    if not words:
+    spans = [match.span() for match in WORD_SPAN_RE.finditer(text)]
+    if not spans:
         return []
-    if len(words) <= FALLBACK_WINDOW_WORDS:
-        return [{"text": text.strip(), "kind": None, "name": None}] if text.strip() else []
+    if len(spans) <= FALLBACK_WINDOW_WORDS:
+        return [{"text": text.strip(), "kind": None, "name": None}]
 
     chunks = []
     step = FALLBACK_WINDOW_WORDS - FALLBACK_OVERLAP_WORDS
-    for start in range(0, len(words), step):
-        window = words[start : start + FALLBACK_WINDOW_WORDS]
+    for start in range(0, len(spans), step):
+        window = spans[start : start + FALLBACK_WINDOW_WORDS]
         if window:
-            chunks.append({"text": " ".join(window), "kind": None, "name": None})
-        if start + FALLBACK_WINDOW_WORDS >= len(words):
+            chunks.append({"text": text[window[0][0] : window[-1][1]], "kind": None, "name": None})
+        if start + FALLBACK_WINDOW_WORDS >= len(spans):
             break
     return chunks
 
 
-def chunk_document(text: str, base_metadata: dict) -> list[dict]:
+def split_by_manifest_blocks(section_text: str) -> list[dict]:
+    blocks: list[dict] = []
+    prose: list[str] = []
+    manifest: list[str] | None = None
+
+    def flush_prose() -> None:
+        if prose:
+            blocks.extend(_fallback_window("\n".join(prose)))
+            prose.clear()
+
+    def flush_manifest() -> None:
+        nonlocal manifest
+        if manifest is None:
+            return
+        block_text = "\n".join(manifest).strip()
+        manifest = None
+        if not block_text:
+            return
+        kind, name = _parse_manifest_kind_and_name(block_text)
+        if len(block_text.split()) > MANIFEST_MAX_WORDS:
+            for sub_chunk in _fallback_window(block_text):
+                blocks.append({"text": sub_chunk["text"], "kind": kind, "name": name})
+        else:
+            blocks.append({"text": block_text, "kind": kind, "name": name})
+
+    for line in section_text.splitlines():
+        if manifest is not None:
+            if SEPARATOR_RE.match(line) or FENCE_RE.match(line):
+                flush_manifest()
+                continue
+            if MANIFEST_START_RE.match(line):
+                flush_manifest()
+                manifest = [line]
+                continue
+            if line.strip() and not line[0].isspace() and not YAML_CONTINUATION_RE.match(line):
+                flush_manifest()
+                prose.append(line)
+                continue
+            manifest.append(line)
+            continue
+        if SEPARATOR_RE.match(line) or FENCE_RE.match(line):
+            continue
+        if MANIFEST_START_RE.match(line):
+            flush_prose()
+            manifest = [line]
+            continue
+        prose.append(line)
+
+    flush_manifest()
+    flush_prose()
+    return blocks
+
+
+def chunk_document(text: str, base_metadata: dict, markdown: bool = True) -> list[dict]:
+    sections = split_by_markdown_headers(text) if markdown else [{"header": None, "text": text}]
     chunks = []
-    for section in split_by_markdown_headers(text):
+    for section in sections:
         for block in split_by_manifest_blocks(section["text"]):
             if not block["text"].strip():
                 continue

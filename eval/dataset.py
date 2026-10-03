@@ -1,13 +1,12 @@
 import json
 from pathlib import Path
 
-DEFAULT_PATH = Path("eval/eval_set.json")
+from src.config import PROJECT_ROOT
+
+DEFAULT_PATH = PROJECT_ROOT / "eval" / "eval_set.json"
 
 
 def load_eval_set(path: Path = DEFAULT_PATH) -> list[dict]:
-    """Expects a JSON list of objects:
-    {"question": str, "ground_truth": str, "retrieved_contexts": list[str]}
-    Does not assume the file exists yet, raises with a clear message if missing."""
     if not path.exists():
         raise FileNotFoundError(
             f"no eval set at {path}. create a JSON list of "

@@ -54,8 +54,6 @@ def test_parse_manifest_kind_and_name_returns_none_when_absent():
 
 
 def test_parse_manifest_kind_and_name_does_not_read_past_metadata_block():
-    # name lives inside metadata:, a name: key appearing under a different
-    # top-level section (e.g. spec:) must not be picked up
     block = (
         "apiVersion: v1\nkind: Pod\nmetadata:\n  name: real-name\n"
         "  labels:\n    app: demo\nspec:\n  containers:\n    - name: decoy-name\n"
@@ -83,14 +81,11 @@ def test_split_by_manifest_blocks_multi_document_file():
     blocks = split_by_manifest_blocks(section)
     assert [b["kind"] for b in blocks] == ["Pod", "Service"]
     assert [b["name"] for b in blocks] == ["web", "web-svc"]
-    # the separator line itself must not leak into either block's text
     assert "---" not in blocks[0]["text"]
     assert "---" not in blocks[1]["text"]
 
 
 def test_split_by_manifest_blocks_no_trailing_separator():
-    # a file with no final "---" after the last document is the common
-    # case, not an edge case: the last block must still be captured whole.
     section = "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: cfg\ndata:\n  key: value\n"
     blocks = split_by_manifest_blocks(section)
     assert len(blocks) == 1
@@ -113,8 +108,6 @@ def test_split_by_manifest_blocks_prose_preamble_before_first_manifest():
         "apiVersion: v1\nkind: Pod\nmetadata:\n  name: web\nspec:\n  containers: []\n"
     )
     blocks = split_by_manifest_blocks(section)
-    # the leading prose becomes its own fallback-window block, the manifest
-    # becomes its own structured block, in that order
     assert len(blocks) == 2
     assert blocks[0]["kind"] is None
     assert "example Pod manifest" in blocks[0]["text"]
@@ -170,3 +163,40 @@ def test_chunk_document_skips_blank_chunks():
     text = "# Header\n\n\n\n## Next\n\nreal content"
     chunks = chunk_document(text, base_metadata={"source_path": "x"})
     assert all(c["text"].strip() for c in chunks)
+
+
+def test_yaml_comment_inside_a_fence_is_not_a_header():
+    doc = "# Guide\n\n```yaml\n# minimal pod\napiVersion: v1\nkind: Pod\nmetadata:\n  name: web\n```\n"
+    sections = split_by_markdown_headers(doc)
+    assert [section["header"] for section in sections] == ["Guide"]
+
+
+def test_non_markdown_documents_are_not_split_on_hash_comments():
+    doc = "# top comment\napiVersion: v1\nkind: Pod\nmetadata:\n  name: web\n# trailing comment\n"
+    chunks = chunk_document(doc, {"source_path": "x.yaml"}, markdown=False)
+    assert all(chunk["metadata"]["section_header"] is None for chunk in chunks)
+    manifests = [c for c in chunks if c["metadata"]["manifest_kind"] == "Pod"]
+    assert len(manifests) == 1
+
+
+def test_manifest_block_excludes_closing_fence_and_trailing_prose():
+    section = "apiVersion: v1\nkind: Pod\nmetadata:\n  name: a\n```\n\nNow some unrelated prose about services.\n"
+    blocks = split_by_manifest_blocks(section)
+    manifest = [b for b in blocks if b["kind"] == "Pod"][0]
+    assert "```" not in manifest["text"]
+    assert "unrelated prose" not in manifest["text"]
+    assert any("unrelated prose" in b["text"] and b["kind"] is None for b in blocks)
+
+
+def test_manifest_name_ignores_nested_label_names():
+    block = "apiVersion: v1\nkind: Pod\nmetadata:\n  labels:\n    name: frontend\n  name: real-name\n"
+    assert _parse_manifest_kind_and_name(block) == ("Pod", "real-name")
+
+
+def test_oversized_manifest_windows_keep_line_structure():
+    body = "\n".join(f"  key{i}: value{i}" for i in range(400))
+    block = "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: big\ndata:\n" + body + "\n"
+    blocks = split_by_manifest_blocks(block)
+    assert len(blocks) > 1
+    assert all("\n" in b["text"] for b in blocks)
+    assert all(b["kind"] == "ConfigMap" and b["name"] == "big" for b in blocks)

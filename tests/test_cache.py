@@ -6,6 +6,7 @@ import src.retrieval.cache as cache_module
 from src.retrieval.cache import (
     embed_canonical_question,
     ensure_semantic_cache_indexes,
+    exact_cache_clear,
     exact_cache_count,
     exact_cache_get,
     exact_cache_set,
@@ -18,12 +19,11 @@ from src.retrieval.cache import (
 
 @pytest.fixture(autouse=True)
 def reset_index_flag():
-    # ensure_semantic_cache_indexes only hits Qdrant once per process
-    # (module-level _indexes_ensured); reset it so each test observes its
-    # own mock_qdrant calls instead of a stale True from an earlier test.
     cache_module._indexes_ensured = False
+    cache_module._next_index_attempt = 0.0
     yield
     cache_module._indexes_ensured = False
+    cache_module._next_index_attempt = 0.0
 
 
 @pytest.fixture(autouse=True)
@@ -36,15 +36,22 @@ def clear_exact_cache():
 
 @pytest.fixture(autouse=True)
 def isolate_corpus_version_marker(tmp_path, monkeypatch):
-    # _current_corpus_version() reads a real file path; point it at a tmp
-    # path per test so tests can't see a leftover marker from a real
-    # `python ingest.py` run in this checkout, and can't leave one behind
-    # for other tests either.
     monkeypatch.setattr(cache_module, "_CORPUS_VERSION_MARKER", tmp_path / "corpus_version")
 
 
-def test_normalize_collapses_whitespace_case_and_punctuation():
-    assert normalize_exact("  How Do I Create a Resource?  ") == "how do i create a resource"
+def test_normalize_collapses_whitespace_and_strips_trailing_punctuation():
+    assert normalize_exact("  How Do   I Create a Resource?  ") == "How Do I Create a Resource"
+
+
+def test_normalize_preserves_case_significant_flags():
+    assert normalize_exact("kubectl get pods -l app=web") != normalize_exact("kubectl get pods -L app=web")
+    assert normalize_exact("what does -A do") != normalize_exact("what does -a do")
+
+
+def test_normalize_preserves_brackets_and_braces():
+    first = "kubectl get pods -o jsonpath='{.items[0].metadata.name}'"
+    second = "kubectl get pods -o jsonpath='.items0.metadata.name'"
+    assert normalize_exact(first) != normalize_exact(second)
 
 
 def test_normalize_does_not_collapse_different_questions():
@@ -56,8 +63,6 @@ def test_normalize_preserves_hyphens_in_kubernetes_identifiers():
 
 
 def test_normalize_preserves_slashes_in_api_groups():
-    # "apps/v1" and "apps v1" are different Kubernetes API syntax and must
-    # not collapse onto the same exact-cache key.
     assert normalize_exact("what apiVersion is apps/v1?") != normalize_exact("what apiVersion is apps v1?")
 
 
@@ -75,7 +80,7 @@ def test_normalize_semantic_only_collapses_whitespace():
 
 def test_exact_cache_roundtrip():
     exact_cache_set("How do I create a resource?", "answer text")
-    assert exact_cache_get("how do i create a resource") == "answer text"
+    assert exact_cache_get("How do I create a resource") == "answer text"
 
 
 def test_exact_cache_miss_returns_none():
@@ -145,7 +150,7 @@ def test_ensure_semantic_cache_indexes_is_idempotent_per_process(mock_qdrant):
 @patch("src.retrieval.cache.qdrant_client")
 def test_ensure_semantic_cache_indexes_swallows_already_exists_error(mock_qdrant):
     mock_qdrant.create_payload_index.side_effect = Exception("already exists")
-    ensure_semantic_cache_indexes()  # must not raise
+    ensure_semantic_cache_indexes()
 
 
 @patch("src.retrieval.cache.qdrant_client")
@@ -173,8 +178,6 @@ def test_current_corpus_version_prefers_marker_file_when_present():
 def test_exact_key_changes_when_corpus_fingerprint_changes():
     exact_cache_set("question", "answer from old corpus")
     cache_module._CORPUS_VERSION_MARKER.write_text("new-fingerprint")
-    # a re-ingest that changes the corpus (without touching CACHE_POLICY_VERSION
-    # or CACHE_SCHEMA_VERSION) must invalidate the old entry on its own.
     assert exact_cache_get("question") is None
 
 
@@ -188,18 +191,33 @@ def test_semantic_cache_set_uses_current_corpus_fingerprint(mock_qdrant):
 
 @patch("src.retrieval.cache.qdrant_client")
 def test_ensure_semantic_cache_indexes_does_not_latch_on_real_failure(mock_qdrant):
-    # A genuine failure (e.g. the collection doesn't exist yet because
-    # ingest.py hasn't run) must not permanently mark indexes as ensured —
-    # that would silently degrade the semantic cache to an always-miss for
-    # the rest of the process, with no way to recover short of a restart.
     mock_qdrant.create_payload_index.side_effect = Exception("collection not found")
     ensure_semantic_cache_indexes()
     assert cache_module._indexes_ensured is False
+    assert cache_module._next_index_attempt > 0
 
     mock_qdrant.create_payload_index.side_effect = None
+    cache_module._next_index_attempt = 0.0
     ensure_semantic_cache_indexes()
     assert cache_module._indexes_ensured is True
-    assert mock_qdrant.create_payload_index.call_count == 6
+    assert mock_qdrant.create_payload_index.call_count == 4
+
+
+@patch("src.retrieval.cache.qdrant_client")
+def test_ensure_semantic_cache_indexes_backs_off_after_a_failure(mock_qdrant):
+    mock_qdrant.create_payload_index.side_effect = Exception("collection not found")
+    ensure_semantic_cache_indexes()
+    calls_after_first = mock_qdrant.create_payload_index.call_count
+    ensure_semantic_cache_indexes()
+    ensure_semantic_cache_indexes()
+    assert mock_qdrant.create_payload_index.call_count == calls_after_first
+
+
+def test_exact_cache_clear_returns_removed_count():
+    exact_cache_set("what is a pod", "a")
+    exact_cache_set("what is a node", "b")
+    assert exact_cache_clear() == 2
+    assert exact_cache_count() == 0
 
 
 def test_exact_cache_count_reflects_diskcache_size():
@@ -207,3 +225,8 @@ def test_exact_cache_count_reflects_diskcache_size():
     exact_cache_set("what is a pod", "a pod is...")
     exact_cache_set("what is a service", "a service is...")
     assert exact_cache_count() == 2
+
+
+def test_exact_cache_lookup_failure_is_a_miss():
+    with patch.object(cache_module._exact_cache, "get", side_effect=OSError("disk error")):
+        assert exact_cache_get("what is a pod") is None

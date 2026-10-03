@@ -2,8 +2,6 @@ from src.ingestion.chunking import MANIFEST_MAX_WORDS, split_by_manifest_blocks
 
 
 def _large_configmap(word_count: int) -> str:
-    # a ConfigMap embedding a large blob of config data is a realistic way
-    # for a single manifest block to run well past MANIFEST_MAX_WORDS
     filler = " ".join(f"line{i}" for i in range(word_count))
     return (
         "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: big-config\n"

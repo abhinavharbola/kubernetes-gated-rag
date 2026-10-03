@@ -15,14 +15,14 @@
   },
   {
     "question": "What's the difference between setting a Deployment's replicas field directly and using a HorizontalPodAutoscaler?",
-    "ground_truth": "`replicas` on the Deployment sets a fixed, static Pod count that only changes when the manifest is edited. A HorizontalPodAutoscaler continuously adjusts the Deployment's replica count automatically based on observed metrics like CPU or memory utilization, and overrides a manually set replicas value while it's active.",
+    "ground_truth": "`replicas` on the Deployment sets the desired Pod count directly. A HorizontalPodAutoscaler automatically adjusts the number of Pods based on observed CPU or memory utilization, between its `minReplicas` and `maxReplicas` bounds.",
     "retrieved_contexts": [
       "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: web\nspec:\n  replicas: 3\n  selector:\n    matchLabels:\n      app: web\n\n---\napiVersion: autoscaling/v2\nkind: HorizontalPodAutoscaler\nmetadata:\n  name: web-hpa\nspec:\n  scaleTargetRef:\n    apiVersion: apps/v1\n    kind: Deployment\n    name: web\n  minReplicas: 2\n  maxReplicas: 10\n  metrics:\n    - type: Resource\n      resource:\n        name: cpu\n        target:\n          type: Utilization\n          averageUtilization: 60\n\nHorizontalPodAutoscaler automatically scales the number of Pods in a Deployment based on observed CPU/memory utilization or custom metrics."
     ]
   },
   {
     "question": "How do I pin a container to a specific image version instead of floating on latest?",
-    "ground_truth": "Set the `image` field to `<repository>:<tag>` with an explicit version tag, or a digest with `@sha256:...` for full immutability, instead of leaving the tag off or using `:latest`, which resolves to whatever the newest pushed image happens to be at deploy time.",
+    "ground_truth": "Set the `image` field to `<repository>:<tag>` with an explicit version tag, or pin an image digest, instead of leaving the tag off or using `latest`, which floats to whatever was most recently pushed.",
     "retrieved_contexts": [
       "containers:\n  - name: web\n    image: nginx:1.27.1\n\nAvoid the `latest` tag or an untagged image reference in production manifests: both float to whatever was most recently pushed, so the same manifest can deploy different code on different days. Pin to an explicit tag, or an image digest for full reproducibility."
     ]
@@ -36,21 +36,21 @@
   },
   {
     "question": "What's the purpose of an initContainers entry relative to a Pod's main containers?",
-    "ground_truth": "Init containers run sequentially before any of the Pod's main containers start, and each one must exit successfully before the next (or the main containers) begins. They're commonly used to wait for a dependency to become available or to perform one-time setup the main container shouldn't have to handle itself.",
+    "ground_truth": "Init containers run to completion before the app containers start, and each must complete successfully before the next starts. They are commonly used for one-time setup, such as fixing file permissions on a volume before the main container runs.",
     "retrieved_contexts": [
       "spec:\n  initContainers:\n    - name: init-permissions\n      image: busybox:1.36\n      command: [\"sh\", \"-c\", \"chown -R 1000:1000 /data\"]\n      volumeMounts:\n        - name: data\n          mountPath: /data\n  containers:\n    - name: app\n      image: myapp:2.0\n\nInit containers always run to completion. If an init container fails, the kubelet repeatedly restarts it until it succeeds, unless the Pod's restartPolicy is Never."
     ]
   },
   {
     "question": "How do I configure a StatefulSet so each replica gets its own persistent storage?",
-    "ground_truth": "Add a `volumeClaimTemplates` block to the StatefulSet spec. Kubernetes provisions a distinct PersistentVolumeClaim per replica, named after the template and the replica's stable ordinal (e.g. `data-web-0`, `data-web-1`), so each Pod keeps its own storage across restarts and rescheduling instead of sharing one volume.",
+    "ground_truth": "Add a `volumeClaimTemplates` block to the StatefulSet spec. Each replica gets its own PersistentVolumeClaim, created and bound automatically and matching the replica's identity, instead of sharing one volume.",
     "retrieved_contexts": [
       "apiVersion: apps/v1\nkind: StatefulSet\nmetadata:\n  name: web\nspec:\n  serviceName: web\n  replicas: 3\n  volumeClaimTemplates:\n    - metadata:\n        name: data\n      spec:\n        accessModes: [\"ReadWriteOnce\"]\n        resources:\n          requests:\n            storage: 10Gi\n\nvolumeClaimTemplates provides stable storage using PersistentVolumeClaims. Each replica gets its own PVC, created and bound automatically, matching the replica's identity."
     ]
   },
   {
     "question": "Why shouldn't I hardcode a database password directly in a Pod's container env field?",
-    "ground_truth": "A hardcoded value in `env` is stored in plain text in the Pod manifest and in the cluster's object store, visible to anyone who can read the Pod spec (e.g. via `kubectl get pod -o yaml`) or has RBAC access to view Pods, and it ends up in version control if the manifest is checked in. Use a Secret and reference it via `env.valueFrom.secretKeyRef`, or mount it as a volume, instead, so the value is stored and accessed separately from the manifest itself.",
+    "ground_truth": "A hardcoded value in `env` is embedded directly in the Pod manifest, whereas a Secret stores sensitive values separately from the Pod spec. Reference the Secret via `env.valueFrom.secretKeyRef` instead of embedding the value.",
     "retrieved_contexts": [
       "env:\n  - name: DB_PASSWORD\n    valueFrom:\n      secretKeyRef:\n        name: db-credentials\n        key: password\n\nSecrets let you store and manage sensitive information such as passwords, tokens, or keys separately from Pod specs. Referencing a Secret via `secretKeyRef` avoids embedding sensitive values directly in a Pod manifest."
     ]

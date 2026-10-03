@@ -1,4 +1,5 @@
 import base64
+import html
 import logging
 import random
 import sys
@@ -6,6 +7,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
@@ -14,6 +16,7 @@ import streamlit as st
 from src.providers.clients import qdrant_client
 from src.config import settings
 from src.graph import run_turn
+from src.history import build_context_history, compute_session_stats
 from src.retrieval.cache import exact_cache_count
 from src.retrieval.rerank import preload as preload_rerank
 
@@ -22,16 +25,17 @@ logger = logging.getLogger(__name__)
 ASSETS_DIR = Path(__file__).resolve().parent.parent / "assets"
 ICON_PATH = ASSETS_DIR / "icon.png"
 
-st.set_page_config(page_title="Kubernetes Assistant", page_icon=str(ICON_PATH), layout="wide")
+st.set_page_config(
+    page_title="Kubernetes Assistant",
+    page_icon=str(ICON_PATH) if ICON_PATH.exists() else None,
+    layout="wide",
+)
 
 
 @st.cache_data(show_spinner=False)
 def _icon_data_uri() -> str:
-    # Streamlit doesn't serve arbitrary project files over HTTP by default,
-    # so an <img src="assets/icon.png"> tag in the sidebar markup would
-    # 404. Inlining it as a base64 data URI works regardless of static
-    # file serving config and keeps the icon a single self-contained file
-    # on disk.
+    if not ICON_PATH.exists():
+        return ""
     encoded = base64.b64encode(ICON_PATH.read_bytes()).decode("ascii")
     return f"data:image/png;base64,{encoded}"
 
@@ -60,13 +64,14 @@ PLACEHOLDER_EXAMPLES = [
 ]
 
 PIPELINE_STEPS = [
-    ("01", "Safety gate", "Blocks unsafe or jailbreak-shaped input before anything else runs."),
-    ("02", "Topic gate", "Keeps answers scoped to Kubernetes, off-topic questions are declined."),
-    ("03", "Cache check", "Exact and semantic caches return an already-approved answer instantly."),
-    ("04", "Retrieve", "Dense vector search over your ingested docs finds candidate chunks."),
-    ("05", "Rerank", "A hard relevance threshold gates out chunks that don't actually match."),
-    ("06", "Generate", "The model answers strictly from the surviving, grounded context."),
-    ("07", "Response check", "The generated answer is screened again before it reaches you."),
+    ("01", "Cache check", "A repeated question returns its already-approved answer instantly."),
+    ("02", "Safety gate", "Blocks unsafe or jailbreak-shaped input before anything else runs."),
+    ("03", "Topic gate", "Keeps answers scoped to Kubernetes, off-topic questions are declined."),
+    ("04", "Semantic cache", "A paraphrase of an approved question reuses its answer."),
+    ("05", "Retrieve", "Dense vector search over your ingested docs finds candidate chunks."),
+    ("06", "Rerank", "A hard relevance threshold gates out chunks that don't actually match."),
+    ("07", "Generate", "The model answers strictly from the surviving, grounded context."),
+    ("08", "Response check", "The generated answer is screened again before it reaches you."),
 ]
 
 PROVIDER_GROUPS = [
@@ -119,18 +124,6 @@ code { font-family: var(--font-mono); }
 
 #MainMenu { visibility: hidden; }
 footer { visibility: hidden; }
-/* The previous fix still hid the collapse/expand control: it hid the
-   entire [data-testid="stToolbar"] container, and in this Streamlit
-   version the sidebar's collapse control is rendered as a sibling inside
-   that same toolbar flex row, not as an independent element elsewhere in
-   the header. Hiding the container hides everything inside it regardless
-   of a later `visibility: visible !important` on a specific child
-   selector, if that selector doesn't match this version's actual testid.
-   The safe fix is to never hide a whole functional container - only the
-   specific decorative leaf elements (the status widget and the toolbar's
-   action buttons: Deploy, "..." menu, etc.), so whatever the collapse
-   control's real testid is in a given Streamlit version, it's never an
-   ancestor-hidden descendant. */
 [data-testid="stHeader"] { background: transparent; }
 [data-testid="stStatusWidget"] { display: none; }
 [data-testid="stToolbarActions"] { display: none; }
@@ -295,36 +288,28 @@ if "placeholder_example" not in st.session_state:
 
 @st.cache_data(ttl=30)
 def get_corpus_stats():
+    docs = semantic_cached = exact_cached = None
     try:
         docs = qdrant_client.count(collection_name=settings.qdrant_docs_collection, exact=False).count
         semantic_cached = qdrant_client.count(collection_name=settings.qdrant_cache_collection, exact=False).count
     except Exception:
-        return None, None, None
+        pass
     try:
         exact_cached = exact_cache_count()
     except Exception:
-        exact_cached = None
+        pass
     return docs, semantic_cached, exact_cached
 
 
 def get_session_stats():
-    assistant_turns = [t for t in st.session_state.history if t["role"] == "assistant"]
-    total = len(assistant_turns)
-    if total == 0:
-        return 0, "-", "-"
-    cache_hits = sum(1 for t in assistant_turns if t.get("details", {}).get("cache_layer"))
-    latencies = [
-        t["details"]["latency_seconds"]
-        for t in assistant_turns
-        if t.get("details", {}).get("latency_seconds") is not None
-    ]
-    avg_latency = f"{sum(latencies) / len(latencies):.2f}s" if latencies else "-"
-    return total, f"{round(cache_hits / total * 100)}%", avg_latency
+    return compute_session_stats(st.session_state.history)
 
 
 def build_trace_segments(details: dict) -> list[dict]:
     if details.get("error"):
         return [{"text": "pipeline error", "status": "fail"}]
+    if details.get("small_talk"):
+        return [{"text": "small talk", "status": "pass"}]
 
     blocked_stage = details.get("blocked_stage")
     cache_layer = details.get("cache_layer")
@@ -335,27 +320,31 @@ def build_trace_segments(details: dict) -> list[dict]:
         return [{"text": "cache hit, exact", "status": "pass"}]
 
     segments = []
+    if unavailable_stage == "safety":
+        return [{"text": "safety check unavailable", "status": "fail"}]
     if blocked_stage == "safety":
-        segments.append({"text": "safety blocked", "status": "fail"})
-        return segments
+        return [{"text": "safety blocked", "status": "fail"}]
     segments.append({"text": "safety pass", "status": "pass"})
 
+    if unavailable_stage == "topic":
+        segments.append({"text": "topic check unavailable", "status": "fail"})
+        return segments
     if blocked_stage == "topic":
         segments.append({"text": "off-topic", "status": "fail"})
         return segments
     segments.append({"text": "on-topic", "status": "pass"})
 
+    if unavailable_stage == "late_safety":
+        segments.append({"text": "safety check unavailable, rewritten question", "status": "fail"})
+        return segments
+    if blocked_stage == "late_safety":
+        segments.append({"text": "safety blocked, rewritten question", "status": "fail"})
+        return segments
+
     if cache_layer == "semantic":
         segments.append({"text": "cache hit, semantic", "status": "pass"})
         return segments
     segments.append({"text": "cache miss" if cache_checked else "cache lookup", "status": "skip"})
-
-    if blocked_stage == "late_safety":
-        # The rewritten (history-based) standalone question matched a known
-        # jailbreak pattern and was blocked on a full safety recheck, not
-        # just skipped past the cache.
-        segments.append({"text": "safety blocked, rewritten question", "status": "fail"})
-        return segments
 
     if unavailable_stage == "retrieval":
         segments.append({"text": "retrieval unavailable", "status": "fail"})
@@ -384,7 +373,9 @@ def build_trace_segments(details: dict) -> list[dict]:
         label = f"{provider}, {model}" if model else provider
         segments.append({"text": label, "status": "info"})
 
-    if blocked_stage == "response_safety":
+    if unavailable_stage == "response_safety":
+        segments.append({"text": "response check unavailable", "status": "fail"})
+    elif blocked_stage == "response_safety":
         segments.append({"text": "response blocked", "status": "fail"})
 
     return segments
@@ -395,7 +386,7 @@ def render_details(details: dict) -> None:
     latency = details.get("latency_seconds")
     latency_html = f'<span class="pill-latency">{latency:.2f}s</span>' if latency is not None else ""
     steps = [
-        f'<span class="pill {seg["status"]}"><span class="dot"></span>{seg["text"]}</span>' for seg in segments
+        f'<span class="pill {seg["status"]}"><span class="dot"></span>{html.escape(str(seg["text"]))}</span>' for seg in segments
     ]
     flow_html = '<span class="trace-arrow">&#8250;</span>'.join(steps)
 
@@ -406,14 +397,17 @@ def render_details(details: dict) -> None:
         )
 
         if details.get("error"):
-            st.markdown(f'<div class="error-note">{details["error"]}</div>', unsafe_allow_html=True)
+            st.markdown(f'<div class="error-note">{html.escape(str(details["error"]))}</div>', unsafe_allow_html=True)
             return
 
         sources = details.get("sources") or []
         if sources:
             rows = ""
             for source in sources:
-                path = source["metadata"].get("source_path", "unknown")
+                metadata = source["metadata"]
+                path = html.escape(str(metadata.get("source_path", "unknown")))
+                if metadata.get("manifest_kind"):
+                    path += html.escape(f" ({metadata['manifest_kind']}/{metadata.get('manifest_name') or '?'})")
                 score = source.get("rerank_score")
                 score_text = f"{score:.3f}" if score is not None else "n/a"
                 rows += f'<div class="source-line"><span>{path}</span><span>{score_text}</span></div>'
@@ -421,9 +415,11 @@ def render_details(details: dict) -> None:
 
 
 with st.sidebar:
+    icon_uri = _icon_data_uri()
+    brand_img = f'<img src="{icon_uri}" alt="" />' if icon_uri else ""
     st.markdown(
         '<div class="brand">'
-        f'<div class="brand-mark"><img src="{_icon_data_uri()}" alt="" /></div>'
+        f'<div class="brand-mark">{brand_img}</div>'
         '<div><div class="brand-name">Kubernetes Assistant</div>'
         '<div class="brand-sub">Gated RAG over your docs</div></div>'
         "</div>",
@@ -465,7 +461,7 @@ with st.sidebar:
         for provider in providers:
             ok = provider["check"]()
             dot_class = "ok" if ok else "missing"
-            status_text = "Connected" if ok else "Not configured"
+            status_text = "Configured" if ok else "Not configured"
             status_class = "" if ok else "missing"
             rows += (
                 '<div class="status-row">'
@@ -482,19 +478,14 @@ with st.sidebar:
 
 prompt = st.chat_input(f'Ask a Kubernetes question, e.g. "{st.session_state.placeholder_example}"')
 if prompt:
-    # Appended here, before the render loop below, so the question shows up
-    # immediately this same run instead of staying invisible for the whole
-    # duration of run_turn() (which can take over 10s) and only appearing
-    # once a later rerun redraws the full history with both turns already
-    # in it.
     st.session_state.history.append({"role": "user", "content": prompt})
 
 with st.container(key="chat_scroll"):
     if not st.session_state.history:
         st.markdown(
             '<div class="empty-hero"><h1>Ask about your Kubernetes docs</h1>'
-            "<p>Every question runs through safety and topic gates, caching, retrieval, "
-            "a relevance-gated rerank, and a response safety check.</p></div>",
+            "<p>Repeat questions are served from cache. New ones pass safety and topic gates, "
+            "retrieval, a relevance-gated rerank, and a response safety check.</p></div>",
             unsafe_allow_html=True,
         )
         with st.container(key="pipeline_scroll"):
@@ -520,11 +511,10 @@ with st.container(key="chat_scroll"):
         if st.session_state.history[-1]["role"] == "user":
             with st.chat_message("assistant"):
                 with st.spinner("Thinking..."):
-                    plain_history = [
-                        {"role": t["role"], "content": t["content"]} for t in st.session_state.history[:-1]
-                    ]
+                    pending_prompt = st.session_state.history[-1]["content"]
+                    plain_history = build_context_history(st.session_state.history[:-1])
                     try:
-                        result = run_turn(prompt, plain_history)
+                        result = run_turn(pending_prompt, plain_history)
                         error = None
                     except Exception as exc:
                         logger.exception("run_turn failed")
@@ -540,13 +530,14 @@ with st.container(key="chat_scroll"):
                             "blocked_stage": result.get("blocked_stage"),
                             "cache_layer": result.get("cache_layer"),
                             "exact_cache_checked": result.get("exact_cache_checked"),
+                            "small_talk": result.get("small_talk", False),
                             "provider": result.get("provider"),
                             "model": result.get("model"),
                             "candidates_count": len(result.get("candidates") or []),
                             "reranked_count": len(result.get("reranked") or []),
                             "service_unavailable": result.get("service_unavailable", False),
                             "unavailable_stage": result.get("unavailable_stage"),
-                            "sources": result.get("reranked") if not result.get("cache_layer") else None,
+                            "sources": result.get("reranked") if not result.get("cache_layer") and not result.get("blocked_stage") else None,
                             "latency_seconds": result.get("latency_seconds"),
                         }
                 st.markdown(answer)

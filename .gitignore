@@ -5,4 +5,3 @@ __pycache__/
 .pytest_cache/
 venv/
 .venv/
-eval/results.csv

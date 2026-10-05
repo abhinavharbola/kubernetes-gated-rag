@@ -1,0 +1,7 @@
+metric,mean
+faithfulness,0.95
+answer_relevancy,0.91
+context_precision,1.00
+context_recall,0.94
+context_entity_recall,0.90
+semantic_similarity,0.91
